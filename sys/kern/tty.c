@@ -1645,6 +1645,10 @@ tty_set_winsize(struct tty *tp, const struct winsize *wsz)
 static int
 tty_sti_check(struct tty *tp, int fflag, struct thread *td)
 {
+    int pr_id;
+    pid_t s_sid;
+    struct proc *p;
+
 	/* Root can bypass all of our constraints. */
 	if (priv_check(td, PRIV_TTY_STI) == 0)
 		return (0);
@@ -1656,6 +1660,21 @@ tty_sti_check(struct tty *tp, int fflag, struct thread *td)
 	/* It must also be their controlling tty. */
 	if (!tty_is_ctty(tp, td->td_proc))
 		return (EACCES);
+
+    /* Deny if there is a risk of prison escape. */
+    pr_id = td->td_ucred->cr_prison->pr_id;
+    s_sid = tp->t_session->s_sid;
+    sx_slock(&allproc_lock);
+    FOREACH_PROC_IN_SYSTEM(p) {
+        PROC_LOCK(p);
+        if (p->p_session->s_sid == s_sid && p->p_ucred->cr_prison->pr_id != pr_id) {
+            PROC_UNLOCK(p);
+            sx_unlock(&allproc_lock);
+            return (EPERM);
+        }
+        PROC_UNLOCK(p);
+    }
+    sx_unlock(&allproc_lock);
 
 	return (0);
 }
