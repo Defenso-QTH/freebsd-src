@@ -127,6 +127,7 @@ struct ngd_private {
 	uint16_t	flags;
 #define	NGDF_OPEN	0x0001
 #define	NGDF_RWAIT	0x0002
+#define	NGDF_DYING	0x0004
 };
 typedef struct ngd_private *priv_p;
 
@@ -364,6 +365,11 @@ ng_device_disconnect(hook_p hook)
 
 	DBG;
 
+	mtx_lock(&priv->ngd_mtx);
+	priv->flags |= NGDF_DYING;
+	wakeup(priv);
+	mtx_unlock(&priv->ngd_mtx);
+
 	destroy_dev(priv->ngddev);
 
 	knlist_destroy(&priv->rsel.si_note);
@@ -523,6 +529,8 @@ ngdread(struct cdev *dev, struct uio *uio, int flag)
 
 	/* get an mbuf */
 	do {
+		if (priv->flags & NGDF_DYING)
+			return (ENXIO);
 		mtx_lock(&priv->ngd_mtx);
 		IF_DEQUEUE(&priv->readq, m);
 		if (m == NULL) {
