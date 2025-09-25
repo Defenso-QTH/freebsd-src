@@ -232,11 +232,11 @@ ng_device_constructor(node_p node)
 	    GID_WHEEL, 0600, NG_DEVICE_DEVNAME "%d", priv->unit);
 	if (priv->ngddev == NULL) {
 		printf("%s(): make_dev() failed\n", __func__);
+		knlist_destroy(&priv->rsel.si_note);
+		knlist_destroy(&priv->wsel.si_note);
 		mtx_destroy(&priv->ngd_mtx);
 		mtx_destroy(&priv->readq.ifq_mtx);
 		free_unr(ngd_unit, priv->unit);
-		knlist_destroy(&priv->rsel.si_note);
-		knlist_destroy(&priv->wsel.si_note);
 		free(priv, M_NETGRAPH);
 		return (EINVAL);
 	}
@@ -365,10 +365,11 @@ ng_device_disconnect(hook_p hook)
 	DBG;
 
 	destroy_dev(priv->ngddev);
-	mtx_destroy(&priv->ngd_mtx);
 
 	knlist_destroy(&priv->rsel.si_note);
 	knlist_destroy(&priv->wsel.si_note);
+	mtx_destroy(&priv->ngd_mtx);
+
 	seldrain(&priv->rsel);
 	seldrain(&priv->wsel);
 
