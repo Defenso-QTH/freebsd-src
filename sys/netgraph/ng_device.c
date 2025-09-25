@@ -531,21 +531,19 @@ ngdread(struct cdev *dev, struct uio *uio, int flag)
 	do {
 		if (priv->flags & NGDF_DYING)
 			return (ENXIO);
-		mtx_lock(&priv->ngd_mtx);
 		IF_DEQUEUE(&priv->readq, m);
 		if (m == NULL) {
 			if (flag & O_NONBLOCK) {
 				mtx_unlock(&priv->ngd_mtx);
 				return (EWOULDBLOCK);
 			}
+			mtx_lock(&priv->ngd_mtx);
 			priv->flags |= NGDF_RWAIT;
 			if ((error = mtx_sleep(priv, &priv->ngd_mtx,
-			    PCATCH, "ngdread", 0)) != 0) {
-				mtx_unlock(&priv->ngd_mtx);
+			    PDROP | PCATCH, "ngdread", 0)) != 0) {
 				return (error);
 			}
 		}
-		mtx_unlock(&priv->ngd_mtx);
 	} while (m == NULL);
 
 	while (m && uio->uio_resid > 0 && error == 0) {
