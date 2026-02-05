@@ -3537,7 +3537,7 @@ dev/vt/logo/logo_freebsd.c	optional vt splash
 dev/vt/logo/logo_beastie.c	optional vt splash
 dev/vt/vt_buf.c			optional vt
 dev/vt/vt_consolectl.c		optional vt
-dev/vt/vt_core.c		optional vt
+dev/vt/vt_core.c		optional vt | shutdown_splash
 dev/vt/vt_cpulogos.c		optional vt splash
 dev/vt/vt_font.c		optional vt
 dev/vt/vt_sysmouse.c		optional vt

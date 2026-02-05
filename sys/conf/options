@@ -727,6 +727,7 @@ DEV_PF			opt_pf.h
 DEV_PFLOG		opt_pf.h
 DEV_PFSYNC		opt_pf.h
 DEV_SPLASH		opt_splash.h
+DEV_SHUTDOWN_SPLASH	opt_shutdown_splash.h
 DEV_VLAN		opt_vlan.h
 
 # bce driver

@@ -50,6 +50,7 @@
 
 #include "opt_syscons.h"
 #include "opt_splash.h"
+#include "opt_shutdown_splash.h"
 
 #ifndef	VT_MAXWINDOWS
 #ifdef	MAXCONS
