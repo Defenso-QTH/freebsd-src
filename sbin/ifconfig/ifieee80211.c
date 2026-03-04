@@ -4010,7 +4010,7 @@ printbssidname(const struct ether_addr *n)
 static void
 list_scan(if_ctx *ctx)
 {
-	uint8_t buf[24*1024];
+	uint8_t buf[48*1024];
 	char ssid[IEEE80211_NWID_LEN+1];
 	const uint8_t *cp;
 	int len, idlen;

@@ -1538,9 +1538,9 @@ wpa_driver_bsd_get_scan_results2(void *priv)
 	struct ieee80211req_scan_result *sr;
 	struct wpa_scan_results *res;
 	int len, rest;
-	uint8_t buf[24*1024], *pos;
+	uint8_t buf[48*1024], *pos;
 
-	len = get80211var(priv, IEEE80211_IOC_SCAN_RESULTS, buf, 24*1024);
+	len = get80211var(priv, IEEE80211_IOC_SCAN_RESULTS, buf, 48*1024);
 	if (len < 0)
 		return NULL;
 
