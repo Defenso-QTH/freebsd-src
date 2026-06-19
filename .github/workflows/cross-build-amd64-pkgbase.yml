@@ -24,10 +24,16 @@ jobs:
         os: [ ubuntu-24.04 ]
         include:
           # TODO: both Ubuntu and macOS have bmake packages, we should try them instead of bootstrapping our own copy.
+          # clang-18 mis-compiles the amd64 kernel/modules: it emits the
+          # stack-protector __stack_chk_guard load via the GOT
+          # (R_X86_64_REX_GOTPCRELX), which the in-kernel module linker
+          # cannot resolve -> unloadable modules (e.g. zfs.ko). clang-19
+          # (what FreeBSD 15 ships natively) does not.  No CFLAGS workaround
+          # fixes clang-18; the fix is to build with clang-19.
           - os: ubuntu-24.04
-            compiler: clang-18
-            cross-bindir: /usr/lib/llvm-18/bin
-            pkgs: bmake libarchive-dev clang-18 lld-18
+            compiler: clang-19
+            cross-bindir: /usr/lib/llvm-19/bin
+            pkgs: bmake libarchive-dev clang-19 lld-19
           - target_arch: amd64
             target: amd64
     steps:
