@@ -79,11 +79,11 @@ jobs:
       - name: make kernel-toolchain
         run: ./tools/build/make.py --debug $EXTRA_BUILD_ARGS TARGET=${{ matrix.target }} TARGET_ARCH=${{ matrix.target_arch }} kernel-toolchain -s -j$NPROC -DWITH_DISK_IMAGE_TOOLS_BOOTSTRAP
       - name: make buildkernel
-        run: ./tools/build/make.py --debug $EXTRA_BUILD_ARGS TARGET=${{ matrix.target }} TARGET_ARCH=${{ matrix.target_arch }} KERNCONF=GENERIC buildkernel -s -j$NPROC $EXTRA_MAKE_ARGS
+        run: ./tools/build/make.py --debug $EXTRA_BUILD_ARGS TARGET=${{ matrix.target }} TARGET_ARCH=${{ matrix.target_arch }} KERNCONF=DEFENSO buildkernel -s -j$NPROC $EXTRA_MAKE_ARGS
       - name: make buildworld
         run: ./tools/build/make.py --debug $EXTRA_BUILD_ARGS TARGET=${{ matrix.target }} TARGET_ARCH=${{ matrix.target_arch }} buildworld -s -j$NPROC $EXTRA_MAKE_ARGS
       - name: make packages
-        run: ./tools/build/make.py --debug $EXTRA_BUILD_ARGS TARGET=${{ matrix.target }} TARGET_ARCH=${{ matrix.target_arch }} PKG_CMD=/usr/local/sbin/pkg REPODIR=$RUNNER_TEMP/repo packages -s -j$NPROC $EXTRA_MAKE_ARGS
+        run: ./tools/build/make.py --debug $EXTRA_BUILD_ARGS TARGET=${{ matrix.target }} TARGET_ARCH=${{ matrix.target_arch }} KERNCONF=DEFENSO PKG_CMD=/usr/local/sbin/pkg REPODIR=$RUNNER_TEMP/repo packages -s -j$NPROC $EXTRA_MAKE_ARGS
       - name: stage pkg repo for Pages
         if: runner.os == 'Linux'
         run: |
