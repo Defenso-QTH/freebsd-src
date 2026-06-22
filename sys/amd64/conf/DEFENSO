@@ -1,0 +1,12 @@
+#
+# DEFENSO -- GENERIC with the vt(4) Alt->Esc compatibility hack disabled.
+#
+# Identical to GENERIC except VT_ALT_TO_ESC_HACK is forced to 0, so a lone
+# Left Alt keypress is not translated into Escape on the system console.
+#
+
+include		GENERIC
+
+ident		DEFENSO
+
+options		VT_ALT_TO_ESC_HACK=0
