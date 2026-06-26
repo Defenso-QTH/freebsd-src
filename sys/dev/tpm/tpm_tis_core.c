@@ -474,6 +474,16 @@ tpmtis_transmit(device_t dev, size_t length)
 		    "Failed to read response\n");
 		return (EIO);
 	}
+
+	/*
+	 * Per TIS 1.3 section 5.6.12, write commandReady after reading the
+	 * response so the TPM can free the ReadFIFO and other internal
+	 * resources. The next tpmtis_go_ready() provides the second
+	 * write the spec mentions, and waits for the state transition,
+	 * so no wait is needed here.
+	 */
+	TPM_WRITE_4(sc->dev, TPM_STS, TPM_STS_CMD_RDY);
+	TPM_WRITE_BARRIER(sc->dev, TPM_STS, 4);
 	tpmtis_relinquish_locality(sc);
 	sc->pending_data_length = bytes_available;
 	sc->total_length = bytes_available;
