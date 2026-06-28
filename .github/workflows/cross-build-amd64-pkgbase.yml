@@ -58,8 +58,11 @@ jobs:
           echo "NPROC=`getconf _NPROCESSORS_ONLN 2>/dev/null || getconf NPROCESSORS_ONLN 2>/dev/null || echo 1`" >> $GITHUB_ENV
           # Skip the 32-bit world and debug files: no lib32 / -dbg packages,
           # which also cuts a large chunk off buildworld + packaging time.
+          # WITH_KERNEL_SYMBOLS overrides WITHOUT_DEBUG_FILES for the kernel
+          # specifically, so FreeBSD-kernel-dbg is produced without re-enabling
+          # debug files for all of world.
           # Passed to buildworld/buildkernel/packages via $EXTRA_MAKE_ARGS.
-          echo "EXTRA_MAKE_ARGS=WITHOUT_LIB32=yes WITHOUT_DEBUG_FILES=yes" >> $GITHUB_ENV
+          echo "EXTRA_MAKE_ARGS=WITHOUT_LIB32=yes WITHOUT_DEBUG_FILES=yes WITH_KERNEL_SYMBOLS=yes" >> $GITHUB_ENV
       - name: bootstrap bmake
         run: ./tools/build/make.py --debug $EXTRA_BUILD_ARGS TARGET=${{ matrix.target }} TARGET_ARCH=${{ matrix.target_arch }} -n
       - name: build host pkg (Linux)
