@@ -58,9 +58,8 @@ jobs:
           echo "NPROC=`getconf _NPROCESSORS_ONLN 2>/dev/null || getconf NPROCESSORS_ONLN 2>/dev/null || echo 1`" >> $GITHUB_ENV
           # Skip the 32-bit world and debug files: no lib32 / -dbg packages,
           # which also cuts a large chunk off buildworld + packaging time.
-          # WITH_KERNEL_SYMBOLS overrides WITHOUT_DEBUG_FILES for the kernel
-          # specifically, so FreeBSD-kernel-dbg is produced without re-enabling
-          # debug files for all of world.
+          # WITH_KERNEL_SYMBOLS ensures kernel.debug is retained in the obj tree
+          # so the "stage pkg repo" step can publish it to Pages for crashinfo(8).
           # Passed to buildworld/buildkernel/packages via $EXTRA_MAKE_ARGS.
           echo "EXTRA_MAKE_ARGS=WITHOUT_LIB32=yes WITHOUT_DEBUG_FILES=yes WITH_KERNEL_SYMBOLS=yes" >> $GITHUB_ENV
       - name: bootstrap bmake
@@ -99,7 +98,18 @@ jobs:
               mv "$abidir/$target" "$abidir/latest"
             fi
           done
-          ls -lR "$repo" | head -n 40
+          # Publish kernel.debug alongside packages so crashinfo(8)/kgdb can
+          # fetch matching debug symbols: fetch .../kernel-debug/kernel.debug
+          # then place at /usr/lib/debug/boot/kernel/kernel.debug on the host.
+          kdbg=$(find "$MAKEOBJDIRPREFIX" -name "kernel.debug" -path "*/DEFENSO/*" | head -1)
+          if [ -n "$kdbg" ]; then
+            mkdir -p "$repo/kernel-debug"
+            cp "$kdbg" "$repo/kernel-debug/kernel.debug"
+            echo "Published kernel.debug ($(du -sh "$repo/kernel-debug/kernel.debug" | cut -f1))"
+          else
+            echo "WARNING: kernel.debug not found in obj tree"
+          fi
+          ls -lR "$repo" | head -n 60
       - name: upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
