@@ -115,9 +115,16 @@ jobs:
             echo 'prefix = "/";'
           } > /tmp/dbg.ucl
 
-          alldir=$(find "$RUNNER_TEMP/repo" -name "All" -type d | head -1)
-          /usr/local/sbin/pkg create -M /tmp/dbg.ucl -r "$stage" -o "$alldir"
-          /usr/local/sbin/pkg repo "$(dirname "$alldir")"
+          # pkgbase places packages directly in the version dir (no All/ subdir).
+          # Locate it via an existing package file.
+          pkgdir=$(find "$RUNNER_TEMP/repo" -name "FreeBSD-kernel-defenso-*.pkg" | head -1 | xargs -r dirname)
+          if [ -z "$pkgdir" ]; then
+            echo "ERROR: could not locate repo package directory"
+            exit 1
+          fi
+          echo "repo dir: $pkgdir"
+          /usr/local/sbin/pkg create -M /tmp/dbg.ucl -r "$stage" -o "$pkgdir"
+          /usr/local/sbin/pkg repo "$pkgdir"
 
       - name: stage pkg repo for Pages
         if: runner.os == 'Linux'
