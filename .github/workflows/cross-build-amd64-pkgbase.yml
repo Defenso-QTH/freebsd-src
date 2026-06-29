@@ -105,16 +105,15 @@ jobs:
           install -d "$stage/usr/lib/debug/boot/kernel"
           install -m 0644 "$kdbg" "$stage/usr/lib/debug/boot/kernel/kernel.debug"
 
-          cat > /tmp/dbg.ucl << 'UCL'
-name = "FreeBSD-kernel-defenso-dbg";
-version = "15.1";
-arch = "freebsd:15:amd64";
-comment = "Debug symbols for the DEFENSO FreeBSD kernel";
-desc = "Debug symbols for the DEFENSO FreeBSD kernel. Install alongside FreeBSD-kernel-defenso, then use crashinfo(8) or kgdb(1) after a panic.";
-www = "https://www.freebsd.org";
-maintainer = "quentin.thebault@defenso.fr";
-prefix = "/";
-UCL
+          { echo 'name = "FreeBSD-kernel-defenso-dbg";'
+            echo 'version = "15.1";'
+            echo 'arch = "freebsd:15:amd64";'
+            echo 'comment = "Debug symbols for the DEFENSO FreeBSD kernel";'
+            echo 'desc = "Debug symbols for the DEFENSO FreeBSD kernel. Install alongside FreeBSD-kernel-defenso, then use crashinfo(8) or kgdb(1) after a panic.";'
+            echo 'www = "https://www.freebsd.org";'
+            echo 'maintainer = "quentin.thebault@defenso.fr";'
+            echo 'prefix = "/";'
+          } > /tmp/dbg.ucl
 
           alldir=$(find "$RUNNER_TEMP/repo" -name "All" -type d | head -1)
           /usr/local/sbin/pkg create -M /tmp/dbg.ucl -r "$stage" -o "$alldir"
