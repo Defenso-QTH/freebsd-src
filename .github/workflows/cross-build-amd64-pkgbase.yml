@@ -86,6 +86,40 @@ jobs:
         run: ./tools/build/make.py --debug $EXTRA_BUILD_ARGS TARGET=${{ matrix.target }} TARGET_ARCH=${{ matrix.target_arch }} buildworld -s -j$NPROC $EXTRA_MAKE_ARGS
       - name: make packages
         run: ./tools/build/make.py --debug $EXTRA_BUILD_ARGS TARGET=${{ matrix.target }} TARGET_ARCH=${{ matrix.target_arch }} KERNCONF=DEFENSO PKG_CMD=/usr/local/sbin/pkg REPODIR=$RUNNER_TEMP/repo packages -s -j$NPROC $EXTRA_MAKE_ARGS
+      - name: create FreeBSD-kernel-defenso-dbg package
+        if: runner.os == 'Linux'
+        run: |
+          set -eux
+          # WITH_KERNEL_SYMBOLS=yes in EXTRA_MAKE_ARGS ensures kernel.debug is
+          # produced in the obj tree even when WITHOUT_DEBUG_FILES=yes skips it
+          # during installkernel (so make packages never creates the -dbg variant).
+          # We create the package manually and re-index the repo here.
+          kdbg=$(find "$MAKEOBJDIRPREFIX" -name "kernel.debug" -path "*/DEFENSO/*" | head -1 || true)
+          if [ -z "$kdbg" ]; then
+            echo "WARNING: kernel.debug not found; skipping FreeBSD-kernel-defenso-dbg"
+            exit 0
+          fi
+          echo "kernel.debug: $kdbg ($(du -sh "$kdbg" | cut -f1))"
+
+          stage=$(mktemp -d)
+          install -d "$stage/usr/lib/debug/boot/kernel"
+          install -m 0644 "$kdbg" "$stage/usr/lib/debug/boot/kernel/kernel.debug"
+
+          cat > /tmp/dbg.ucl << 'UCL'
+name = "FreeBSD-kernel-defenso-dbg";
+version = "15.1";
+arch = "freebsd:15:amd64";
+comment = "Debug symbols for the DEFENSO FreeBSD kernel";
+desc = "Debug symbols for the DEFENSO FreeBSD kernel. Install alongside FreeBSD-kernel-defenso, then use crashinfo(8) or kgdb(1) after a panic.";
+www = "https://www.freebsd.org";
+maintainer = "quentin.thebault@defenso.fr";
+prefix = "/";
+UCL
+
+          alldir=$(find "$RUNNER_TEMP/repo" -name "All" -type d | head -1)
+          /usr/local/sbin/pkg create -M /tmp/dbg.ucl -r "$stage" -o "$alldir"
+          /usr/local/sbin/pkg repo "$(dirname "$alldir")"
+
       - name: stage pkg repo for Pages
         if: runner.os == 'Linux'
         run: |
@@ -98,18 +132,7 @@ jobs:
               mv "$abidir/$target" "$abidir/latest"
             fi
           done
-          # Publish kernel.debug alongside packages so crashinfo(8)/kgdb can
-          # fetch matching debug symbols: fetch .../kernel-debug/kernel.debug
-          # then place at /usr/lib/debug/boot/kernel/kernel.debug on the host.
-          kdbg=$(find "$MAKEOBJDIRPREFIX" -name "kernel.debug" -path "*/DEFENSO/*" | head -1)
-          if [ -n "$kdbg" ]; then
-            mkdir -p "$repo/kernel-debug"
-            cp "$kdbg" "$repo/kernel-debug/kernel.debug"
-            echo "Published kernel.debug ($(du -sh "$repo/kernel-debug/kernel.debug" | cut -f1))"
-          else
-            echo "WARNING: kernel.debug not found in obj tree"
-          fi
-          ls -lR "$repo" | head -n 60
+          ls -lR "$repo" | head -n 40
       - name: upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
