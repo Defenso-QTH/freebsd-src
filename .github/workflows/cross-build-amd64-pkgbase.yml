@@ -105,9 +105,11 @@ jobs:
           install -d "$stage/usr/lib/debug/boot/kernel"
           install -m 0644 "$kdbg" "$stage/usr/lib/debug/boot/kernel/kernel.debug"
 
+          flatsize=$(find "$stage" -type f -exec stat -c '%s' {} + | awk '{s+=$1}END{print s+0}')
           { echo 'name = "FreeBSD-kernel-defenso-dbg";'
             echo 'version = "15.1";'
-            echo 'arch = "freebsd:15:amd64";'
+            echo 'abi = "FreeBSD:15:amd64";'
+            echo "flatsize = $flatsize;"
             echo 'comment = "Debug symbols for the DEFENSO FreeBSD kernel";'
             echo 'desc = "Debug symbols for the DEFENSO FreeBSD kernel. Install alongside FreeBSD-kernel-defenso, then use crashinfo(8) or kgdb(1) after a panic.";'
             echo 'www = "https://www.freebsd.org";'
@@ -124,7 +126,7 @@ jobs:
             exit 1
           fi
           echo "repo dir: $pkgdir"
-          /usr/local/sbin/pkg create -M /tmp/dbg.ucl -r "$stage" -o "$pkgdir"
+          /usr/local/sbin/pkg -o ABI="FreeBSD:15:amd64" create -M /tmp/dbg.ucl -r "$stage" -o "$pkgdir"
           /usr/local/sbin/pkg repo "$pkgdir"
 
       - name: stage pkg repo for Pages
