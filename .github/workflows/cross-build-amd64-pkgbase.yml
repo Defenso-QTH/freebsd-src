@@ -105,9 +105,15 @@ jobs:
           install -d "$stage/usr/lib/debug/boot/kernel"
           install -m 0644 "$kdbg" "$stage/usr/lib/debug/boot/kernel/kernel.debug"
 
+          # Derive version from a sibling package already in the repo so this
+          # package stays in sync with the rest of the pkgbase set.
+          kpkg=$(find "$RUNNER_TEMP/repo" -name "FreeBSD-kernel-defenso-[0-9]*.pkg" | head -1)
+          pkgver=$(basename "$kpkg" .pkg | sed 's/^FreeBSD-kernel-defenso-//')
+          echo "kernel-defenso version: $pkgver"
+
           flatsize=$(find "$stage" -type f -exec stat -c '%s' {} + | awk '{s+=$1}END{print s+0}')
           { echo 'name = "FreeBSD-kernel-defenso-dbg";'
-            echo 'version = "15.1";'
+            echo "version = \"$pkgver\";"
             echo 'abi = "FreeBSD:15:amd64";'
             echo "flatsize = $flatsize;"
             echo 'comment = "Debug symbols for the DEFENSO FreeBSD kernel";'
