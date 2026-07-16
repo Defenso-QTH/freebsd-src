@@ -1495,7 +1495,7 @@ vt_flush(struct vt_device *vd)
 	if (vw == NULL)
 		return (0);
 
-	if (vd->vd_flags & VDF_SPLASH || vw->vw_flags & VWF_BUSY)
+	if (vw->vw_flags & VWF_BUSY)
 		return (0);
 
 	vf = vw->vw_font;
@@ -1503,6 +1503,16 @@ vt_flush(struct vt_device *vd)
 		return (0);
 
 	VT_FLUSH_LOCK(vd);
+
+	/*
+	 * Re-check VDF_SPLASH inside VT_FLUSH_LOCK so that vtterm_splash(),
+	 * which holds this lock across its framebuffer writes, fully excludes
+	 * concurrent character rendering.
+	 */
+	if (vd->vd_flags & VDF_SPLASH) {
+		VT_FLUSH_UNLOCK(vd);
+		return (0);
+	}
 
 	vtbuf_lock(&vw->vw_buf);
 	inside_vt_flush = true;
@@ -1694,14 +1704,28 @@ vtterm_splash(struct vt_device *vd)
 	if (si == NULL) {
 		if (vd->vd_driver->vd_bitblt_bmp == NULL)
 			return;
-	} else if (vd->vd_driver->vd_bitblt_argb == NULL)
+	} else {
+		if (vd->vd_driver->vd_bitblt_argb == NULL)
+			return;
+		if (si->si_depth != 4)
+			return;
+	}
+	if (rebooting == 1 && vd->vd_driver->vd_blank == NULL)
 		return;
 
-	if (rebooting == 1) {
-		if (vd->vd_driver->vd_blank == NULL)
-			return;
+	/*
+	 * All capability checks passed.  Hold VT_FLUSH_LOCK across the flag
+	 * set and the entire blit so that any vt_flush() that is already past
+	 * the early VDF_SPLASH test must wait for us to finish before it can
+	 * acquire the lock; it will then re-check VDF_SPLASH inside the lock
+	 * and return without touching the framebuffer.  VT_FLUSH_LOCK is
+	 * MTX_DEF, so holding it across a slow blit is legal.
+	 */
+	VT_FLUSH_LOCK(vd);
+	vd->vd_flags |= VDF_SPLASH;
+
+	if (rebooting == 1)
 		vd->vd_driver->vd_blank(vd, TC_BLACK);
-	}
 
 	if (si == NULL) {
 		top = (vd->vd_height - vt_logo_height) / 2;
@@ -1710,8 +1734,6 @@ vtterm_splash(struct vt_device *vd)
 		    vd->vd_curwindow, vt_logo_image, NULL, vt_logo_width,
 		    vt_logo_height, left, top, TC_WHITE, TC_BLACK);
 	} else {
-		if (si->si_depth != 4)
-			return;
 		image = (uintptr_t)si + sizeof(struct splash_info);
 		image = roundup2(image, 8);
 		top = (vd->vd_height - si->si_height) / 2;
@@ -1720,7 +1742,7 @@ vtterm_splash(struct vt_device *vd)
 		    (unsigned char *)image, si->si_width, si->si_height,
 		    left, top);
 	}
-	vd->vd_flags |= VDF_SPLASH;
+	VT_FLUSH_UNLOCK(vd);
 }
 #endif
 
