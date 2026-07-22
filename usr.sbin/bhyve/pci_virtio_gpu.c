@@ -51,6 +51,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #include <virglrenderer.h>
 
@@ -247,6 +248,13 @@ struct vtgpu_softc {
 	struct vmctx		*vsc_ctx;
 	uint32_t		vsc_width;
 	uint32_t		vsc_height;
+	/*
+	 * Host DRM render node fd (e.g. /dev/dri/renderD128), opened at init.
+	 * Handed to virglrenderer via the get_drm_fd callback so it brings up
+	 * EGL on the GBM platform against this node — a fully headless GPU
+	 * context that needs no Wayland/X display.  -1 if none was opened.
+	 */
+	int			vsc_drm_fd;
 
 	/*
 	 * Modern virtio-pci (virtio 1.0) transport state.  bhyve's shared
@@ -294,9 +302,28 @@ vtgpu_write_fence(void *cookie, uint32_t fence_id)
 	}
 }
 
+/*
+ * Supply the host render-node fd to virglrenderer (version-2 callback).
+ * When this returns a valid fd, virglrenderer's EGL init uses the GBM
+ * platform on that node instead of falling back to EGL_DEFAULT_DISPLAY,
+ * so no window-system (Wayland/X) display is needed.  We dup on each call
+ * because virglrenderer takes ownership of the fd it receives, and the
+ * init fallback chain may query us more than once.
+ */
+static int
+vtgpu_get_drm_fd(void *cookie)
+{
+	struct vtgpu_softc *sc = cookie;
+
+	if (sc->vsc_drm_fd < 0)
+		return (-1);
+	return (dup(sc->vsc_drm_fd));
+}
+
 static struct virgl_renderer_callbacks vtgpu_virgl_cbs = {
-	.version     = 1,
+	.version     = 2,
 	.write_fence = vtgpu_write_fence,
+	.get_drm_fd  = vtgpu_get_drm_fd,
 };
 
 /* ----------------------------------------------------------------------- */
@@ -1315,12 +1342,12 @@ vtgpu_modern_setup(struct pci_devinst *pi)
 
 /*
  * Probe for a Wayland compositor socket in the standard locations.
- * Used as an EGL backend when the render-node (GBM) path is unavailable
- * because virglrenderer-mvisor is built with -Ddrm=disabled, which omits
- * virgl_gbm.c and leaves EGL_DEFAULT_DISPLAY as the only EGL entry point.
- * With WAYLAND_DISPLAY set, mesa's EGL uses the Wayland platform and
- * virglrenderer can create a surfaceless context against it without
- * producing any actual on-screen output.
+ * This is only a last-resort EGL backend: the preferred paths are the
+ * render-node (GBM) and surfaceless platforms set up in vtgpu_virgl_init,
+ * both of which are fully headless.  We fall back to a compositor only if
+ * no usable render node is available.  With WAYLAND_DISPLAY set, mesa's EGL
+ * uses the Wayland platform and virglrenderer creates a surfaceless context
+ * against it without producing any actual on-screen output.
  */
 static void
 vtgpu_probe_wayland(void)
@@ -1356,18 +1383,35 @@ vtgpu_probe_wayland(void)
  * the worker thread so the host GL context it creates is owned by the same
  * thread that will render with it (a context made current on a different
  * thread than it was created on triggers glXMakeContextCurrent BadAccess).
- * Returns 0 on success.  The environment (WAYLAND_DISPLAY / DRI_PRIME) was
- * set up by pci_vtgpu_init before the worker started.
+ * Returns 0 on success.  The environment (WAYLAND_DISPLAY) and the render
+ * node fd (sc->vsc_drm_fd) were set up by pci_vtgpu_init before the worker
+ * started.
+ *
+ * Order of preference is headless-first: with a render-node fd the initial
+ * EGL attempts come up on the GBM platform (no display server); if that
+ * fails we try surfaceless EGL; only then do we fall back to attaching to a
+ * Wayland/X compositor.  So on a host with a usable render node no
+ * compositor needs to be running at all.
  */
 static int
 vtgpu_virgl_init(struct vtgpu_softc *sc)
 {
 	int flags;
 
+	/* Headless via the render node (get_drm_fd -> GBM platform). */
 	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLES;
 	if (virgl_renderer_init(sc, flags, &vtgpu_virgl_cbs) == 0)
 		return (0);
 	flags = VIRGL_RENDERER_USE_EGL;
+	if (virgl_renderer_init(sc, flags, &vtgpu_virgl_cbs) == 0)
+		return (0);
+
+	/* Headless via surfaceless EGL (no window system, no render-node fd). */
+	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLES |
+	    VIRGL_RENDERER_USE_SURFACELESS;
+	if (virgl_renderer_init(sc, flags, &vtgpu_virgl_cbs) == 0)
+		return (0);
+	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_SURFACELESS;
 	if (virgl_renderer_init(sc, flags, &vtgpu_virgl_cbs) == 0)
 		return (0);
 
@@ -1402,6 +1446,7 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 	sc->vsc_ctx    = pi->pi_vmctx;
 	sc->vsc_width  = VTGPU_DEFAULT_WIDTH;
 	sc->vsc_height = VTGPU_DEFAULT_HEIGHT;
+	sc->vsc_drm_fd = -1;
 	TAILQ_INIT(&sc->vsc_fences);
 
 	render_node     = NULL;
@@ -1426,12 +1471,19 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 		setenv("WAYLAND_DISPLAY", wayland_display, 1);
 
 	/*
-	 * If a specific render node was given, set DRI_PRIME so mesa picks
-	 * it.  Note: DRI_PRIME expects an integer index or PCI ID, not a
-	 * path; for single-GPU hosts omit this entirely.
+	 * Open the host DRM render node and hand it to virglrenderer (via the
+	 * get_drm_fd callback) so it initializes EGL headlessly on the GBM
+	 * platform — no Wayland/X compositor required.  Default to renderD128;
+	 * a specific node can be selected with render=/dev/dri/renderDNNN.
+	 * If this fails we leave the fd at -1 and virgl_init falls back to the
+	 * surfaceless / Wayland / GLX chain.
 	 */
-	if (render_node != NULL)
-		setenv("DRI_PRIME", "1", 1);
+	if (render_node == NULL)
+		render_node = "/dev/dri/renderD128";
+	sc->vsc_drm_fd = open(render_node, O_RDWR | O_CLOEXEC);
+	if (sc->vsc_drm_fd < 0)
+		EPRINTLN("vtgpu: open(%s) failed, falling back to "
+		    "surfaceless/compositor EGL", render_node);
 
 	/*
 	 * virglrenderer is initialized later, on the worker thread
