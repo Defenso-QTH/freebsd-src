@@ -113,6 +113,41 @@ struct virgl_box {
 #define	VTGPU_MODERN_FEATURES	\
 	((1ULL << VIRTIO_GPU_F_VIRGL) | (1ULL << VTGPU_F_VERSION_1_BIT))
 
+/*
+ * mvisor-compatible "virtio-vgpu" mode (device option `mvisor=on`).
+ *
+ * mvisor's Windows guest driver drives the *same* virtio-gpu 3D command
+ * protocol this device already implements, but binds a device with a
+ * different PCI id (0x105B == 0x1040 + type 27) and a different, purely-3D
+ * config space (`struct vgpu_config`) that advertises capabilities via a
+ * bitfield rather than the VIRTIO_GPU_F_VIRGL feature bit.  In this mode we
+ * present that identity/config so the mvisor driver attaches; the transport
+ * and command handling are shared with the standard virtio-gpu path.
+ */
+#define	VTGPU_DEV_VGPU		0x105B
+
+/* VIRTGPU_PARAM_* bits reported in vgpu_config.capabilities (mvisor). */
+#define	VTGPU_PARAM_3D_FEATURES		(1u << 0)
+#define	VTGPU_PARAM_CAPSET_QUERY_FIX	(1u << 1)
+#define	VTGPU_PARAM_RESOURCE_BLOB	(1u << 2)
+#define	VTGPU_PARAM_HOST_VISIBLE	(1u << 3)
+#define	VTGPU_PARAM_CROSS_DEVICE	(1u << 4)
+#define	VTGPU_PARAM_CONTEXT_INIT	(1u << 5)
+#define	VTGPU_PARAM_SUPPORTED_CAPSET_IDS	(1u << 6)
+
+/* mvisor's device config space (see mvisor devices/virtio/virtio_vgpu.h). */
+struct vgpu_config {
+	uint8_t		staging;
+	uint8_t		num_queues;
+	uint32_t	num_capsets;
+	uint64_t	memory_size;
+	uint64_t	capabilities;
+} __attribute__((packed));
+
+/* In mvisor mode 3D is signalled via vgpu_config.capabilities, not a
+ * feature bit, so only VIRTIO_F_VERSION_1 is offered. */
+#define	VTGPU_MVISOR_FEATURES	(1ULL << VTGPU_F_VERSION_1_BIT)
+
 /* device_status bits (virtio 1.0 s2.1). */
 #define	VTGPU_S_ACKNOWLEDGE	0x01
 #define	VTGPU_S_DRIVER		0x02
@@ -187,6 +222,8 @@ struct vtgpu_fence {
 struct vtgpu_softc {
 	struct virtio_softc	vsc_vs;
 	struct virtio_gpu_config vsc_cfg;
+	bool			vsc_mvisor;	/* present mvisor vgpu identity */
+	struct vgpu_config	vsc_vgpu_cfg;	/* device config in mvisor mode */
 	struct vqueue_info	vsc_queues[VTGPU_MAXQ];
 	pthread_mutex_t		vsc_mtx;
 
@@ -451,6 +488,19 @@ vtgpu_cmd_resource_attach_backing(struct vtgpu_softc *sc,
 	struct iovec *iovs;
 	uint32_t i;
 
+	/*
+	 * mvisor's driver uses a different ATTACH_BACKING layout: it backs
+	 * each resource with a single contiguous allocation described by an
+	 * inline (gpa, size) pair and never fills in nr_entries (it is left
+	 * zero).  Those two fields land at exactly the offsets our first
+	 * virtio_gpu_mem_entry occupies (addr @ +32, length @ +40), so we can
+	 * reuse the entries[] path by forcing a single entry.  Without this
+	 * the standard nr_entries==0 read attaches no backing at all, leaving
+	 * the resource dataless -> virglrenderer "illegal resource".
+	 */
+	if (sc->vsc_mvisor)
+		n = 1;
+
 	if (n > VTGPU_MAX_BACKING) {
 		vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 		    VIRTIO_GPU_RESP_ERR_UNSPEC, wiov, nwiov);
@@ -679,9 +729,9 @@ vtgpu_flatten_riov(struct iovec *riov, int nriov, void **out, size_t *out_len)
 #define	VTGPU_MAXIOV	(VTGPU_RINGSZ * 2)
 
 static void
-vtgpu_process_controlq(struct vtgpu_softc *sc)
+vtgpu_process_controlq(struct vtgpu_softc *sc, int qidx)
 {
-	struct vqueue_info *vq = &sc->vsc_queues[VTGPU_CONTROLQ];
+	struct vqueue_info *vq = &sc->vsc_queues[qidx];
 	struct iovec iov[VTGPU_MAXIOV];
 	struct vi_req req;
 	int n;
@@ -908,8 +958,30 @@ vtgpu_worker(void *arg)
 		if (!sc->vsc_running)
 			break;
 
-		vtgpu_process_controlq(sc);
-		vtgpu_process_cursorq(sc);
+		if (sc->vsc_mvisor) {
+			/*
+			 * mvisor's driver uses a different queue split:
+			 * queue 0 = COMMAND (3D submit stream), queue 1 =
+			 * CONTROL (capset/context/resource/transfer).  Both
+			 * carry standard virtio-gpu commands dispatched by
+			 * hdr.type and there is no cursor queue, so run the
+			 * command handler on both.
+			 *
+			 * Process CONTROL (queue 1) first: it carries
+			 * GET_CAPSET_INFO/GET_CAPSET and CTX_CREATE/CTX_DESTROY,
+			 * while COMMAND (queue 0) carries the resource
+			 * create/attach/transfer and SUBMIT_3D that all
+			 * reference the virgl context created on queue 1.
+			 * Servicing COMMAND first would run a submit before its
+			 * context exists -> virglrenderer context/command
+			 * errors.
+			 */
+			vtgpu_process_controlq(sc, 1);
+			vtgpu_process_controlq(sc, 0);
+		} else {
+			vtgpu_process_controlq(sc, VTGPU_CONTROLQ);
+			vtgpu_process_cursorq(sc);
+		}
 	}
 	pthread_mutex_unlock(&sc->vsc_mtx);
 	return (NULL);
@@ -941,9 +1013,20 @@ static int
 vtgpu_cfgread(void *arg, int offset, int size, uint32_t *retval)
 {
 	struct vtgpu_softc *sc = arg;
-	void *ptr = (char *)&sc->vsc_cfg + offset;
+	const uint8_t *base;
+	size_t cfgsize;
 
-	memcpy(retval, ptr, size);
+	if (sc->vsc_mvisor) {
+		base = (const uint8_t *)&sc->vsc_vgpu_cfg;
+		cfgsize = sizeof(sc->vsc_vgpu_cfg);
+	} else {
+		base = (const uint8_t *)&sc->vsc_cfg;
+		cfgsize = sizeof(sc->vsc_cfg);
+	}
+	*retval = 0;
+	if (offset < 0 || (size_t)offset + size > cfgsize)
+		return (0);		/* out-of-range read reads as zero */
+	memcpy(retval, base + offset, size);
 	return (0);
 }
 
@@ -1056,14 +1139,16 @@ vtgpu_common_read(struct vtgpu_softc *sc, uint64_t off)
 {
 	uint16_t q = sc->vsc_qsel;
 	bool qok = (q < VTGPU_MAXQ);
+	uint64_t feat = sc->vsc_mvisor ? VTGPU_MVISOR_FEATURES :
+	    VTGPU_MODERN_FEATURES;
 
 	switch (off) {
 	case VTGPU_CC_DFSELECT:	return sc->vsc_dev_feature_sel;
 	case VTGPU_CC_DF:
 		if (sc->vsc_dev_feature_sel == 0)
-			return (uint32_t)VTGPU_MODERN_FEATURES;
+			return (uint32_t)feat;
 		if (sc->vsc_dev_feature_sel == 1)
-			return (uint32_t)(VTGPU_MODERN_FEATURES >> 32);
+			return (uint32_t)(feat >> 32);
 		return 0;
 	case VTGPU_CC_GFSELECT:	return sc->vsc_drv_feature_sel;
 	case VTGPU_CC_GF:
@@ -1330,6 +1415,8 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 		if (h) sc->vsc_height = (uint32_t)atoi(h);
 		render_node     = get_config_value_node(nvl, "render");
 		wayland_display = get_config_value_node(nvl, "wayland");
+		sc->vsc_mvisor  = get_config_bool_node_default(nvl, "mvisor",
+		    false);
 	}
 
 	/* Environment overrides. */
@@ -1353,9 +1440,20 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 	 * environment set up above steers which backend that init selects.
 	 */
 
-	/* Fill in the virtio-gpu config space. */
+	/* Fill in the device config space (both layouts share num_capsets=2:
+	 * VIRGL + VIRGL2). */
 	sc->vsc_cfg.num_scanouts = VTGPU_NUM_SCANOUTS;
-	sc->vsc_cfg.num_capsets  = 2; /* VIRGL + VIRGL2 */
+	sc->vsc_cfg.num_capsets  = 2;
+	if (sc->vsc_mvisor) {
+		/* Mirror mvisor's vgpu_config so its Windows driver attaches. */
+		sc->vsc_vgpu_cfg.staging     = 0;
+		sc->vsc_vgpu_cfg.num_queues  = VTGPU_MAXQ;
+		sc->vsc_vgpu_cfg.num_capsets = 2;
+		sc->vsc_vgpu_cfg.memory_size = 1ULL << 30;	/* 1 GiB */
+		sc->vsc_vgpu_cfg.capabilities =
+		    VTGPU_PARAM_3D_FEATURES | VTGPU_PARAM_CAPSET_QUERY_FIX |
+		    VTGPU_PARAM_CONTEXT_INIT | VTGPU_PARAM_SUPPORTED_CAPSET_IDS;
+	}
 
 	pthread_mutex_init(&sc->vsc_mtx, NULL);
 	pthread_cond_init(&sc->vsc_cnd, NULL);
@@ -1387,16 +1485,20 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 	vtgpu_modern_reset(sc);
 
 	/*
-	 * PCI identity: modern virtio-gpu.  Device ID 0x1040+type routes
-	 * Linux down the modern probe path; revision >= 1 marks it
-	 * non-transitional.  Subsystem fields mirror virtio convention.
+	 * PCI identity.  Device ID 0x1040+type routes the guest down the
+	 * modern virtio-pci probe path; revision >= 1 marks it
+	 * non-transitional.  In mvisor mode we present mvisor's device id
+	 * (0x105B) so its Windows vgpu driver binds; otherwise the standard
+	 * virtio-gpu id (0x1050) for the in-kernel Linux driver.
 	 */
-	pci_set_cfgdata16(pi, PCIR_DEVICE, VIRTIO_DEV_GPU);
+	pci_set_cfgdata16(pi, PCIR_DEVICE,
+	    sc->vsc_mvisor ? VTGPU_DEV_VGPU : VIRTIO_DEV_GPU);
 	pci_set_cfgdata16(pi, PCIR_VENDOR, VIRTIO_VENDOR);
 	pci_set_cfgdata8(pi, PCIR_REVID, 1);
 	pci_set_cfgdata8(pi, PCIR_CLASS, PCIC_DISPLAY);
 	pci_set_cfgdata8(pi, PCIR_SUBCLASS, PCIS_DISPLAY_OTHER);
-	pci_set_cfgdata16(pi, PCIR_SUBDEV_0, VIRTIO_ID_GPU);
+	pci_set_cfgdata16(pi, PCIR_SUBDEV_0,
+	    sc->vsc_mvisor ? (VTGPU_DEV_VGPU - 0x1040) : VIRTIO_ID_GPU);
 	pci_set_cfgdata16(pi, PCIR_SUBVEND_0, VIRTIO_VENDOR);
 
 	/*
