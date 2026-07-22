@@ -255,6 +255,8 @@ int	pci_parse_slot(char *opt);
 void    pci_print_supported_devices(void);
 void	pci_populate_msicap(struct msicap *cap, int msgs, int nextptr);
 int	pci_emul_add_msixcap(struct pci_devinst *pi, int msgnum, int barnum);
+int	pci_emul_add_capability(struct pci_devinst *pi, u_char *capdata,
+	    int caplen);
 int	pci_emul_msix_twrite(struct pci_devinst *pi, uint64_t offset, int size,
 			     uint64_t value);
 uint64_t pci_emul_msix_tread(struct pci_devinst *pi, uint64_t offset, int size);
