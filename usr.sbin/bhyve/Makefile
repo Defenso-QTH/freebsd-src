@@ -75,6 +75,14 @@ SRCS=	\
 SRCS+=	snapshot.c
 .endif
 
+.if defined(BHYVE_VIRGL_SUPPORT)
+SRCS+=	pci_virtio_gpu.c
+CFLAGS+= -I/usr/local/include/virgl
+# Absolute path so the cross-linker (lld with --sysroot) finds it on the build
+# host rather than inside the FreeBSD sysroot where no ports library exists.
+LDADD+= /usr/local/lib/libvirglrenderer.so
+.endif
+
 .include "${MACHINE_CPUARCH}/Makefile.inc"
 
 SUBDIR+= slirp
