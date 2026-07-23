@@ -52,6 +52,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <time.h>
 
 #include <virglrenderer.h>
 
@@ -995,8 +996,34 @@ vtgpu_worker(void *arg)
 	while (sc->vsc_running) {
 		while (sc->vsc_running &&
 		    !vq_has_descs(&sc->vsc_queues[VTGPU_CONTROLQ]) &&
-		    !vq_has_descs(&sc->vsc_queues[VTGPU_CURSORQ]))
-			pthread_cond_wait(&sc->vsc_cnd, &sc->vsc_mtx);
+		    !vq_has_descs(&sc->vsc_queues[VTGPU_CURSORQ])) {
+			if (!TAILQ_EMPTY(&sc->vsc_fences)) {
+				/*
+				 * Fenced commands are awaiting GPU completion.
+				 * The guest may be blocked waiting for one of
+				 * those fences and will not ring a queue again,
+				 * so we must not sleep indefinitely: poll
+				 * virglrenderer for fence progress on a short
+				 * timeout until the fence list drains
+				 * (write_fence releases each chain as its fence
+				 * fires).  Without this the guest hangs forever
+				 * on the first fenced submit/transfer.
+				 */
+				struct timespec ts;
+
+				clock_gettime(CLOCK_REALTIME, &ts);
+				ts.tv_nsec += 1000000;		/* 1 ms */
+				if (ts.tv_nsec >= 1000000000L) {
+					ts.tv_sec++;
+					ts.tv_nsec -= 1000000000L;
+				}
+				pthread_cond_timedwait(&sc->vsc_cnd,
+				    &sc->vsc_mtx, &ts);
+				virgl_renderer_poll();
+			} else {
+				pthread_cond_wait(&sc->vsc_cnd, &sc->vsc_mtx);
+			}
+		}
 
 		if (!sc->vsc_running)
 			break;
