@@ -1441,30 +1441,39 @@ vtgpu_virgl_init(struct vtgpu_softc *sc)
 {
 	int flags;
 
-	/* Headless via the render node (get_drm_fd -> GBM platform). */
-	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLES;
+	/*
+	 * Headless via the render node (get_drm_fd -> GBM platform).
+	 *
+	 * Prefer desktop GL (USE_EGL alone) over GLES: on this host desktop
+	 * GL exposes the full GL 4.6 / GLSL 460 profile, whereas the GLES
+	 * backend caps the guest at a GL 4.3-equivalent profile.  Some guests
+	 * (notably Blender) require the higher profile, and the GLES profile
+	 * can also mis-render text/OSD.  GLES stays as a fallback for hosts
+	 * where desktop GL is unavailable.
+	 */
+	flags = VIRGL_RENDERER_USE_EGL;
 	if (virgl_renderer_init(sc, flags, &vtgpu_virgl_cbs) == 0)
 		return (0);
-	flags = VIRGL_RENDERER_USE_EGL;
+	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLES;
 	if (virgl_renderer_init(sc, flags, &vtgpu_virgl_cbs) == 0)
 		return (0);
 
 	/* Headless via surfaceless EGL (no window system, no render-node fd). */
-	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLES |
-	    VIRGL_RENDERER_USE_SURFACELESS;
+	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_SURFACELESS;
 	if (virgl_renderer_init(sc, flags, &vtgpu_virgl_cbs) == 0)
 		return (0);
-	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_SURFACELESS;
+	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLES |
+	    VIRGL_RENDERER_USE_SURFACELESS;
 	if (virgl_renderer_init(sc, flags, &vtgpu_virgl_cbs) == 0)
 		return (0);
 
 	/* Probe for a running Wayland compositor and retry EGL. */
 	if (getenv("WAYLAND_DISPLAY") == NULL && getenv("DISPLAY") == NULL)
 		vtgpu_probe_wayland();
-	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLES;
+	flags = VIRGL_RENDERER_USE_EGL;
 	if (virgl_renderer_init(sc, flags, &vtgpu_virgl_cbs) == 0)
 		return (0);
-	flags = VIRGL_RENDERER_USE_EGL;
+	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLES;
 	if (virgl_renderer_init(sc, flags, &vtgpu_virgl_cbs) == 0)
 		return (0);
 
