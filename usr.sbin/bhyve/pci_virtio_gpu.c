@@ -422,6 +422,10 @@ vtgpu_cmd_resource_create_2d(struct vtgpu_softc *sc, struct vqueue_info *vq,
 		.flags          = 0,
 	};
 	int ret = virgl_renderer_resource_create(&args, NULL, 0);
+	/* See vtgpu_cmd_resource_create_3d: mvisor never sends the attach. */
+	if (ret == 0 && sc->vsc_mvisor && hdr->ctx_id != 0)
+		virgl_renderer_ctx_attach_resource(hdr->ctx_id,
+		    (int)cmd->resource_id);
 	uint32_t type = ret ? VIRTIO_GPU_RESP_ERR_UNSPEC
 	                    : VIRTIO_GPU_RESP_OK_NODATA;
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx, type, wiov, nwiov);
@@ -447,6 +451,18 @@ vtgpu_cmd_resource_create_3d(struct vtgpu_softc *sc, struct vqueue_info *vq,
 		.flags          = cmd->flags,
 	};
 	int ret = virgl_renderer_resource_create(&args, NULL, 0);
+	/*
+	 * mvisor's guest driver never emits CTX_ATTACH_RESOURCE (its
+	 * AttachResource path is dead code); it expects the host to bind the
+	 * new resource to the context named in the create command's ctx_id.
+	 * Without this the resource exists globally but stays invisible to the
+	 * context, so vrend surface-create / transfers report "Illegal
+	 * resource".  Standard virtio-gpu guests send the attach themselves,
+	 * so only do this in mvisor mode.
+	 */
+	if (ret == 0 && sc->vsc_mvisor && hdr->ctx_id != 0)
+		virgl_renderer_ctx_attach_resource(hdr->ctx_id,
+		    (int)cmd->resource_id);
 	uint32_t type = ret ? VIRTIO_GPU_RESP_ERR_UNSPEC
 	                    : VIRTIO_GPU_RESP_OK_NODATA;
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx, type, wiov, nwiov);
