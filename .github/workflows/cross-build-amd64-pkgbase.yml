@@ -90,7 +90,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: virgl-sysroot
-          key: virglrenderer-fbsd15-1.2.0-venus
+          key: virglrenderer-fbsd15-1.2.0-venus-2
 
       - name: stage stock virglrenderer (FreeBSD VM — cold cache only)
         if: steps.virgl-cache.outputs.cache-hit != 'true'
@@ -111,7 +111,10 @@ jobs:
             # brings them to the Ubuntu runner and actions/cache persists them.
             mkdir -p "${GITHUB_WORKSPACE}/virgl-sysroot/include/virgl" \
                      "${GITHUB_WORKSPACE}/virgl-sysroot/lib"
-            cp /usr/local/include/virgl/virglrenderer.h \
+            # Copy the whole virgl header set: virglrenderer.h #includes the
+            # generated virgl-version.h (and possibly others), so a single-file
+            # copy leaves a dangling include.
+            cp /usr/local/include/virgl/*.h \
                "${GITHUB_WORKSPACE}/virgl-sysroot/include/virgl/"
             # libvirglrenderer.so plus the libraries it records as NEEDED, so
             # the Ubuntu cross-link resolves them (venus adds libvulkan and
