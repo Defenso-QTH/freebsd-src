@@ -79,76 +79,51 @@ jobs:
           # _pkgbootstrap skips bootstrap iff ${LOCALBASE}/sbin/pkg exists:
           ls -l /usr/local/sbin/pkg || ls -l /usr/local/bin/pkg
 
-      # virglrenderer-mvisor headers and .so are required by bhyve when
-      # BHYVE_VIRGL_SUPPORT=yes is passed to make.  During a cross-build on
-      # Ubuntu the library cannot come from the FreeBSD ports tree, so we
-      # carry it through the actions/cache keyed on the pinned upstream commit.
-      # On a cold cache the FreeBSD VM builds it from source; subsequent runs
+      # virglrenderer (stock x11/virglrenderer, VENUS on by default) headers
+      # and .so are required by bhyve when BHYVE_VIRGL_SUPPORT=yes.  During the
+      # cross-build on Ubuntu the FreeBSD header/libraries are staged into
+      # virgl-sysroot by a short FreeBSD VM step (a plain pkg install of the
+      # official package) and carried via actions/cache; subsequent runs
       # restore it in seconds.
-      - name: restore virglrenderer-mvisor cache
+      - name: restore virglrenderer cache
         id: virgl-cache
         uses: actions/cache@v4
         with:
           path: virgl-sysroot
-          key: virglrenderer-mvisor-fbsd15-8df4cba170940dad9350a99900293adbcef39b6c
+          key: virglrenderer-fbsd15-1.2.0-venus
 
-      - name: build virglrenderer-mvisor (FreeBSD VM — cold cache only)
+      - name: stage stock virglrenderer (FreeBSD VM — cold cache only)
         if: steps.virgl-cache.outputs.cache-hit != 'true'
         uses: vmactions/freebsd-vm@v1
         with:
           release: "15.1"
           usesh: true
-          mem: 4096
           copyback: true
           run: |
             set -eux
             export ASSUME_ALWAYS_YES=yes
-            VIRGL_COMMIT="8df4cba170940dad9350a99900293adbcef39b6c"
+            # The official x11/virglrenderer port is built with the VENUS
+            # option on by default, so the stock package already carries
+            # Vulkan (venus) support and its render server.  Just install it.
+            pkg install -y virglrenderer
 
-            # Fast path: already built by poudriere and published to Pages.
-            if fetch -qo /tmp/virgl.pkg \
-                 "https://defenso-qth.github.io/freebsd-ports/All/virglrenderer-mvisor-0.10.4.20230112.pkg" \
-               2>/dev/null; then
-              pkg install -y libepoxy libdrm mesa-libs
-              pkg add /tmp/virgl.pkg
-              echo "Installed virglrenderer-mvisor from Pages"
-            else
-              # Source build fallback: compile from the pinned GitLab commit.
-              pkg install -y meson ninja pkgconf libepoxy libdrm py311-pyyaml
-              fetch -qo /tmp/virgl.tar.gz \
-                "https://gitlab.freedesktop.org/virgl/virglrenderer/-/archive/${VIRGL_COMMIT}/virglrenderer-${VIRGL_COMMIT}.tar.gz"
-              mkdir /tmp/vsrc
-              tar -xzf /tmp/virgl.tar.gz -C /tmp/vsrc --strip-components=1
-              # pthread_np.h is present on FreeBSD; the upstream guard misses it.
-              sed -i '' \
-                's/#ifdef HAVE_PTHREAD_NP_H/#if defined(HAVE_PTHREAD_NP_H) || defined(__FreeBSD__)/' \
-                /tmp/vsrc/src/mesa/util/u_thread.h
-              cd /tmp/vsrc
-              meson setup /tmp/vbuild \
-                -Dvenus=false -Ddrm=disabled -Ddrm-msm-experimental=false
-              ninja -C /tmp/vbuild -j$(nproc)
-              install -d /usr/local/lib /usr/local/include/virgl
-              install -m 0755 /tmp/vbuild/src/libvirglrenderer.so \
-                              /tmp/vbuild/src/libvirglrenderer.so.1 \
-                /usr/local/lib/
-              find /tmp/vbuild/src -name 'libvirglrenderer.so.*.*' \
-                -exec install -m 0755 {} /usr/local/lib/ \;
-              install -m 0644 /tmp/vsrc/src/virglrenderer.h \
-                /usr/local/include/virgl/
-              echo "Built virglrenderer-mvisor from source"
-            fi
-
-            # Stage into the workspace so copyback brings it to the Ubuntu runner
-            # and actions/cache can persist it for future runs.
+            # Stage the header and libraries into the workspace so copyback
+            # brings them to the Ubuntu runner and actions/cache persists them.
             mkdir -p "${GITHUB_WORKSPACE}/virgl-sysroot/include/virgl" \
                      "${GITHUB_WORKSPACE}/virgl-sysroot/lib"
             cp /usr/local/include/virgl/virglrenderer.h \
                "${GITHUB_WORKSPACE}/virgl-sysroot/include/virgl/"
-            cp /usr/local/lib/libvirglrenderer.so* \
-               "${GITHUB_WORKSPACE}/virgl-sysroot/lib/"
+            # libvirglrenderer.so plus the libraries it records as NEEDED, so
+            # the Ubuntu cross-link resolves them (venus adds libvulkan and
+            # libepoll-shim on top of the GL/GBM/DRM deps).
+            for l in libvirglrenderer libvulkan libepoll-shim libepoxy \
+                     libgbm libdrm; do
+              cp -a /usr/local/lib/${l}.so* \
+                 "${GITHUB_WORKSPACE}/virgl-sysroot/lib/" 2>/dev/null || true
+            done
             ls -la "${GITHUB_WORKSPACE}/virgl-sysroot/lib/"
 
-      - name: install virglrenderer-mvisor for cross-build
+      - name: install virglrenderer for cross-build
         if: runner.os == 'Linux'
         run: |
           set -eu
@@ -159,7 +134,7 @@ jobs:
           }
           sudo mkdir -p /usr/local/include /usr/local/lib
           sudo cp -r virgl-sysroot/include/virgl /usr/local/include/
-          sudo cp virgl-sysroot/lib/libvirglrenderer.so* /usr/local/lib/
+          sudo cp -a virgl-sysroot/lib/*.so* /usr/local/lib/
           # Append to the make args already set by create-environment.
           echo "EXTRA_MAKE_ARGS=${EXTRA_MAKE_ARGS} BHYVE_VIRGL_SUPPORT=yes" >> "$GITHUB_ENV"
           echo "virglrenderer staged; bhyve will build with BHYVE_VIRGL_SUPPORT=yes"
