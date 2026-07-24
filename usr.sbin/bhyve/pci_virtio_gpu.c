@@ -116,6 +116,18 @@ struct virgl_box {
 	((1ULL << VIRTIO_GPU_F_VIRGL) | (1ULL << VTGPU_F_VERSION_1_BIT))
 
 /*
+ * With venus=on we additionally negotiate CONTEXT_INIT (so the guest kernel
+ * exposes context-init / venus contexts to userspace) and RESOURCE_BLOB (the
+ * venus command ring is a guest-memory blob resource).  Without these two
+ * bits the guest's venus ICD reports "no valid GPUs".  The feature numbers
+ * come from <dev/virtio/gpu/virtio_gpu.h>.
+ */
+#define	VTGPU_VENUS_FEATURES	\
+	(VTGPU_MODERN_FEATURES | \
+	 (1ULL << VIRTIO_GPU_F_CONTEXT_INIT) | \
+	 (1ULL << VIRTIO_GPU_F_RESOURCE_BLOB))
+
+/*
  * mvisor-compatible "virtio-vgpu" mode (device option `mvisor=on`).
  *
  * mvisor's Windows guest driver drives the *same* virtio-gpu 3D command
@@ -136,6 +148,13 @@ struct virgl_box {
 #define	VTGPU_PARAM_CROSS_DEVICE	(1u << 4)
 #define	VTGPU_PARAM_CONTEXT_INIT	(1u << 5)
 #define	VTGPU_PARAM_SUPPORTED_CAPSET_IDS	(1u << 6)
+
+/*
+ * Capset id for the Venus (Vulkan) renderer.  virtio_gpu.h only defines the
+ * VIRGL/VIRGL2 capsets; VENUS is advertised as a third capset (index 2) when
+ * the device is started with venus=on.
+ */
+#define	VIRTIO_GPU_CAPSET_VENUS		4
 
 /* mvisor's device config space (see mvisor devices/virtio/virtio_vgpu.h). */
 struct vgpu_config {
@@ -225,6 +244,7 @@ struct vtgpu_softc {
 	struct virtio_softc	vsc_vs;
 	struct virtio_gpu_config vsc_cfg;
 	bool			vsc_mvisor;	/* present mvisor vgpu identity */
+	bool			vsc_venus;	/* advertise Venus (Vulkan) capset */
 	struct vgpu_config	vsc_vgpu_cfg;	/* device config in mvisor mode */
 	struct vqueue_info	vsc_queues[VTGPU_MAXQ];
 	pthread_mutex_t		vsc_mtx;
@@ -601,6 +621,102 @@ vtgpu_cmd_resource_detach_backing(struct vtgpu_softc *sc,
 	    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
 }
 
+/*
+ * RESOURCE_CREATE_BLOB.  Used by venus: the command ring and other shared
+ * buffers are guest-memory blobs (BLOB_MEM_GUEST / HOST3D_GUEST) whose pages
+ * the guest supplies as mem entries — we translate them to host iovecs and
+ * hand them to virglrenderer, which (with USE_EXTERNAL_BLOB) shares them with
+ * the render server.  Purely host-allocated blobs (HOST3D, nr_entries == 0)
+ * would need the host-visible PCI window, which is not implemented yet.
+ */
+static void
+vtgpu_cmd_resource_create_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
+    const struct virtio_gpu_ctrl_hdr *hdr, uint16_t chain_idx,
+    const struct virtio_gpu_resource_create_blob *cmd,
+    const struct virtio_gpu_mem_entry *entries,
+    struct iovec *wiov, int nwiov)
+{
+	struct virgl_renderer_resource_create_blob_args args;
+	struct iovec *iovs = NULL;
+	uint32_t n = cmd->nr_entries;
+	uint32_t i;
+	int ret;
+
+	if (n > VTGPU_MAX_BACKING) {
+		vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
+		    VIRTIO_GPU_RESP_ERR_UNSPEC, wiov, nwiov);
+		return;
+	}
+	if (n > 0) {
+		iovs = calloc(n, sizeof(*iovs));
+		if (iovs == NULL) {
+			vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
+			    VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, wiov, nwiov);
+			return;
+		}
+		for (i = 0; i < n; i++) {
+			iovs[i].iov_base = paddr_guest2host(sc->vsc_ctx,
+			    entries[i].addr, entries[i].length);
+			iovs[i].iov_len  = entries[i].length;
+			if (iovs[i].iov_base == NULL) {
+				free(iovs);
+				vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
+				    VIRTIO_GPU_RESP_ERR_UNSPEC, wiov, nwiov);
+				return;
+			}
+		}
+	}
+
+	memset(&args, 0, sizeof(args));
+	args.res_handle = cmd->resource_id;
+	args.ctx_id     = hdr->ctx_id;
+	args.blob_mem   = cmd->blob_mem;
+	args.blob_flags = cmd->blob_flags;
+	args.blob_id    = cmd->blob_id;
+	args.size       = cmd->size;
+	args.iovecs     = iovs;
+	args.num_iovs   = n;
+
+	ret = virgl_renderer_resource_create_blob(&args);
+	DPRINTF("create_blob id=%u mem=%u flags=0x%x blob_id=%lu size=%lu "
+	    "nr=%u ctx=%u ret=%d", cmd->resource_id, cmd->blob_mem,
+	    cmd->blob_flags, (unsigned long)cmd->blob_id,
+	    (unsigned long)cmd->size, n, hdr->ctx_id, ret);
+	/* Bind to the creating context (same convention as our other creates). */
+	if (ret == 0 && hdr->ctx_id != 0)
+		virgl_renderer_ctx_attach_resource(hdr->ctx_id,
+		    (int)cmd->resource_id);
+	/* virglrenderer copies the (const) iovec array; free our copy. */
+	free(iovs);
+	vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
+	    ret ? VIRTIO_GPU_RESP_ERR_UNSPEC : VIRTIO_GPU_RESP_OK_NODATA,
+	    wiov, nwiov);
+}
+
+/*
+ * RESOURCE_MAP_BLOB / UNMAP_BLOB.  Guest-memory blobs (the venus ring) never
+ * take this path — the guest already owns their pages.  Host-visible (HOST3D)
+ * mapping into a guest PCI window is future work; for now report the cache
+ * type so probes succeed.
+ */
+static void
+vtgpu_cmd_resource_map_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
+    const struct virtio_gpu_ctrl_hdr *hdr, uint16_t chain_idx,
+    const struct virtio_gpu_resource_map_blob *cmd,
+    struct iovec *wiov, int nwiov)
+{
+	struct virtio_gpu_resp_map_info resp = {};
+	uint32_t map_info = 0;
+
+	virgl_renderer_resource_get_map_info(cmd->resource_id, &map_info);
+	resp.hdr.type     = VIRTIO_GPU_RESP_OK_MAP_INFO;
+	resp.hdr.flags    = hdr->flags & VIRTIO_GPU_FLAG_FENCE;
+	resp.hdr.fence_id = hdr->fence_id;
+	resp.hdr.ctx_id   = hdr->ctx_id;
+	resp.map_info     = map_info;
+	vtgpu_respond(sc, vq, hdr, chain_idx, &resp, sizeof(resp), wiov, nwiov);
+}
+
 static void
 vtgpu_cmd_get_capset_info(struct vtgpu_softc *sc, struct vqueue_info *vq,
     const struct virtio_gpu_ctrl_hdr *hdr, uint16_t chain_idx,
@@ -614,13 +730,30 @@ vtgpu_cmd_get_capset_info(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	resp.hdr.ctx_id   = hdr->ctx_id;
 
 	/*
-	 * We expose two capsets: index 0 = VIRGL, index 1 = VIRGL2.
-	 * The guest probes these by capset_index, not by ID.
+	 * We expose index 0 = VIRGL, index 1 = VIRGL2, and — when venus is
+	 * enabled — index 2 = VENUS.  The guest probes these by capset_index,
+	 * not by ID.
 	 */
-	uint32_t capset_id = (cmd->capset_index == 0) ?
-	    VIRTIO_GPU_CAPSET_VIRGL : VIRTIO_GPU_CAPSET_VIRGL2;
+	uint32_t capset_id;
+	switch (cmd->capset_index) {
+	case 0:
+		capset_id = VIRTIO_GPU_CAPSET_VIRGL;
+		break;
+	case 2:
+		if (sc->vsc_venus) {
+			capset_id = VIRTIO_GPU_CAPSET_VENUS;
+			break;
+		}
+		/* FALLTHROUGH */
+	case 1:
+	default:
+		capset_id = VIRTIO_GPU_CAPSET_VIRGL2;
+		break;
+	}
 	uint32_t max_ver = 0, max_size = 0;
 	virgl_renderer_get_cap_set(capset_id, &max_ver, &max_size);
+	DPRINTF("capset_info idx=%u -> id=%u max_ver=%u max_size=%u",
+	    cmd->capset_index, capset_id, max_ver, max_size);
 
 	resp.capset_id          = capset_id;
 	resp.capset_max_version = max_ver;
@@ -636,6 +769,8 @@ vtgpu_cmd_get_capset(struct vtgpu_softc *sc, struct vqueue_info *vq,
 {
 	uint32_t max_ver = 0, max_size = 0;
 	virgl_renderer_get_cap_set(cmd->capset_id, &max_ver, &max_size);
+	DPRINTF("get_capset id=%u ver=%u -> max_ver=%u max_size=%u",
+	    cmd->capset_id, cmd->capset_version, max_ver, max_size);
 
 	if (max_size == 0) {
 		vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
@@ -666,8 +801,22 @@ vtgpu_cmd_ctx_create(struct vtgpu_softc *sc, struct vqueue_info *vq,
     const struct virtio_gpu_ctx_create *cmd,
     struct iovec *wiov, int nwiov)
 {
-	int ret = virgl_renderer_context_create(hdr->ctx_id,
-	    cmd->nlen, cmd->debug_name);
+	int ret;
+
+	if (cmd->context_init != 0) {
+		/*
+		 * Context-init: the low byte of context_init selects the
+		 * capset (VIRGL / VIRGL2 / VENUS).  virglrenderer's context
+		 * flags use the same capset-id encoding in their low byte, so
+		 * pass context_init straight through.  This is the path a
+		 * Venus (Vulkan) guest takes to create a vkr context.
+		 */
+		ret = virgl_renderer_context_create_with_flags(hdr->ctx_id,
+		    cmd->context_init, cmd->nlen, cmd->debug_name);
+	} else {
+		ret = virgl_renderer_context_create(hdr->ctx_id,
+		    cmd->nlen, cmd->debug_name);
+	}
 	uint32_t type = ret ? VIRTIO_GPU_RESP_ERR_UNSPEC
 	                    : VIRTIO_GPU_RESP_OK_NODATA;
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx, type, wiov, nwiov);
@@ -896,6 +1045,30 @@ vtgpu_process_controlq(struct vtgpu_softc *sc, int qidx)
 			vtgpu_cmd_resource_detach_backing(sc, vq, hdr, req.idx,
 			    (const struct virtio_gpu_resource_detach_backing *)hdr,
 			    wiov, nwiov);
+			break;
+
+		case VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB: {
+			const struct virtio_gpu_resource_create_blob *cb =
+			    (const void *)hdr;
+			const struct virtio_gpu_mem_entry *ents =
+			    (const void *)(cb + 1);
+			vtgpu_cmd_resource_create_blob(sc, vq, hdr, req.idx,
+			    cb, ents, wiov, nwiov);
+			break;
+		}
+
+		case VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB:
+			vtgpu_cmd_resource_map_blob(sc, vq, hdr, req.idx,
+			    (const struct virtio_gpu_resource_map_blob *)hdr,
+			    wiov, nwiov);
+			break;
+
+		case VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB:
+			virgl_renderer_resource_unmap(
+			    ((const struct virtio_gpu_resource_unmap_blob *)
+			    hdr)->resource_id);
+			vtgpu_resp_nodata(sc, vq, hdr, req.idx,
+			    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
 			break;
 
 		case VIRTIO_GPU_CMD_GET_CAPSET_INFO:
@@ -1238,7 +1411,7 @@ vtgpu_common_read(struct vtgpu_softc *sc, uint64_t off)
 	uint16_t q = sc->vsc_qsel;
 	bool qok = (q < VTGPU_MAXQ);
 	uint64_t feat = sc->vsc_mvisor ? VTGPU_MVISOR_FEATURES :
-	    VTGPU_MODERN_FEATURES;
+	    (sc->vsc_venus ? VTGPU_VENUS_FEATURES : VTGPU_MODERN_FEATURES);
 
 	switch (off) {
 	case VTGPU_CC_DFSELECT:	return sc->vsc_dev_feature_sel;
@@ -1468,6 +1641,17 @@ static int
 vtgpu_virgl_init(struct vtgpu_softc *sc)
 {
 	int flags;
+	/*
+	 * When venus is enabled, OR the Venus + render-server flags into every
+	 * backend attempt.  RENDER_SERVER makes virglrenderer bring up the
+	 * out-of-process virgl_render_server (which it fork/execs itself, since
+	 * we do not provide a get_server_fd callback) and proxy Vulkan command
+	 * streams to it; VENUS selects the vkr renderer and a GBM-compatible
+	 * resource layout for GL<->Vulkan interop.
+	 */
+	int venus = sc->vsc_venus ?
+	    (VIRGL_RENDERER_VENUS | VIRGL_RENDERER_RENDER_SERVER |
+	     VIRGL_RENDERER_USE_EXTERNAL_BLOB) : 0;
 
 	/*
 	 * Headless via the render node (get_drm_fd -> GBM platform).
@@ -1480,33 +1664,33 @@ vtgpu_virgl_init(struct vtgpu_softc *sc)
 	 * where desktop GL is unavailable.
 	 */
 	flags = VIRGL_RENDERER_USE_EGL;
-	if (virgl_renderer_init(sc, flags, &vtgpu_virgl_cbs) == 0)
+	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0)
 		return (0);
 	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLES;
-	if (virgl_renderer_init(sc, flags, &vtgpu_virgl_cbs) == 0)
+	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0)
 		return (0);
 
 	/* Headless via surfaceless EGL (no window system, no render-node fd). */
 	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_SURFACELESS;
-	if (virgl_renderer_init(sc, flags, &vtgpu_virgl_cbs) == 0)
+	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0)
 		return (0);
 	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLES |
 	    VIRGL_RENDERER_USE_SURFACELESS;
-	if (virgl_renderer_init(sc, flags, &vtgpu_virgl_cbs) == 0)
+	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0)
 		return (0);
 
 	/* Probe for a running Wayland compositor and retry EGL. */
 	if (getenv("WAYLAND_DISPLAY") == NULL && getenv("DISPLAY") == NULL)
 		vtgpu_probe_wayland();
 	flags = VIRGL_RENDERER_USE_EGL;
-	if (virgl_renderer_init(sc, flags, &vtgpu_virgl_cbs) == 0)
+	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0)
 		return (0);
 	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLES;
-	if (virgl_renderer_init(sc, flags, &vtgpu_virgl_cbs) == 0)
+	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0)
 		return (0);
 
 	flags = VIRGL_RENDERER_USE_GLX;
-	if (virgl_renderer_init(sc, flags, &vtgpu_virgl_cbs) == 0)
+	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0)
 		return (0);
 
 	return (1);
@@ -1542,6 +1726,8 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 		wayland_display = get_config_value_node(nvl, "wayland");
 		sc->vsc_mvisor  = get_config_bool_node_default(nvl, "mvisor",
 		    false);
+		sc->vsc_venus   = get_config_bool_node_default(nvl, "venus",
+		    false);
 		pci_vtgpu_debug = get_config_bool_node_default(nvl, "debug",
 		    false);
 	}
@@ -1574,10 +1760,10 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 	 * environment set up above steers which backend that init selects.
 	 */
 
-	/* Fill in the device config space (both layouts share num_capsets=2:
-	 * VIRGL + VIRGL2). */
+	/* Fill in the device config space.  Base layout advertises 2 capsets
+	 * (VIRGL + VIRGL2); with venus=on a third (VENUS) is added. */
 	sc->vsc_cfg.num_scanouts = VTGPU_NUM_SCANOUTS;
-	sc->vsc_cfg.num_capsets  = 2;
+	sc->vsc_cfg.num_capsets  = sc->vsc_venus ? 3 : 2;
 	if (sc->vsc_mvisor) {
 		/* Mirror mvisor's vgpu_config so its Windows driver attaches. */
 		sc->vsc_vgpu_cfg.staging     = 0;
