@@ -423,6 +423,9 @@ vtgpu_cmd_resource_create_2d(struct vtgpu_softc *sc, struct vqueue_info *vq,
 		.flags          = 0,
 	};
 	int ret = virgl_renderer_resource_create(&args, NULL, 0);
+	DPRINTF("create_2d id=%u fmt=%u %ux%u ctx=%u ret=%d",
+	    cmd->resource_id, cmd->format, cmd->width, cmd->height,
+	    hdr->ctx_id, ret);
 	/* See vtgpu_cmd_resource_create_3d: mvisor never sends the attach. */
 	if (ret == 0 && sc->vsc_mvisor && hdr->ctx_id != 0)
 		virgl_renderer_ctx_attach_resource(hdr->ctx_id,
@@ -452,6 +455,11 @@ vtgpu_cmd_resource_create_3d(struct vtgpu_softc *sc, struct vqueue_info *vq,
 		.flags          = cmd->flags,
 	};
 	int ret = virgl_renderer_resource_create(&args, NULL, 0);
+	DPRINTF("create_3d id=%u tgt=%u fmt=%u bind=0x%x %ux%ux%u "
+	    "array=%u levels=%u samples=%u ctx=%u ret=%d",
+	    cmd->resource_id, cmd->target, cmd->format, cmd->bind,
+	    cmd->width, cmd->height, cmd->depth, cmd->array_size,
+	    cmd->last_level, cmd->nr_samples, hdr->ctx_id, ret);
 	/*
 	 * mvisor's guest driver never emits CTX_ATTACH_RESOURCE (its
 	 * AttachResource path is dead code); it expects the host to bind the
@@ -515,6 +523,9 @@ vtgpu_cmd_transfer_to_host_2d(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	};
 	int ret = virgl_renderer_transfer_write_iov(cmd->resource_id, 0,
 	    0, 0, 0, &box, cmd->offset, NULL, 0);
+	DPRINTF("xfer_2d id=%u box=%u,%u %ux%u off=%lu ret=%d",
+	    cmd->resource_id, cmd->r.x, cmd->r.y, cmd->r.width, cmd->r.height,
+	    (unsigned long)cmd->offset, ret);
 	uint32_t type = ret ? VIRTIO_GPU_RESP_ERR_UNSPEC
 	                    : VIRTIO_GPU_RESP_OK_NODATA;
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx, type, wiov, nwiov);
@@ -568,6 +579,9 @@ vtgpu_cmd_resource_attach_backing(struct vtgpu_softc *sc,
 		}
 	}
 	virgl_renderer_resource_attach_iov(cmd->resource_id, iovs, (int)n);
+	DPRINTF("attach_backing id=%u nr_entries=%u n=%u gpa=0x%lx len=%u",
+	    cmd->resource_id, cmd->nr_entries, n,
+	    (unsigned long)entries[0].addr, entries[0].length);
 	/* virglrenderer takes ownership of iovs; do not free here. */
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 	    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
@@ -704,6 +718,12 @@ vtgpu_cmd_transfer_to_host_3d(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	int ret = virgl_renderer_transfer_write_iov(cmd->resource_id,
 	    hdr->ctx_id, (int)cmd->level, cmd->stride, cmd->layer_stride,
 	    &box, cmd->offset, NULL, 0);
+	DPRINTF("xfer_to_3d id=%u ctx=%u lvl=%u stride=%u lstride=%u "
+	    "box=%u,%u,%u %ux%ux%u off=%lu ret=%d",
+	    cmd->resource_id, hdr->ctx_id, cmd->level, cmd->stride,
+	    cmd->layer_stride, cmd->box.x, cmd->box.y, cmd->box.z,
+	    cmd->box.w, cmd->box.h, cmd->box.d,
+	    (unsigned long)cmd->offset, ret);
 	uint32_t type = ret ? VIRTIO_GPU_RESP_ERR_UNSPEC
 	                    : VIRTIO_GPU_RESP_OK_NODATA;
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx, type, wiov, nwiov);
@@ -722,6 +742,12 @@ vtgpu_cmd_transfer_from_host_3d(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	int ret = virgl_renderer_transfer_read_iov(cmd->resource_id,
 	    hdr->ctx_id, (int)cmd->level, cmd->stride, cmd->layer_stride,
 	    &box, cmd->offset, NULL, 0);
+	DPRINTF("xfer_from_3d id=%u ctx=%u lvl=%u stride=%u lstride=%u "
+	    "box=%u,%u,%u %ux%ux%u off=%lu ret=%d",
+	    cmd->resource_id, hdr->ctx_id, cmd->level, cmd->stride,
+	    cmd->layer_stride, cmd->box.x, cmd->box.y, cmd->box.z,
+	    cmd->box.w, cmd->box.h, cmd->box.d,
+	    (unsigned long)cmd->offset, ret);
 	uint32_t type = ret ? VIRTIO_GPU_RESP_ERR_UNSPEC
 	                    : VIRTIO_GPU_RESP_OK_NODATA;
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx, type, wiov, nwiov);
@@ -735,6 +761,8 @@ vtgpu_cmd_submit_3d(struct vtgpu_softc *sc, struct vqueue_info *vq,
 {
 	int ret = virgl_renderer_submit_cmd((void *)(uintptr_t)buf,
 	    (int)hdr->ctx_id, cmd->size / 4);
+	DPRINTF("submit_3d ctx=%u size=%uB (%u dwords) ret=%d",
+	    hdr->ctx_id, cmd->size, cmd->size / 4, ret);
 	uint32_t type = ret ? VIRTIO_GPU_RESP_ERR_UNSPEC
 	                    : VIRTIO_GPU_RESP_OK_NODATA;
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx, type, wiov, nwiov);
@@ -1513,6 +1541,8 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 		render_node     = get_config_value_node(nvl, "render");
 		wayland_display = get_config_value_node(nvl, "wayland");
 		sc->vsc_mvisor  = get_config_bool_node_default(nvl, "mvisor",
+		    false);
+		pci_vtgpu_debug = get_config_bool_node_default(nvl, "debug",
 		    false);
 	}
 
