@@ -137,6 +137,13 @@ struct virgl_box {
 #define	VTGPU_PARAM_CONTEXT_INIT	(1u << 5)
 #define	VTGPU_PARAM_SUPPORTED_CAPSET_IDS	(1u << 6)
 
+/*
+ * Capset id for the Venus (Vulkan) renderer.  virtio_gpu.h only defines the
+ * VIRGL/VIRGL2 capsets; VENUS is advertised as a third capset (index 2) when
+ * the device is started with venus=on.
+ */
+#define	VIRTIO_GPU_CAPSET_VENUS		4
+
 /* mvisor's device config space (see mvisor devices/virtio/virtio_vgpu.h). */
 struct vgpu_config {
 	uint8_t		staging;
@@ -225,6 +232,7 @@ struct vtgpu_softc {
 	struct virtio_softc	vsc_vs;
 	struct virtio_gpu_config vsc_cfg;
 	bool			vsc_mvisor;	/* present mvisor vgpu identity */
+	bool			vsc_venus;	/* advertise Venus (Vulkan) capset */
 	struct vgpu_config	vsc_vgpu_cfg;	/* device config in mvisor mode */
 	struct vqueue_info	vsc_queues[VTGPU_MAXQ];
 	pthread_mutex_t		vsc_mtx;
@@ -614,11 +622,26 @@ vtgpu_cmd_get_capset_info(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	resp.hdr.ctx_id   = hdr->ctx_id;
 
 	/*
-	 * We expose two capsets: index 0 = VIRGL, index 1 = VIRGL2.
-	 * The guest probes these by capset_index, not by ID.
+	 * We expose index 0 = VIRGL, index 1 = VIRGL2, and — when venus is
+	 * enabled — index 2 = VENUS.  The guest probes these by capset_index,
+	 * not by ID.
 	 */
-	uint32_t capset_id = (cmd->capset_index == 0) ?
-	    VIRTIO_GPU_CAPSET_VIRGL : VIRTIO_GPU_CAPSET_VIRGL2;
+	uint32_t capset_id;
+	switch (cmd->capset_index) {
+	case 0:
+		capset_id = VIRTIO_GPU_CAPSET_VIRGL;
+		break;
+	case 2:
+		if (sc->vsc_venus) {
+			capset_id = VIRTIO_GPU_CAPSET_VENUS;
+			break;
+		}
+		/* FALLTHROUGH */
+	case 1:
+	default:
+		capset_id = VIRTIO_GPU_CAPSET_VIRGL2;
+		break;
+	}
 	uint32_t max_ver = 0, max_size = 0;
 	virgl_renderer_get_cap_set(capset_id, &max_ver, &max_size);
 
@@ -666,8 +689,22 @@ vtgpu_cmd_ctx_create(struct vtgpu_softc *sc, struct vqueue_info *vq,
     const struct virtio_gpu_ctx_create *cmd,
     struct iovec *wiov, int nwiov)
 {
-	int ret = virgl_renderer_context_create(hdr->ctx_id,
-	    cmd->nlen, cmd->debug_name);
+	int ret;
+
+	if (cmd->context_init != 0) {
+		/*
+		 * Context-init: the low byte of context_init selects the
+		 * capset (VIRGL / VIRGL2 / VENUS).  virglrenderer's context
+		 * flags use the same capset-id encoding in their low byte, so
+		 * pass context_init straight through.  This is the path a
+		 * Venus (Vulkan) guest takes to create a vkr context.
+		 */
+		ret = virgl_renderer_context_create_with_flags(hdr->ctx_id,
+		    cmd->context_init, cmd->nlen, cmd->debug_name);
+	} else {
+		ret = virgl_renderer_context_create(hdr->ctx_id,
+		    cmd->nlen, cmd->debug_name);
+	}
 	uint32_t type = ret ? VIRTIO_GPU_RESP_ERR_UNSPEC
 	                    : VIRTIO_GPU_RESP_OK_NODATA;
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx, type, wiov, nwiov);
@@ -1468,6 +1505,16 @@ static int
 vtgpu_virgl_init(struct vtgpu_softc *sc)
 {
 	int flags;
+	/*
+	 * When venus is enabled, OR the Venus + render-server flags into every
+	 * backend attempt.  RENDER_SERVER makes virglrenderer bring up the
+	 * out-of-process virgl_render_server (which it fork/execs itself, since
+	 * we do not provide a get_server_fd callback) and proxy Vulkan command
+	 * streams to it; VENUS selects the vkr renderer and a GBM-compatible
+	 * resource layout for GL<->Vulkan interop.
+	 */
+	int venus = sc->vsc_venus ?
+	    (VIRGL_RENDERER_VENUS | VIRGL_RENDERER_RENDER_SERVER) : 0;
 
 	/*
 	 * Headless via the render node (get_drm_fd -> GBM platform).
@@ -1480,33 +1527,33 @@ vtgpu_virgl_init(struct vtgpu_softc *sc)
 	 * where desktop GL is unavailable.
 	 */
 	flags = VIRGL_RENDERER_USE_EGL;
-	if (virgl_renderer_init(sc, flags, &vtgpu_virgl_cbs) == 0)
+	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0)
 		return (0);
 	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLES;
-	if (virgl_renderer_init(sc, flags, &vtgpu_virgl_cbs) == 0)
+	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0)
 		return (0);
 
 	/* Headless via surfaceless EGL (no window system, no render-node fd). */
 	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_SURFACELESS;
-	if (virgl_renderer_init(sc, flags, &vtgpu_virgl_cbs) == 0)
+	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0)
 		return (0);
 	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLES |
 	    VIRGL_RENDERER_USE_SURFACELESS;
-	if (virgl_renderer_init(sc, flags, &vtgpu_virgl_cbs) == 0)
+	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0)
 		return (0);
 
 	/* Probe for a running Wayland compositor and retry EGL. */
 	if (getenv("WAYLAND_DISPLAY") == NULL && getenv("DISPLAY") == NULL)
 		vtgpu_probe_wayland();
 	flags = VIRGL_RENDERER_USE_EGL;
-	if (virgl_renderer_init(sc, flags, &vtgpu_virgl_cbs) == 0)
+	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0)
 		return (0);
 	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLES;
-	if (virgl_renderer_init(sc, flags, &vtgpu_virgl_cbs) == 0)
+	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0)
 		return (0);
 
 	flags = VIRGL_RENDERER_USE_GLX;
-	if (virgl_renderer_init(sc, flags, &vtgpu_virgl_cbs) == 0)
+	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0)
 		return (0);
 
 	return (1);
@@ -1542,6 +1589,8 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 		wayland_display = get_config_value_node(nvl, "wayland");
 		sc->vsc_mvisor  = get_config_bool_node_default(nvl, "mvisor",
 		    false);
+		sc->vsc_venus   = get_config_bool_node_default(nvl, "venus",
+		    false);
 		pci_vtgpu_debug = get_config_bool_node_default(nvl, "debug",
 		    false);
 	}
@@ -1574,10 +1623,10 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 	 * environment set up above steers which backend that init selects.
 	 */
 
-	/* Fill in the device config space (both layouts share num_capsets=2:
-	 * VIRGL + VIRGL2). */
+	/* Fill in the device config space.  Base layout advertises 2 capsets
+	 * (VIRGL + VIRGL2); with venus=on a third (VENUS) is added. */
 	sc->vsc_cfg.num_scanouts = VTGPU_NUM_SCANOUTS;
-	sc->vsc_cfg.num_capsets  = 2;
+	sc->vsc_cfg.num_capsets  = sc->vsc_venus ? 3 : 2;
 	if (sc->vsc_mvisor) {
 		/* Mirror mvisor's vgpu_config so its Windows driver attaches. */
 		sc->vsc_vgpu_cfg.staging     = 0;
