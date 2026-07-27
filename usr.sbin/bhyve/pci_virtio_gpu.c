@@ -54,6 +54,7 @@
 #include <fcntl.h>
 #include <time.h>
 #include <sys/mman.h>
+#include <dev/vmm/vmm_mem.h>	/* VM_VIRTIO_GPU_HOSTVIS devmem segid */
 
 #include <virglrenderer.h>
 
