@@ -116,6 +116,18 @@ struct virgl_box {
 	((1ULL << VIRTIO_GPU_F_VIRGL) | (1ULL << VTGPU_F_VERSION_1_BIT))
 
 /*
+ * With venus=on we additionally negotiate CONTEXT_INIT (so the guest kernel
+ * exposes context-init / venus contexts to userspace) and RESOURCE_BLOB (the
+ * venus command ring is a guest-memory blob resource).  Without these two
+ * bits the guest's venus ICD reports "no valid GPUs".  The feature numbers
+ * come from <dev/virtio/gpu/virtio_gpu.h>.
+ */
+#define	VTGPU_VENUS_FEATURES	\
+	(VTGPU_MODERN_FEATURES | \
+	 (1ULL << VIRTIO_GPU_F_CONTEXT_INIT) | \
+	 (1ULL << VIRTIO_GPU_F_RESOURCE_BLOB))
+
+/*
  * mvisor-compatible "virtio-vgpu" mode (device option `mvisor=on`).
  *
  * mvisor's Windows guest driver drives the *same* virtio-gpu 3D command
@@ -609,6 +621,102 @@ vtgpu_cmd_resource_detach_backing(struct vtgpu_softc *sc,
 	    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
 }
 
+/*
+ * RESOURCE_CREATE_BLOB.  Used by venus: the command ring and other shared
+ * buffers are guest-memory blobs (BLOB_MEM_GUEST / HOST3D_GUEST) whose pages
+ * the guest supplies as mem entries — we translate them to host iovecs and
+ * hand them to virglrenderer, which (with USE_EXTERNAL_BLOB) shares them with
+ * the render server.  Purely host-allocated blobs (HOST3D, nr_entries == 0)
+ * would need the host-visible PCI window, which is not implemented yet.
+ */
+static void
+vtgpu_cmd_resource_create_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
+    const struct virtio_gpu_ctrl_hdr *hdr, uint16_t chain_idx,
+    const struct virtio_gpu_resource_create_blob *cmd,
+    const struct virtio_gpu_mem_entry *entries,
+    struct iovec *wiov, int nwiov)
+{
+	struct virgl_renderer_resource_create_blob_args args;
+	struct iovec *iovs = NULL;
+	uint32_t n = cmd->nr_entries;
+	uint32_t i;
+	int ret;
+
+	if (n > VTGPU_MAX_BACKING) {
+		vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
+		    VIRTIO_GPU_RESP_ERR_UNSPEC, wiov, nwiov);
+		return;
+	}
+	if (n > 0) {
+		iovs = calloc(n, sizeof(*iovs));
+		if (iovs == NULL) {
+			vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
+			    VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, wiov, nwiov);
+			return;
+		}
+		for (i = 0; i < n; i++) {
+			iovs[i].iov_base = paddr_guest2host(sc->vsc_ctx,
+			    entries[i].addr, entries[i].length);
+			iovs[i].iov_len  = entries[i].length;
+			if (iovs[i].iov_base == NULL) {
+				free(iovs);
+				vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
+				    VIRTIO_GPU_RESP_ERR_UNSPEC, wiov, nwiov);
+				return;
+			}
+		}
+	}
+
+	memset(&args, 0, sizeof(args));
+	args.res_handle = cmd->resource_id;
+	args.ctx_id     = hdr->ctx_id;
+	args.blob_mem   = cmd->blob_mem;
+	args.blob_flags = cmd->blob_flags;
+	args.blob_id    = cmd->blob_id;
+	args.size       = cmd->size;
+	args.iovecs     = iovs;
+	args.num_iovs   = n;
+
+	ret = virgl_renderer_resource_create_blob(&args);
+	DPRINTF("create_blob id=%u mem=%u flags=0x%x blob_id=%lu size=%lu "
+	    "nr=%u ctx=%u ret=%d", cmd->resource_id, cmd->blob_mem,
+	    cmd->blob_flags, (unsigned long)cmd->blob_id,
+	    (unsigned long)cmd->size, n, hdr->ctx_id, ret);
+	/* Bind to the creating context (same convention as our other creates). */
+	if (ret == 0 && hdr->ctx_id != 0)
+		virgl_renderer_ctx_attach_resource(hdr->ctx_id,
+		    (int)cmd->resource_id);
+	/* virglrenderer copies the (const) iovec array; free our copy. */
+	free(iovs);
+	vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
+	    ret ? VIRTIO_GPU_RESP_ERR_UNSPEC : VIRTIO_GPU_RESP_OK_NODATA,
+	    wiov, nwiov);
+}
+
+/*
+ * RESOURCE_MAP_BLOB / UNMAP_BLOB.  Guest-memory blobs (the venus ring) never
+ * take this path — the guest already owns their pages.  Host-visible (HOST3D)
+ * mapping into a guest PCI window is future work; for now report the cache
+ * type so probes succeed.
+ */
+static void
+vtgpu_cmd_resource_map_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
+    const struct virtio_gpu_ctrl_hdr *hdr, uint16_t chain_idx,
+    const struct virtio_gpu_resource_map_blob *cmd,
+    struct iovec *wiov, int nwiov)
+{
+	struct virtio_gpu_resp_map_info resp = {};
+	uint32_t map_info = 0;
+
+	virgl_renderer_resource_get_map_info(cmd->resource_id, &map_info);
+	resp.hdr.type     = VIRTIO_GPU_RESP_OK_MAP_INFO;
+	resp.hdr.flags    = hdr->flags & VIRTIO_GPU_FLAG_FENCE;
+	resp.hdr.fence_id = hdr->fence_id;
+	resp.hdr.ctx_id   = hdr->ctx_id;
+	resp.map_info     = map_info;
+	vtgpu_respond(sc, vq, hdr, chain_idx, &resp, sizeof(resp), wiov, nwiov);
+}
+
 static void
 vtgpu_cmd_get_capset_info(struct vtgpu_softc *sc, struct vqueue_info *vq,
     const struct virtio_gpu_ctrl_hdr *hdr, uint16_t chain_idx,
@@ -933,6 +1041,30 @@ vtgpu_process_controlq(struct vtgpu_softc *sc, int qidx)
 			vtgpu_cmd_resource_detach_backing(sc, vq, hdr, req.idx,
 			    (const struct virtio_gpu_resource_detach_backing *)hdr,
 			    wiov, nwiov);
+			break;
+
+		case VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB: {
+			const struct virtio_gpu_resource_create_blob *cb =
+			    (const void *)hdr;
+			const struct virtio_gpu_mem_entry *ents =
+			    (const void *)(cb + 1);
+			vtgpu_cmd_resource_create_blob(sc, vq, hdr, req.idx,
+			    cb, ents, wiov, nwiov);
+			break;
+		}
+
+		case VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB:
+			vtgpu_cmd_resource_map_blob(sc, vq, hdr, req.idx,
+			    (const struct virtio_gpu_resource_map_blob *)hdr,
+			    wiov, nwiov);
+			break;
+
+		case VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB:
+			virgl_renderer_resource_unmap(
+			    ((const struct virtio_gpu_resource_unmap_blob *)
+			    hdr)->resource_id);
+			vtgpu_resp_nodata(sc, vq, hdr, req.idx,
+			    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
 			break;
 
 		case VIRTIO_GPU_CMD_GET_CAPSET_INFO:
@@ -1275,7 +1407,7 @@ vtgpu_common_read(struct vtgpu_softc *sc, uint64_t off)
 	uint16_t q = sc->vsc_qsel;
 	bool qok = (q < VTGPU_MAXQ);
 	uint64_t feat = sc->vsc_mvisor ? VTGPU_MVISOR_FEATURES :
-	    VTGPU_MODERN_FEATURES;
+	    (sc->vsc_venus ? VTGPU_VENUS_FEATURES : VTGPU_MODERN_FEATURES);
 
 	switch (off) {
 	case VTGPU_CC_DFSELECT:	return sc->vsc_dev_feature_sel;
@@ -1514,7 +1646,8 @@ vtgpu_virgl_init(struct vtgpu_softc *sc)
 	 * resource layout for GL<->Vulkan interop.
 	 */
 	int venus = sc->vsc_venus ?
-	    (VIRGL_RENDERER_VENUS | VIRGL_RENDERER_RENDER_SERVER) : 0;
+	    (VIRGL_RENDERER_VENUS | VIRGL_RENDERER_RENDER_SERVER |
+	     VIRGL_RENDERER_USE_EXTERNAL_BLOB) : 0;
 
 	/*
 	 * Headless via the render node (get_drm_fd -> GBM platform).
