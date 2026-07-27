@@ -55,6 +55,8 @@
 #include <time.h>
 #include <sys/mman.h>
 #include <dev/vmm/vmm_mem.h>	/* VM_VIRTIO_GPU_HOSTVIS devmem segid */
+#include <machine/vmm.h>
+#include <vmmapi.h>		/* vm_create_devmem / vm_mmap_memseg */
 
 #include <virglrenderer.h>
 
