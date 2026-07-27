@@ -752,6 +752,8 @@ vtgpu_cmd_get_capset_info(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	}
 	uint32_t max_ver = 0, max_size = 0;
 	virgl_renderer_get_cap_set(capset_id, &max_ver, &max_size);
+	DPRINTF("capset_info idx=%u -> id=%u max_ver=%u max_size=%u",
+	    cmd->capset_index, capset_id, max_ver, max_size);
 
 	resp.capset_id          = capset_id;
 	resp.capset_max_version = max_ver;
@@ -767,6 +769,8 @@ vtgpu_cmd_get_capset(struct vtgpu_softc *sc, struct vqueue_info *vq,
 {
 	uint32_t max_ver = 0, max_size = 0;
 	virgl_renderer_get_cap_set(cmd->capset_id, &max_ver, &max_size);
+	DPRINTF("get_capset id=%u ver=%u -> max_ver=%u max_size=%u",
+	    cmd->capset_id, cmd->capset_version, max_ver, max_size);
 
 	if (max_size == 0) {
 		vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
