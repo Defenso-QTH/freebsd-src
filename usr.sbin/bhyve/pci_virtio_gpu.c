@@ -53,6 +53,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <time.h>
+#include <sys/mman.h>
 
 #include <virglrenderer.h>
 
@@ -183,6 +184,16 @@ struct vgpu_config {
 #define	VTGPU_CAP_ISR_CFG	3
 #define	VTGPU_CAP_DEVICE_CFG	4
 #define	VTGPU_CAP_PCI_CFG	5
+#define	VTGPU_CAP_SHARED_MEMORY_CFG 8	/* virtio shared-memory region cap */
+
+/*
+ * Host-visible memory window (venus).  A separate MEM64 BAR backed by a
+ * devmem segment (VM_VIRTIO_GPU_HOSTVIS), advertised to the guest via a
+ * virtio SHARED_MEMORY cap with shmid VIRTIO_GPU_SHM_ID_HOST_VISIBLE so the
+ * guest kernel reports "+host_visible" and the venus ICD will attach.
+ */
+#define	VTGPU_HOSTVIS_BAR	2		/* MEM64 -> consumes BARs 2 and 3 */
+#define	VTGPU_HOSTVIS_SZ	(256ULL << 20)	/* 256 MiB */
 
 /*
  * Modern config BAR (BAR 4, MEM64) layout.  One 4 KiB page per structure
@@ -276,6 +287,14 @@ struct vtgpu_softc {
 	 * context that needs no Wayland/X display.  -1 if none was opened.
 	 */
 	int			vsc_drm_fd;
+
+	/*
+	 * Host-visible memory window (venus).  vsc_hostvis_base is the bhyve
+	 * process mapping of the devmem segment; vsc_hostvis_gpa is the guest
+	 * physical address the BAR is currently mapped at (0 = not mapped).
+	 */
+	void			*vsc_hostvis_base;
+	uint64_t		vsc_hostvis_gpa;
 
 	/*
 	 * Modern virtio-pci (virtio 1.0) transport state.  bhyve's shared
@@ -1354,6 +1373,82 @@ vtgpu_add_cap(struct pci_devinst *pi, uint8_t cfg_type, uint8_t bar,
 	(void)pci_emul_add_capability(pi, buf, len);
 }
 
+/*
+ * Add a virtio SHARED_MEMORY region capability (struct virtio_pci_cap64):
+ * the 16-byte base cap with the shmid in the id byte, plus 64-bit offset and
+ * length split into lo/hi halves.
+ */
+static void
+vtgpu_add_shm_cap(struct pci_devinst *pi, uint8_t bar, uint8_t shmid,
+    uint64_t offset, uint64_t length)
+{
+	uint8_t buf[24];
+	uint32_t v;
+
+	memset(buf, 0, sizeof(buf));
+	buf[0] = PCIY_VENDOR;			/* cap_vndr */
+	buf[1] = 0;				/* cap_next (filled in later) */
+	buf[2] = 24;				/* cap_len (cap64) */
+	buf[3] = VTGPU_CAP_SHARED_MEMORY_CFG;	/* cfg_type */
+	buf[4] = bar;				/* bar */
+	buf[5] = shmid;				/* id (shmid) */
+	v = (uint32_t)offset;         memcpy(&buf[8],  &v, 4);	/* offset lo */
+	v = (uint32_t)length;         memcpy(&buf[12], &v, 4);	/* length lo */
+	v = (uint32_t)(offset >> 32); memcpy(&buf[16], &v, 4);	/* offset hi */
+	v = (uint32_t)(length >> 32); memcpy(&buf[20], &v, 4);	/* length hi */
+	(void)pci_emul_add_capability(pi, buf, 24);
+}
+
+/*
+ * Allocate and advertise the host-visible memory window (venus only).  The
+ * BAR is backed by a devmem segment so it is both guest-mappable (via
+ * vm_mmap_memseg in the baraddr handler) and reachable from bhyve.
+ */
+static int
+vtgpu_hostvis_setup(struct vtgpu_softc *sc, struct pci_devinst *pi)
+{
+	if (pci_emul_alloc_bar(pi, VTGPU_HOSTVIS_BAR, PCIBAR_MEM64,
+	    VTGPU_HOSTVIS_SZ) != 0)
+		return (1);
+	sc->vsc_hostvis_base = vm_create_devmem(pi->pi_vmctx,
+	    VM_VIRTIO_GPU_HOSTVIS, "vtgpu-hostvis", VTGPU_HOSTVIS_SZ);
+	if (sc->vsc_hostvis_base == NULL ||
+	    sc->vsc_hostvis_base == MAP_FAILED) {
+		EPRINTLN("vtgpu: vm_create_devmem(hostvis) failed");
+		return (1);
+	}
+	vtgpu_add_shm_cap(pi, VTGPU_HOSTVIS_BAR,
+	    VIRTIO_GPU_SHM_ID_HOST_VISIBLE, 0, VTGPU_HOSTVIS_SZ);
+	return (0);
+}
+
+/*
+ * Map/unmap the host-visible window into guest physical space when the guest
+ * programs (or clears) the BAR — same pattern as pci_fbuf.
+ */
+static void
+vtgpu_baraddr(struct pci_devinst *pi, int baridx, int enabled,
+    uint64_t address)
+{
+	struct vtgpu_softc *sc = pi->pi_arg;
+
+	if (baridx != VTGPU_HOSTVIS_BAR)
+		return;
+	if (!enabled) {
+		if (sc->vsc_hostvis_gpa != 0)
+			(void)vm_munmap_memseg(pi->pi_vmctx,
+			    sc->vsc_hostvis_gpa, VTGPU_HOSTVIS_SZ);
+		sc->vsc_hostvis_gpa = 0;
+		return;
+	}
+	if (vm_mmap_memseg(pi->pi_vmctx, address, VM_VIRTIO_GPU_HOSTVIS, 0,
+	    VTGPU_HOSTVIS_SZ, PROT_READ | PROT_WRITE) != 0) {
+		EPRINTLN("vtgpu: vm_mmap_memseg(hostvis) failed");
+		return;
+	}
+	sc->vsc_hostvis_gpa = address;
+}
+
 /* Reset all modern transport + virtqueue state (device_status written 0). */
 static void
 vtgpu_modern_reset(struct vtgpu_softc *sc)
@@ -1805,6 +1900,18 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 	vtgpu_modern_reset(sc);
 
 	/*
+	 * Host-visible memory window (venus only): a second MEM64 BAR + a
+	 * SHARED_MEMORY cap so the guest reports +host_visible and the venus
+	 * ICD attaches.  Requires the VM_VIRTIO_GPU_HOSTVIS devmem segid in the
+	 * (rebuilt) kernel.
+	 */
+	if (sc->vsc_venus && vtgpu_hostvis_setup(sc, pi) != 0) {
+		warnx("vtgpu: host-visible window setup failed");
+		free(sc);
+		return (1);
+	}
+
+	/*
 	 * PCI identity.  Device ID 0x1040+type routes the guest down the
 	 * modern virtio-pci probe path; revision >= 1 marks it
 	 * non-transitional.  In mvisor mode we present mvisor's device id
@@ -1860,5 +1967,6 @@ static const struct pci_devemu pci_de_vtgpu = {
 	.pe_init	= pci_vtgpu_init,
 	.pe_barwrite	= vtgpu_modern_barwrite,
 	.pe_barread	= vtgpu_modern_barread,
+	.pe_baraddr	= vtgpu_baraddr,
 };
 PCI_EMUL_SET(pci_de_vtgpu);
