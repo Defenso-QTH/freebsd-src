@@ -23,6 +23,7 @@ enum {
         VM_BOOTROM = VM_MAXSYSMEM,
         VM_FRAMEBUFFER,
         VM_PCIROM,
+        VM_VIRTIO_GPU_HOSTVIS,	/* virtio-gpu venus host-visible memory window */
         VM_MEMSEG_END
 };
 
