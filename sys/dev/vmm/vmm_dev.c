@@ -393,6 +393,10 @@ static const struct vmmdev_ioctl vmmdev_ioctls[] = {
 	    VMMDEV_IOCTL_XLOCK_MEMSEGS | VMMDEV_IOCTL_LOCK_ALL_VCPUS),
 	VMMDEV_IOCTL(VM_MUNMAP_MEMSEG,
 	    VMMDEV_IOCTL_XLOCK_MEMSEGS | VMMDEV_IOCTL_LOCK_ALL_VCPUS),
+	VMMDEV_IOCTL(VM_MMAP_BLOB,
+	    VMMDEV_IOCTL_XLOCK_MEMSEGS | VMMDEV_IOCTL_LOCK_ALL_VCPUS),
+	VMMDEV_IOCTL(VM_MUNMAP_BLOB,
+	    VMMDEV_IOCTL_XLOCK_MEMSEGS | VMMDEV_IOCTL_LOCK_ALL_VCPUS),
 	VMMDEV_IOCTL(VM_REINIT,
 	    VMMDEV_IOCTL_XLOCK_MEMSEGS | VMMDEV_IOCTL_LOCK_ALL_VCPUS),
 
@@ -542,6 +546,21 @@ vmmdev_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 
 		mu = (struct vm_munmap *)data;
 		error = vm_munmap_memseg(sc->vm, mu->gpa, mu->len);
+		break;
+	}
+	case VM_MMAP_BLOB: {
+		struct vm_mmap_blob *mb;
+
+		mb = (struct vm_mmap_blob *)data;
+		error = vm_mmap_blob(sc->vm, mb->gpa, mb->hva, mb->len,
+		    mb->prot);
+		break;
+	}
+	case VM_MUNMAP_BLOB: {
+		struct vm_munmap *mu;
+
+		mu = (struct vm_munmap *)data;
+		error = vm_munmap_blob(sc->vm, mu->gpa, mu->len);
 		break;
 	}
 #ifdef __amd64__
