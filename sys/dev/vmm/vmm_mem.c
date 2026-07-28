@@ -8,6 +8,7 @@
 #include <sys/types.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
+#include <sys/proc.h>
 #include <sys/sx.h>
 #include <sys/systm.h>
 
@@ -349,6 +350,91 @@ vm_munmap_memseg(struct vm *vm, vm_paddr_t gpa, size_t len)
 	}
 
 	return (EINVAL);
+}
+
+/*
+ * Alias a range [hva, hva+len) of the calling (VMM) process's address space
+ * into the guest's physical address space at 'gpa'.  Used by the bhyve
+ * virtio-gpu device to expose a host-visible venus blob (which virglrenderer
+ * has mmap'd at 'hva') to the guest inside the device's host-visible BAR
+ * window -- zero-copy, coherent, like vm_mmap_memseg but backed by whatever
+ * VM object currently backs 'hva' (an shm/dmabuf mapping) instead of a memseg.
+ *
+ * Any existing guest mapping over [gpa, gpa+len) is replaced.
+ */
+int
+vm_mmap_blob(struct vm *vm, vm_paddr_t gpa, uintptr_t hva, size_t len, int prot)
+{
+	struct vmspace *uvmspace;
+	vm_map_t umap, gmap;
+	vm_map_entry_t entry;
+	vm_object_t obj;
+	vm_ooffset_t obj_off;
+	int error;
+
+	if (prot == 0 || (prot & ~(VM_PROT_ALL)) != 0)
+		return (EINVAL);
+	if (len == 0 || (gpa | hva | len) & PAGE_MASK)
+		return (EINVAL);
+	if (hva + len < hva || gpa + len < gpa)
+		return (EINVAL);
+
+	/*
+	 * Find the VM object backing the host mapping and take a reference on
+	 * it that we will hand to the guest map entry.  The whole range must
+	 * fall inside a single map entry (virglrenderer maps a blob as one
+	 * contiguous mmap, so this holds).
+	 */
+	uvmspace = curproc->p_vmspace;
+	umap = &uvmspace->vm_map;
+	vm_map_lock_read(umap);
+	if (!vm_map_lookup_entry(umap, hva, &entry) ||
+	    entry->end < hva + len ||
+	    (entry->eflags & (MAP_ENTRY_IS_SUB_MAP | MAP_ENTRY_GUARD)) != 0) {
+		vm_map_unlock_read(umap);
+		return (EINVAL);
+	}
+	obj = entry->object.vm_object;
+	if (obj == NULL) {
+		vm_map_unlock_read(umap);
+		return (EINVAL);
+	}
+	obj_off = entry->offset + (hva - entry->start);
+	vm_object_reference(obj);
+	vm_map_unlock_read(umap);
+
+	/*
+	 * Drop any prior guest mapping over the target range, then insert the
+	 * host object.  Callers hold the memseg xlock with all vcpus frozen, so
+	 * the window between remove and insert cannot race an EPT fault.  On
+	 * failure release the reference we took above.
+	 */
+	gmap = &vm_vmspace(vm)->vm_map;
+	(void)vm_map_remove(gmap, gpa, gpa + len);
+	vm_map_lock(gmap);
+	error = vm_map_insert(gmap, obj, obj_off, gpa, gpa + len, prot, prot, 0);
+	vm_map_unlock(gmap);
+	if (error != KERN_SUCCESS) {
+		vm_object_deallocate(obj);
+		return (vm_mmap_to_errno(error));
+	}
+
+	return (0);
+}
+
+int
+vm_munmap_blob(struct vm *vm, vm_paddr_t gpa, size_t len)
+{
+	int error;
+
+	if (len == 0 || (gpa | len) & PAGE_MASK)
+		return (EINVAL);
+	if (gpa + len < gpa)
+		return (EINVAL);
+
+	error = vm_map_remove(&vm_vmspace(vm)->vm_map, gpa, gpa + len);
+
+	return (error == KERN_SUCCESS ? 0 : EINVAL);
 }
 
 int

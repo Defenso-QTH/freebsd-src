@@ -43,6 +43,8 @@ extern const char *vm_capstrmap[];
 	VM_MMAP_MEMSEG,		\
 	VM_MMAP_GETNEXT,	\
 	VM_MUNMAP_MEMSEG,	\
+	VM_MMAP_BLOB,		\
+	VM_MUNMAP_BLOB,		\
 	VM_SET_REGISTER,	\
 	VM_GET_REGISTER,	\
 	VM_SET_REGISTER_SET,	\
