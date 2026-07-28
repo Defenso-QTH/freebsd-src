@@ -342,6 +342,32 @@ vm_munmap_memseg(struct vmctx *ctx, vm_paddr_t gpa, size_t len)
 }
 
 int
+vm_mmap_blob(struct vmctx *ctx, vm_paddr_t gpa, void *hva, size_t len, int prot)
+{
+	struct vm_mmap_blob mb;
+
+	bzero(&mb, sizeof(mb));
+	mb.gpa = gpa;
+	mb.hva = (uint64_t)(uintptr_t)hva;
+	mb.len = len;
+	mb.prot = prot;
+
+	return (ioctl(ctx->fd, VM_MMAP_BLOB, &mb));
+}
+
+int
+vm_munmap_blob(struct vmctx *ctx, vm_paddr_t gpa, size_t len)
+{
+	struct vm_munmap munmap;
+
+	bzero(&munmap, sizeof(munmap));
+	munmap.gpa = gpa;
+	munmap.len = len;
+
+	return (ioctl(ctx->fd, VM_MUNMAP_BLOB, &munmap));
+}
+
+int
 vm_mmap_getnext(struct vmctx *ctx, vm_paddr_t *gpa, int *segid,
     vm_ooffset_t *segoff, size_t *len, int *prot, int *flags)
 {
