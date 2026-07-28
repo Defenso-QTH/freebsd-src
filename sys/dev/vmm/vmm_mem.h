@@ -81,6 +81,9 @@ void vm_assert_memseg_xlocked(struct vm *vm);
 int vm_mmap_memseg(struct vm *vm, vm_paddr_t gpa, int segid, vm_ooffset_t off,
     size_t len, int prot, int flags);
 int vm_munmap_memseg(struct vm *vm, vm_paddr_t gpa, size_t len);
+int vm_mmap_blob(struct vm *vm, vm_paddr_t gpa, uintptr_t hva, size_t len,
+    int prot);
+int vm_munmap_blob(struct vm *vm, vm_paddr_t gpa, size_t len);
 int vm_alloc_memseg(struct vm *vm, int ident, size_t len, bool sysmem,
     struct domainset *obj_domainset);
 void vm_free_memseg(struct vm *vm, int ident);

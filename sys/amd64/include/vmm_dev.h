@@ -52,6 +52,20 @@ struct vm_munmap {
 	size_t		len;
 };
 
+/*
+ * Alias a range of the calling (VMM) process's address space -- where
+ * virglrenderer has mapped a host-visible venus blob -- into the guest's
+ * physical address space at 'gpa' (inside the virtio-gpu host-visible BAR
+ * window).  This makes the host GPU-allocated memory directly visible to
+ * the guest without a copy, the same way vm_mmap_memseg exposes a memseg.
+ */
+struct vm_mmap_blob {
+	vm_paddr_t	gpa;		/* guest phys addr in the window */
+	uint64_t	hva;		/* host virt addr from resource_map */
+	size_t		len;		/* length (page-aligned) */
+	int		prot;		/* RWX */
+};
+
 #define	VM_MEMSEG_NAME(m)	((m)->name[0] != '\0' ? (m)->name : NULL)
 struct vm_memseg {
 	int		segid;
@@ -341,7 +355,11 @@ enum {
 	/* checkpoint */
 	IOCNUM_SNAPSHOT_REQ = 113,
 
-	IOCNUM_RESTORE_TIME = 115
+	IOCNUM_RESTORE_TIME = 115,
+
+	/* virtio-gpu venus host-visible blob mapping */
+	IOCNUM_MMAP_BLOB = 116,
+	IOCNUM_MUNMAP_BLOB = 117
 };
 
 #define	VM_RUN		\
@@ -360,6 +378,10 @@ enum {
 	_IOWR('v', IOCNUM_MMAP_GETNEXT, struct vm_memmap)
 #define	VM_MUNMAP_MEMSEG	\
 	_IOW('v', IOCNUM_MUNMAP_MEMSEG, struct vm_munmap)
+#define	VM_MMAP_BLOB	\
+	_IOW('v', IOCNUM_MMAP_BLOB, struct vm_mmap_blob)
+#define	VM_MUNMAP_BLOB	\
+	_IOW('v', IOCNUM_MUNMAP_BLOB, struct vm_munmap)
 #define	VM_SET_REGISTER \
 	_IOW('v', IOCNUM_SET_REGISTER, struct vm_register)
 #define	VM_GET_REGISTER \
