@@ -300,6 +300,20 @@ struct vtgpu_softc {
 	uint64_t		vsc_hostvis_gpa;
 
 	/*
+	 * Active host-visible blob mappings (venus).  Each RESOURCE_MAP_BLOB
+	 * aliases a virglrenderer-owned host mapping into the window at a guest
+	 * offset; we track the guest range so RESOURCE_UNMAP_BLOB (which carries
+	 * only the resource id) can tear it down.
+	 */
+#define	VTGPU_MAX_BLOB_MAPS	64
+	struct vtgpu_blob_map {
+		uint32_t	res_id;
+		uint64_t	gpa;	/* guest phys addr in the window */
+		uint64_t	len;	/* page-rounded length */
+		bool		used;
+	}			vsc_blob_maps[VTGPU_MAX_BLOB_MAPS];
+
+	/*
 	 * Modern virtio-pci (virtio 1.0) transport state.  bhyve's shared
 	 * vi_ layer is legacy-only; virtio-gpu requires VIRTIO_F_VERSION_1,
 	 * so this device implements the modern transport itself (a MEM64 BAR
@@ -715,11 +729,27 @@ vtgpu_cmd_resource_create_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	    wiov, nwiov);
 }
 
+#define	VTGPU_PAGE_ROUND(x)	(((x) + PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1))
+
+static struct vtgpu_blob_map *
+vtgpu_blob_map_find(struct vtgpu_softc *sc, uint32_t res_id)
+{
+	int i;
+
+	for (i = 0; i < VTGPU_MAX_BLOB_MAPS; i++)
+		if (sc->vsc_blob_maps[i].used &&
+		    sc->vsc_blob_maps[i].res_id == res_id)
+			return (&sc->vsc_blob_maps[i]);
+	return (NULL);
+}
+
 /*
- * RESOURCE_MAP_BLOB / UNMAP_BLOB.  Guest-memory blobs (the venus ring) never
- * take this path — the guest already owns their pages.  Host-visible (HOST3D)
- * mapping into a guest PCI window is future work; for now report the cache
- * type so probes succeed.
+ * RESOURCE_MAP_BLOB.  A host-visible venus blob (host-allocated VkDeviceMemory
+ * or the coherent shm ring) is placed into the guest's host-visible BAR window
+ * at cmd->offset so the guest can mmap it.  We export the blob's fd from
+ * virglrenderer, mmap it in bhyve to obtain a host VA, and alias that VA into
+ * the guest window via VM_MMAP_BLOB — zero-copy and coherent with the render
+ * server.  The bhyve mapping and fd are retained until UNMAP_BLOB.
  */
 static void
 vtgpu_cmd_resource_map_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
@@ -728,15 +758,107 @@ vtgpu_cmd_resource_map_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
     struct iovec *wiov, int nwiov)
 {
 	struct virtio_gpu_resp_map_info resp = {};
+	struct vtgpu_blob_map *bm;
 	uint32_t map_info = 0;
+	uint64_t gpa, len, map_size = 0;
+	void *hva = NULL;
+	int i, ret;
+
+	if (sc->vsc_hostvis_gpa == 0) {
+		DPRINTF("map_blob res=%u but host-visible BAR not mapped",
+		    cmd->resource_id);
+		goto err;
+	}
+	/* Find a free tracking slot. */
+	bm = NULL;
+	for (i = 0; i < VTGPU_MAX_BLOB_MAPS; i++)
+		if (!sc->vsc_blob_maps[i].used) {
+			bm = &sc->vsc_blob_maps[i];
+			break;
+		}
+	if (bm == NULL) {
+		DPRINTF("map_blob res=%u: no free blob-map slots",
+		    cmd->resource_id);
+		goto err;
+	}
+
+	/*
+	 * Let virglrenderer map the blob into our address space: it uses the
+	 * resource's true size (res->map_size, not fstat -- device-memory blob
+	 * fds are not regular files) and picks the right method for shm, dmabuf
+	 * or opaque device memory.  We then alias the returned host VA into the
+	 * guest window; virglrenderer owns the mapping until resource_unmap.
+	 */
+	ret = virgl_renderer_resource_map(cmd->resource_id, &hva, &map_size);
+	if (ret != 0 || hva == NULL) {
+		DPRINTF("map_blob res=%u resource_map ret=%d hva=%p",
+		    cmd->resource_id, ret, hva);
+		goto err;
+	}
+	len = VTGPU_PAGE_ROUND(map_size);
+	if (len == 0 || cmd->offset + len < cmd->offset ||
+	    cmd->offset + len > VTGPU_HOSTVIS_SZ) {
+		DPRINTF("map_blob res=%u bad off=0x%lx size=0x%lx (win=0x%lx)",
+		    cmd->resource_id, (unsigned long)cmd->offset,
+		    (unsigned long)map_size, (unsigned long)VTGPU_HOSTVIS_SZ);
+		virgl_renderer_resource_unmap(cmd->resource_id);
+		goto err;
+	}
+	gpa = sc->vsc_hostvis_gpa + cmd->offset;
+
+	if (vm_mmap_blob(sc->vsc_ctx, gpa, hva, len,
+	    PROT_READ | PROT_WRITE) != 0) {
+		DPRINTF("map_blob res=%u vm_mmap_blob(gpa=0x%lx len=0x%lx) "
+		    "failed: %s", cmd->resource_id, (unsigned long)gpa,
+		    (unsigned long)len, strerror(errno));
+		virgl_renderer_resource_unmap(cmd->resource_id);
+		goto err;
+	}
+
+	bm->res_id = cmd->resource_id;
+	bm->gpa    = gpa;
+	bm->len    = len;
+	bm->used   = true;
 
 	virgl_renderer_resource_get_map_info(cmd->resource_id, &map_info);
+	DPRINTF("map_blob res=%u off=0x%lx gpa=0x%lx len=0x%lx map_info=%u ok",
+	    cmd->resource_id, (unsigned long)cmd->offset, (unsigned long)gpa,
+	    (unsigned long)len, map_info);
+
 	resp.hdr.type     = VIRTIO_GPU_RESP_OK_MAP_INFO;
 	resp.hdr.flags    = hdr->flags & VIRTIO_GPU_FLAG_FENCE;
 	resp.hdr.fence_id = hdr->fence_id;
 	resp.hdr.ctx_id   = hdr->ctx_id;
 	resp.map_info     = map_info;
 	vtgpu_respond(sc, vq, hdr, chain_idx, &resp, sizeof(resp), wiov, nwiov);
+	return;
+
+err:
+	vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
+	    VIRTIO_GPU_RESP_ERR_UNSPEC, wiov, nwiov);
+}
+
+/*
+ * RESOURCE_UNMAP_BLOB.  Reverse of map_blob: drop the guest alias, then let
+ * virglrenderer release its host mapping.  The command carries only the
+ * resource id, so we look up the guest range we recorded at map time.
+ */
+static void
+vtgpu_cmd_resource_unmap_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
+    const struct virtio_gpu_ctrl_hdr *hdr, uint16_t chain_idx,
+    const struct virtio_gpu_resource_unmap_blob *cmd,
+    struct iovec *wiov, int nwiov)
+{
+	struct vtgpu_blob_map *bm;
+
+	bm = vtgpu_blob_map_find(sc, cmd->resource_id);
+	if (bm != NULL) {
+		vm_munmap_blob(sc->vsc_ctx, bm->gpa, bm->len);
+		memset(bm, 0, sizeof(*bm));
+	}
+	virgl_renderer_resource_unmap(cmd->resource_id);
+	vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
+	    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
 }
 
 static void
@@ -835,9 +957,14 @@ vtgpu_cmd_ctx_create(struct vtgpu_softc *sc, struct vqueue_info *vq,
 		 */
 		ret = virgl_renderer_context_create_with_flags(hdr->ctx_id,
 		    cmd->context_init, cmd->nlen, cmd->debug_name);
+		DPRINTF("ctx_create id=%u context_init=0x%x (capset=%u) "
+		    "nlen=%u ret=%d", hdr->ctx_id, cmd->context_init,
+		    cmd->context_init & 0xff, cmd->nlen, ret);
 	} else {
 		ret = virgl_renderer_context_create(hdr->ctx_id,
 		    cmd->nlen, cmd->debug_name);
+		DPRINTF("ctx_create id=%u (legacy, no context_init) ret=%d",
+		    hdr->ctx_id, ret);
 	}
 	uint32_t type = ret ? VIRTIO_GPU_RESP_ERR_UNSPEC
 	                    : VIRTIO_GPU_RESP_OK_NODATA;
@@ -1086,11 +1213,9 @@ vtgpu_process_controlq(struct vtgpu_softc *sc, int qidx)
 			break;
 
 		case VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB:
-			virgl_renderer_resource_unmap(
-			    ((const struct virtio_gpu_resource_unmap_blob *)
-			    hdr)->resource_id);
-			vtgpu_resp_nodata(sc, vq, hdr, req.idx,
-			    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
+			vtgpu_cmd_resource_unmap_blob(sc, vq, hdr, req.idx,
+			    (const struct virtio_gpu_resource_unmap_blob *)hdr,
+			    wiov, nwiov);
 			break;
 
 		case VIRTIO_GPU_CMD_GET_CAPSET_INFO:
@@ -1762,34 +1887,55 @@ vtgpu_virgl_init(struct vtgpu_softc *sc)
 	 * where desktop GL is unavailable.
 	 */
 	flags = VIRGL_RENDERER_USE_EGL;
-	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0)
+	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0) {
+		DPRINTF("virgl init ok (flags=0x%x venus=0x%x)",
+		    flags, venus);
 		return (0);
+	}
 	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLES;
-	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0)
+	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0) {
+		DPRINTF("virgl init ok (flags=0x%x venus=0x%x)",
+		    flags, venus);
 		return (0);
+	}
 
 	/* Headless via surfaceless EGL (no window system, no render-node fd). */
 	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_SURFACELESS;
-	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0)
+	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0) {
+		DPRINTF("virgl init ok (flags=0x%x venus=0x%x)",
+		    flags, venus);
 		return (0);
+	}
 	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLES |
 	    VIRGL_RENDERER_USE_SURFACELESS;
-	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0)
+	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0) {
+		DPRINTF("virgl init ok (flags=0x%x venus=0x%x)",
+		    flags, venus);
 		return (0);
+	}
 
 	/* Probe for a running Wayland compositor and retry EGL. */
 	if (getenv("WAYLAND_DISPLAY") == NULL && getenv("DISPLAY") == NULL)
 		vtgpu_probe_wayland();
 	flags = VIRGL_RENDERER_USE_EGL;
-	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0)
+	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0) {
+		DPRINTF("virgl init ok (flags=0x%x venus=0x%x)",
+		    flags, venus);
 		return (0);
+	}
 	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLES;
-	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0)
+	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0) {
+		DPRINTF("virgl init ok (flags=0x%x venus=0x%x)",
+		    flags, venus);
 		return (0);
+	}
 
 	flags = VIRGL_RENDERER_USE_GLX;
-	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0)
+	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0) {
+		DPRINTF("virgl init ok (flags=0x%x venus=0x%x)",
+		    flags, venus);
 		return (0);
+	}
 
 	return (1);
 }
