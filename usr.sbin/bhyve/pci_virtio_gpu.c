@@ -795,6 +795,24 @@ vtgpu_cmd_resource_map_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
 		    cmd->resource_id, ret, hva);
 		goto err;
 	}
+	/*
+	 * Diagnostic: report the resource's fd type and the mapped VA/size.
+	 * "no entry" from vm_mmap_blob means this hva is not a real mapping in
+	 * our address space -- distinguishes a DMABUF we failed to mmap from an
+	 * OPAQUE handle whose resource_map returns a render-server-side pointer.
+	 */
+	{
+		uint32_t dbg_fd_type = 0;
+		int dbg_fd = -1;
+		int er = virgl_renderer_resource_export_blob(cmd->resource_id,
+		    &dbg_fd_type, &dbg_fd);
+		DPRINTF("map_blob res=%u DIAG hva=%p map_size=%lu | "
+		    "export_blob ret=%d fd_type=%u fd=%d",
+		    cmd->resource_id, hva, (unsigned long)map_size,
+		    er, dbg_fd_type, dbg_fd);
+		if (dbg_fd >= 0)
+			close(dbg_fd);
+	}
 	len = VTGPU_PAGE_ROUND(map_size);
 	if (len == 0 || cmd->offset + len < cmd->offset ||
 	    cmd->offset + len > VTGPU_HOSTVIS_SZ) {
