@@ -1266,6 +1266,166 @@ linux_file_kqfilter(struct file *file, struct knote *kn)
 	return (error);
 }
 
+/*
+ * lkpi_vma_to_vm_object() - create a fault-backed VM object from a
+ * vm_area_struct that a driver's ->mmap has already populated (vm_ops set).
+ *
+ * This is the object-creation tail of linux_file_mmap_single(), factored out
+ * so that file types which implement fo_mmap directly -- and therefore bypass
+ * linux_file_mmap_single() -- can still obtain a real cdev-pager mapping whose
+ * faults are bridged to vmap->vm_ops->fault.  The vma is consumed: on success
+ * it is inserted into linux_vma_head and a referenced VM object is returned;
+ * on failure it is freed and NULL is returned.  The caller then passes the
+ * object to vm_mmap_object() with a zero offset.
+ */
+vm_object_t
+lkpi_vma_to_vm_object(struct vm_area_struct *vmap, vm_size_t size,
+    vm_prot_t nprot, vm_ooffset_t offset, struct thread *td)
+{
+	struct vm_area_struct *ptr;
+	vm_object_t object;
+	void *vm_private_data;
+	vm_memattr_t attr;
+	bool vm_no_fault;
+	int error;
+
+	if (vmap->vm_ops == NULL || vmap->vm_ops->open == NULL ||
+	    vmap->vm_ops->close == NULL || vmap->vm_private_data == NULL) {
+		linux_cdev_handle_free(vmap);
+		return (NULL);
+	}
+
+	attr = pgprot2cachemode(vmap->vm_page_prot);
+	vm_private_data = vmap->vm_private_data;
+
+	rw_wlock(&linux_vma_lock);
+	TAILQ_FOREACH(ptr, &linux_vma_head, vm_entry) {
+		if (ptr->vm_private_data == vm_private_data)
+			break;
+	}
+	if (ptr != NULL) {
+		if (ptr->vm_ops == NULL || ptr->vm_ops->open == NULL ||
+		    ptr->vm_ops->close == NULL) {
+			error = ESTALE;
+			vm_no_fault = 1;
+		} else {
+			error = EEXIST;
+			vm_no_fault = (ptr->vm_ops->fault == NULL);
+		}
+	} else {
+		TAILQ_INSERT_TAIL(&linux_vma_head, vmap, vm_entry);
+		error = 0;
+		vm_no_fault = (vmap->vm_ops->fault == NULL);
+	}
+	rw_wunlock(&linux_vma_lock);
+
+	if (error != 0) {
+		/*
+		 * A mapping for this handle already exists, so this vma is
+		 * redundant.  Run its ->close first: an exporter's ->mmap may
+		 * have taken a reference that it expects ->close to release
+		 * (TTM's ttm_bo_mmap_obj does ttm_bo_get()), and dropping the
+		 * vma without closing it would leak that reference.
+		 */
+		vmap->vm_ops->close(vmap);
+		linux_cdev_handle_free(vmap);
+		if (error != EEXIST)
+			return (NULL);
+	}
+
+	if (vm_no_fault) {
+		object = cdev_pager_allocate(vm_private_data, OBJT_DEVICE,
+		    &linux_cdev_pager_ops[1], size, nprot, offset,
+		    td->td_ucred);
+	} else {
+		object = cdev_pager_allocate(vm_private_data, OBJT_MGTDEVICE,
+		    &linux_cdev_pager_ops[0], size, nprot, offset,
+		    td->td_ucred);
+	}
+
+	if (object == NULL) {
+		if (error == 0) {
+			linux_cdev_handle_remove(vmap);
+			linux_cdev_handle_free(vmap);
+		}
+		return (NULL);
+	}
+
+	if (attr != VM_MEMATTR_DEFAULT) {
+		VM_OBJECT_WLOCK(object);
+		vm_object_set_memattr(object, attr);
+		VM_OBJECT_WUNLOCK(object);
+	}
+	return (object);
+}
+EXPORT_SYMBOL(lkpi_vma_to_vm_object);
+
+/*
+ * lkpi_driver_mmap_object() - full driver-mmap helper for file types with
+ * their own fo_mmap.  Sets up a vm_area_struct describing [0, size) at page
+ * offset (offset >> PAGE_SHIFT), invokes the driver's mmap through mmap_cb,
+ * then converts the populated vma into a fault-backed object with
+ * lkpi_vma_to_vm_object().
+ *
+ * Its first consumer is drm-kmod's dma_buf fo_mmap: that path calls the
+ * exporter's ->mmap (amdgpu: ttm_bo_mmap_obj), which only sets vm_ops on the
+ * vma and returns, so without this the mmap "succeeds" while mapping nothing.
+ *
+ * Note vm_start is 0 and vm_pgoff is in *pages*: linux_cdev_pager_populate()
+ * faults with address = IDX_TO_OFF(pidx), and consumers such as
+ * ttm_bo_vm_fault_reserved() compute
+ *     ((address - vm_start) >> PAGE_SHIFT) + vm_pgoff - drm_vma_node_start()
+ * where drm_gem_prime_mmap() has already added drm_vma_node_start() (also in
+ * pages) to vm_pgoff, so the two cancel and the page index is exact.
+ *
+ * vm_file is left NULL: it is only dereferenced under #ifdef __linux__, and
+ * get_file() takes a struct linux_file, which a dma_buf fd is not.
+ */
+vm_object_t
+lkpi_driver_mmap_object(vm_size_t size, vm_prot_t nprot, vm_ooffset_t offset,
+    bool is_shared, struct thread *td,
+    int (*mmap_cb)(void *, struct vm_area_struct *), void *cb_arg)
+{
+	struct vm_area_struct *vmap;
+	struct mm_struct *mm;
+	int error;
+
+	linux_set_current(td);
+	mm = current->mm;
+	if (atomic_inc_not_zero(&mm->mm_users) == 0)
+		return (NULL);
+
+	vmap = kzalloc(sizeof(*vmap), GFP_KERNEL);
+	if (vmap == NULL) {
+		mmput(mm);
+		return (NULL);
+	}
+	vmap->vm_start = 0;
+	vmap->vm_end = size;
+	vmap->vm_pgoff = offset >> PAGE_SHIFT;
+	vmap->vm_pfn = 0;
+	vmap->vm_flags = vmap->vm_page_prot = (nprot & VM_PROT_ALL);
+	if (is_shared)
+		vmap->vm_flags |= VM_SHARED;
+	vmap->vm_ops = NULL;
+	vmap->vm_file = NULL;
+	vmap->vm_mm = mm;
+
+	if (unlikely(down_write_killable(&vmap->vm_mm->mmap_sem))) {
+		linux_cdev_handle_free(vmap);
+		return (NULL);
+	}
+	error = -mmap_cb(cb_arg, vmap);
+	up_write(&vmap->vm_mm->mmap_sem);
+	if (error != 0) {
+		linux_cdev_handle_free(vmap);
+		return (NULL);
+	}
+
+	return (lkpi_vma_to_vm_object(vmap, size, nprot, offset, td));
+}
+EXPORT_SYMBOL(lkpi_driver_mmap_object);
+
 static int
 linux_file_mmap_single(struct file *fp, const struct file_operations *fop,
     vm_ooffset_t *offset, vm_size_t size, struct vm_object **object,
