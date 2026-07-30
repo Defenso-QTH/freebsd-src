@@ -127,6 +127,17 @@ struct vm_area_struct {
 	TAILQ_ENTRY(vm_area_struct) vm_entry;
 };
 
+/*
+ * Build a fault-backed VM object for a driver mmap.  For file types that
+ * implement fo_mmap directly and so bypass linux_file_mmap_single() (notably
+ * a mmap'd dma_buf fd), which otherwise leaves the mapping unbacked.
+ */
+vm_object_t lkpi_vma_to_vm_object(struct vm_area_struct *vmap, vm_size_t size,
+    vm_prot_t nprot, vm_ooffset_t offset, struct thread *td);
+vm_object_t lkpi_driver_mmap_object(vm_size_t size, vm_prot_t nprot,
+    vm_ooffset_t offset, bool is_shared, struct thread *td,
+    int (*mmap_cb)(void *, struct vm_area_struct *), void *cb_arg);
+
 struct vm_fault {
 	unsigned int flags;
 	pgoff_t	pgoff;
