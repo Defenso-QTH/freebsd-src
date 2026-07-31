@@ -1005,6 +1005,7 @@ vtgpu_cmd_ctx_attach_resource(struct vtgpu_softc *sc, struct vqueue_info *vq,
     const struct virtio_gpu_ctx_resource *cmd,
     struct iovec *wiov, int nwiov)
 {
+	DPRINTF("ctx_attach_res ctx=%u res=%u", hdr->ctx_id, cmd->resource_id);
 	virgl_renderer_ctx_attach_resource(hdr->ctx_id, (int)cmd->resource_id);
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 	    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
@@ -1016,6 +1017,7 @@ vtgpu_cmd_ctx_detach_resource(struct vtgpu_softc *sc, struct vqueue_info *vq,
     const struct virtio_gpu_ctx_resource *cmd,
     struct iovec *wiov, int nwiov)
 {
+	DPRINTF("ctx_detach_res ctx=%u res=%u", hdr->ctx_id, cmd->resource_id);
 	virgl_renderer_ctx_detach_resource(hdr->ctx_id, (int)cmd->resource_id);
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 	    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
