@@ -52,6 +52,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <time.h>
 #include <sys/mman.h>
 #include <dev/vmm/vmm_mem.h>	/* VM_VIRTIO_GPU_HOSTVIS devmem segid */
@@ -275,6 +276,14 @@ struct vtgpu_softc {
 	 * pci_vtgpu_init waits for it: 0 = pending, 1 = ok, -1 = failed.
 	 */
 	int			vsc_init_done;
+
+	/*
+	 * virglrenderer's fence poll fd: becomes readable when there is fence
+	 * work pending, letting the worker wake on completion instead of on a
+	 * fixed timeout.  -1 when unavailable (then we fall back to the timed
+	 * wait alone).
+	 */
+	int			vsc_poll_fd;
 
 	/* fence tracking (vtgpu_write_fence fires from the worker thread) */
 	TAILQ_HEAD(, vtgpu_fence) vsc_fences;
@@ -1352,6 +1361,10 @@ vtgpu_worker(void *arg)
 	 * if virgl is unavailable.
 	 */
 	rc = vtgpu_virgl_init(sc);
+	if (rc == 0) {
+		sc->vsc_poll_fd = virgl_renderer_get_poll_fd();
+		DPRINTF("virgl poll fd = %d", sc->vsc_poll_fd);
+	}
 
 	pthread_mutex_lock(&sc->vsc_mtx);
 	sc->vsc_init_done = (rc == 0) ? 1 : -1;
@@ -1377,16 +1390,37 @@ vtgpu_worker(void *arg)
 				 * fires).  Without this the guest hangs forever
 				 * on the first fenced submit/transfer.
 				 */
-				struct timespec ts;
+				if (sc->vsc_poll_fd >= 0) {
+					/*
+					 * Wake as soon as virglrenderer has
+					 * fence work rather than after a fixed
+					 * delay: a blind 1 ms sleep adds up to
+					 * 1 ms of latency to every fence, and a
+					 * frame takes several.  The timeout is
+					 * only a safety net (and bounds how
+					 * quickly we notice vsc_running going
+					 * false).
+					 */
+					struct pollfd pfd = {
+						.fd = sc->vsc_poll_fd,
+						.events = POLLIN,
+					};
 
-				clock_gettime(CLOCK_REALTIME, &ts);
-				ts.tv_nsec += 1000000;		/* 1 ms */
-				if (ts.tv_nsec >= 1000000000L) {
-					ts.tv_sec++;
-					ts.tv_nsec -= 1000000000L;
+					pthread_mutex_unlock(&sc->vsc_mtx);
+					(void)poll(&pfd, 1, 1 /* ms cap */);
+					pthread_mutex_lock(&sc->vsc_mtx);
+				} else {
+					struct timespec ts;
+
+					clock_gettime(CLOCK_REALTIME, &ts);
+					ts.tv_nsec += 1000000;	/* 1 ms */
+					if (ts.tv_nsec >= 1000000000L) {
+						ts.tv_sec++;
+						ts.tv_nsec -= 1000000000L;
+					}
+					pthread_cond_timedwait(&sc->vsc_cnd,
+					    &sc->vsc_mtx, &ts);
 				}
-				pthread_cond_timedwait(&sc->vsc_cnd,
-				    &sc->vsc_mtx, &ts);
 				virgl_renderer_poll();
 			} else {
 				pthread_cond_wait(&sc->vsc_cnd, &sc->vsc_mtx);
@@ -1975,6 +2009,7 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 	sc->vsc_width  = VTGPU_DEFAULT_WIDTH;
 	sc->vsc_height = VTGPU_DEFAULT_HEIGHT;
 	sc->vsc_drm_fd = -1;
+	sc->vsc_poll_fd = -1;
 	TAILQ_INIT(&sc->vsc_fences);
 
 	render_node     = NULL;
