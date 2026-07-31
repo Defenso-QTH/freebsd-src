@@ -37,6 +37,7 @@
  */
 
 #include <sys/param.h>
+#include <sys/event.h>
 #include <sys/linker_set.h>
 #include <sys/queue.h>
 #include <sys/uio.h>
@@ -47,6 +48,7 @@
 #include <pthread.h>
 #include <pthread_np.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -94,7 +96,15 @@ struct virgl_box {
 #define	VTGPU_DEFAULT_HEIGHT	1080
 
 /* Max iov entries we copy for an ATTACH_BACKING command. */
-#define	VTGPU_MAX_BACKING	256
+/*
+ * Upper bound on mem entries accepted in one ATTACH_BACKING / CREATE_BLOB.
+ * The real limit is how many entries the received command buffer actually
+ * holds (checked per-command); this is only a sanity ceiling so a bogus
+ * nr_entries cannot make us allocate absurdly.  It must be generous: a
+ * 1280x720 BGRA surface is 900 pages, and a scattered 4K one is ~2000, so
+ * the old value of 256 silently rejected ordinary compositor buffers.
+ */
+#define	VTGPU_MAX_BACKING	65536
 
 /*
  * virtio-gpu is a modern-only device: its Linux driver refuses any device
@@ -132,46 +142,11 @@ struct virgl_box {
 	 (1ULL << VIRTIO_GPU_F_RESOURCE_BLOB))
 
 /*
- * mvisor-compatible "virtio-vgpu" mode (device option `mvisor=on`).
- *
- * mvisor's Windows guest driver drives the *same* virtio-gpu 3D command
- * protocol this device already implements, but binds a device with a
- * different PCI id (0x105B == 0x1040 + type 27) and a different, purely-3D
- * config space (`struct vgpu_config`) that advertises capabilities via a
- * bitfield rather than the VIRTIO_GPU_F_VIRGL feature bit.  In this mode we
- * present that identity/config so the mvisor driver attaches; the transport
- * and command handling are shared with the standard virtio-gpu path.
- */
-#define	VTGPU_DEV_VGPU		0x105B
-
-/* VIRTGPU_PARAM_* bits reported in vgpu_config.capabilities (mvisor). */
-#define	VTGPU_PARAM_3D_FEATURES		(1u << 0)
-#define	VTGPU_PARAM_CAPSET_QUERY_FIX	(1u << 1)
-#define	VTGPU_PARAM_RESOURCE_BLOB	(1u << 2)
-#define	VTGPU_PARAM_HOST_VISIBLE	(1u << 3)
-#define	VTGPU_PARAM_CROSS_DEVICE	(1u << 4)
-#define	VTGPU_PARAM_CONTEXT_INIT	(1u << 5)
-#define	VTGPU_PARAM_SUPPORTED_CAPSET_IDS	(1u << 6)
-
-/*
  * Capset id for the Venus (Vulkan) renderer.  virtio_gpu.h only defines the
  * VIRGL/VIRGL2 capsets; VENUS is advertised as a third capset (index 2) when
  * the device is started with venus=on.
  */
 #define	VIRTIO_GPU_CAPSET_VENUS		4
-
-/* mvisor's device config space (see mvisor devices/virtio/virtio_vgpu.h). */
-struct vgpu_config {
-	uint8_t		staging;
-	uint8_t		num_queues;
-	uint32_t	num_capsets;
-	uint64_t	memory_size;
-	uint64_t	capabilities;
-} __attribute__((packed));
-
-/* In mvisor mode 3D is signalled via vgpu_config.capabilities, not a
- * feature bit, so only VIRTIO_F_VERSION_1 is offered. */
-#define	VTGPU_MVISOR_FEATURES	(1ULL << VTGPU_F_VERSION_1_BIT)
 
 /* device_status bits (virtio 1.0 s2.1). */
 #define	VTGPU_S_ACKNOWLEDGE	0x01
@@ -254,12 +229,27 @@ struct vtgpu_fence {
 	TAILQ_ENTRY(vtgpu_fence) vf_link;
 };
 
+/* kqueue ident for the queue-kick user event. */
+#define	VTGPU_KQ_NOTIFY		1
+
+/*
+ * Backstop for the kqueue wait.  Measured 2026-08-01 under a real
+ * workload: ~90% of fence waits are woken by an event, ~10% fall through
+ * to this timeout.  That 10% is why the backstop must stay at 1ms.  It
+ * was briefly 10ms, on the assumption that events would cover everything
+ * -- which left the mean wait unchanged (0.9*0 + 0.1*10ms == the 1ms
+ * every wait used to cost) while making the tail ten times worse.  A
+ * 10ms stall is over half a frame at 60fps, so the spikes hurt pacing
+ * more than the old uniform 1ms did.  At 1ms this path is never worse
+ * than the condvar it replaced, and ~10x better on the 90% that are
+ * woken by an event.  Do not raise it without re-measuring the miss rate.
+ */
+#define	VTGPU_KQ_BACKSTOP_MS	1
+
 struct vtgpu_softc {
 	struct virtio_softc	vsc_vs;
 	struct virtio_gpu_config vsc_cfg;
-	bool			vsc_mvisor;	/* present mvisor vgpu identity */
 	bool			vsc_venus;	/* advertise Venus (Vulkan) capset */
-	struct vgpu_config	vsc_vgpu_cfg;	/* device config in mvisor mode */
 	struct vqueue_info	vsc_queues[VTGPU_MAXQ];
 	pthread_mutex_t		vsc_mtx;
 
@@ -290,6 +280,19 @@ struct vtgpu_softc {
 	 * context that needs no Wayland/X display.  -1 if none was opened.
 	 */
 	int			vsc_drm_fd;
+	/*
+	 * Event-driven wake-up.  vsc_kq multiplexes the two independent
+	 * sources that can make the worker runnable: virglrenderer fence
+	 * progress (EVFILT_READ on vsc_poll_fd) and a guest queue kick
+	 * (EVFILT_USER, triggered by vtgpu_qnotify).  Both are needed: a
+	 * fence-blocked guest never rings a queue, and a queue kick can
+	 * arrive with no fence outstanding.  Either being < 0 means the
+	 * kqueue path is unavailable and we fall back to the condvar.
+	 */
+	int			vsc_kq;
+	int			vsc_poll_fd;
+	uint64_t		vsc_fwait;	/* fence waits entered */
+	uint64_t		vsc_fwait_late;	/* ... that hit the backstop */
 
 	/*
 	 * Host-visible memory window (venus).  vsc_hostvis_base is the bhyve
@@ -305,7 +308,14 @@ struct vtgpu_softc {
 	 * offset; we track the guest range so RESOURCE_UNMAP_BLOB (which carries
 	 * only the resource id) can tear it down.
 	 */
-#define	VTGPU_MAX_BLOB_MAPS	64
+/*
+ * Concurrent host-visible blob mappings.  64 was chosen when only vkcube and
+ * vulkaninfo had ever run; a real game holds far more mapped at once.  Slots
+ * are released by RESOURCE_UNMAP_BLOB and RESOURCE_UNREF, so this bounds live
+ * mappings rather than lifetime allocations -- but exhausting it drops guest
+ * commands, so map_blob logs unconditionally when it does.
+ */
+#define	VTGPU_MAX_BLOB_MAPS	1024
 	struct vtgpu_blob_map {
 		uint32_t	res_id;
 		uint64_t	gpa;	/* guest phys addr in the window */
@@ -482,10 +492,6 @@ vtgpu_cmd_resource_create_2d(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	DPRINTF("create_2d id=%u fmt=%u %ux%u ctx=%u ret=%d",
 	    cmd->resource_id, cmd->format, cmd->width, cmd->height,
 	    hdr->ctx_id, ret);
-	/* See vtgpu_cmd_resource_create_3d: mvisor never sends the attach. */
-	if (ret == 0 && sc->vsc_mvisor && hdr->ctx_id != 0)
-		virgl_renderer_ctx_attach_resource(hdr->ctx_id,
-		    (int)cmd->resource_id);
 	uint32_t type = ret ? VIRTIO_GPU_RESP_ERR_UNSPEC
 	                    : VIRTIO_GPU_RESP_OK_NODATA;
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx, type, wiov, nwiov);
@@ -516,22 +522,14 @@ vtgpu_cmd_resource_create_3d(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	    cmd->resource_id, cmd->target, cmd->format, cmd->bind,
 	    cmd->width, cmd->height, cmd->depth, cmd->array_size,
 	    cmd->last_level, cmd->nr_samples, hdr->ctx_id, ret);
-	/*
-	 * mvisor's guest driver never emits CTX_ATTACH_RESOURCE (its
-	 * AttachResource path is dead code); it expects the host to bind the
-	 * new resource to the context named in the create command's ctx_id.
-	 * Without this the resource exists globally but stays invisible to the
-	 * context, so vrend surface-create / transfers report "Illegal
-	 * resource".  Standard virtio-gpu guests send the attach themselves,
-	 * so only do this in mvisor mode.
-	 */
-	if (ret == 0 && sc->vsc_mvisor && hdr->ctx_id != 0)
-		virgl_renderer_ctx_attach_resource(hdr->ctx_id,
-		    (int)cmd->resource_id);
 	uint32_t type = ret ? VIRTIO_GPU_RESP_ERR_UNSPEC
 	                    : VIRTIO_GPU_RESP_OK_NODATA;
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx, type, wiov, nwiov);
 }
+
+/* Defined below, next to the rest of the blob-map helpers. */
+static struct vtgpu_blob_map *vtgpu_blob_map_find(struct vtgpu_softc *sc,
+    uint32_t res_id);
 
 static void
 vtgpu_cmd_resource_unref(struct vtgpu_softc *sc, struct vqueue_info *vq,
@@ -539,6 +537,30 @@ vtgpu_cmd_resource_unref(struct vtgpu_softc *sc, struct vqueue_info *vq,
     const struct virtio_gpu_resource_unref *cmd,
     struct iovec *wiov, int nwiov)
 {
+	struct vtgpu_blob_map *bm;
+
+	/*
+	 * A blob resource may be unref'd while still mapped: the guest is not
+	 * obliged to send RESOURCE_UNMAP_BLOB first, and a guest that exits or
+	 * crashes never will.  Tear the mapping down here before dropping the
+	 * reference.
+	 *
+	 * Order matters.  virgl_renderer_resource_unref() can free the storage
+	 * the blob is backed by, so the guest alias installed by map_blob must
+	 * be removed BEFORE the unref -- otherwise the guest is left with a
+	 * window onto freed host memory that it can still read and write.
+	 * Releasing the tracking slot also matters on its own: without it the
+	 * fixed-size table fills up and every later map_blob fails.
+	 */
+	bm = vtgpu_blob_map_find(sc, cmd->resource_id);
+	if (bm != NULL) {
+		EPRINTLN("vtgpu: unref res=%u releasing blob map gpa=0x%lx "
+		    "len=%lu", cmd->resource_id, (unsigned long)bm->gpa,
+		    (unsigned long)bm->len);
+		vm_munmap_blob(sc->vsc_ctx, bm->gpa, bm->len);
+		memset(bm, 0, sizeof(*bm));
+		virgl_renderer_resource_unmap(cmd->resource_id);
+	}
 	virgl_renderer_resource_unref(cmd->resource_id);
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 	    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
@@ -592,7 +614,7 @@ vtgpu_cmd_resource_attach_backing(struct vtgpu_softc *sc,
     struct vqueue_info *vq, const struct virtio_gpu_ctrl_hdr *hdr,
     uint16_t chain_idx,
     const struct virtio_gpu_resource_attach_backing *cmd,
-    const struct virtio_gpu_mem_entry *entries,
+    const struct virtio_gpu_mem_entry *entries, uint32_t max_entries,
     struct iovec *wiov, int nwiov)
 {
 	uint32_t n = cmd->nr_entries;
@@ -600,25 +622,25 @@ vtgpu_cmd_resource_attach_backing(struct vtgpu_softc *sc,
 	uint32_t i;
 
 	/*
-	 * mvisor's driver uses a different ATTACH_BACKING layout: it backs
-	 * each resource with a single contiguous allocation described by an
-	 * inline (gpa, size) pair and never fills in nr_entries (it is left
-	 * zero).  Those two fields land at exactly the offsets our first
-	 * virtio_gpu_mem_entry occupies (addr @ +32, length @ +40), so we can
-	 * reuse the entries[] path by forcing a single entry.  Without this
-	 * the standard nr_entries==0 read attaches no backing at all, leaving
-	 * the resource dataless -> virglrenderer "illegal resource".
+	 * Validate nr_entries against what the command buffer actually
+	 * contains before indexing entries[]; the guest controls the count.
+	 * Rejections are logged unconditionally: silently dropping the
+	 * backing leaves the resource dataless and every later use fails with
+	 * virglrenderer "illegal resource", which is very hard to trace back
+	 * to here.
 	 */
-	if (sc->vsc_mvisor)
-		n = 1;
-
-	if (n > VTGPU_MAX_BACKING) {
+	if (n > max_entries || n > VTGPU_MAX_BACKING) {
+		EPRINTLN("vtgpu: attach_backing id=%u REJECTED nr_entries=%u "
+		    "(buffer holds %u, ceiling %u)", cmd->resource_id, n,
+		    max_entries, VTGPU_MAX_BACKING);
 		vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 		    VIRTIO_GPU_RESP_ERR_UNSPEC, wiov, nwiov);
 		return;
 	}
 	iovs = calloc(n, sizeof(*iovs));
 	if (iovs == NULL) {
+		EPRINTLN("vtgpu: attach_backing id=%u FAILED - out of memory "
+		    "for %u iovecs", cmd->resource_id, n);
 		vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 		    VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, wiov, nwiov);
 		return;
@@ -628,6 +650,10 @@ vtgpu_cmd_resource_attach_backing(struct vtgpu_softc *sc,
 		    entries[i].addr, entries[i].length);
 		iovs[i].iov_len  = entries[i].length;
 		if (iovs[i].iov_base == NULL) {
+			EPRINTLN("vtgpu: attach_backing id=%u FAILED - entry %u "
+			    "gpa=0x%lx len=%u is not guest memory",
+			    cmd->resource_id, i,
+			    (unsigned long)entries[i].addr, entries[i].length);
 			free(iovs);
 			vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 			    VIRTIO_GPU_RESP_ERR_UNSPEC, wiov, nwiov);
@@ -669,7 +695,7 @@ static void
 vtgpu_cmd_resource_create_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
     const struct virtio_gpu_ctrl_hdr *hdr, uint16_t chain_idx,
     const struct virtio_gpu_resource_create_blob *cmd,
-    const struct virtio_gpu_mem_entry *entries,
+    const struct virtio_gpu_mem_entry *entries, uint32_t max_entries,
     struct iovec *wiov, int nwiov)
 {
 	struct virgl_renderer_resource_create_blob_args args;
@@ -678,7 +704,10 @@ vtgpu_cmd_resource_create_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	uint32_t i;
 	int ret;
 
-	if (n > VTGPU_MAX_BACKING) {
+	if (n > max_entries || n > VTGPU_MAX_BACKING) {
+		EPRINTLN("vtgpu: create_blob id=%u REJECTED nr_entries=%u "
+		    "(buffer holds %u, ceiling %u)", cmd->resource_id, n,
+		    max_entries, VTGPU_MAX_BACKING);
 		vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 		    VIRTIO_GPU_RESP_ERR_UNSPEC, wiov, nwiov);
 		return;
@@ -686,6 +715,8 @@ vtgpu_cmd_resource_create_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	if (n > 0) {
 		iovs = calloc(n, sizeof(*iovs));
 		if (iovs == NULL) {
+			EPRINTLN("vtgpu: create_blob id=%u FAILED - out of "
+			    "memory for %u iovecs", cmd->resource_id, n);
 			vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 			    VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, wiov, nwiov);
 			return;
@@ -695,6 +726,11 @@ vtgpu_cmd_resource_create_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
 			    entries[i].addr, entries[i].length);
 			iovs[i].iov_len  = entries[i].length;
 			if (iovs[i].iov_base == NULL) {
+				EPRINTLN("vtgpu: create_blob id=%u FAILED - "
+				    "entry %u gpa=0x%lx len=%u is not guest "
+				    "memory", cmd->resource_id, i,
+				    (unsigned long)entries[i].addr,
+				    entries[i].length);
 				free(iovs);
 				vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 				    VIRTIO_GPU_RESP_ERR_UNSPEC, wiov, nwiov);
@@ -718,7 +754,36 @@ vtgpu_cmd_resource_create_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	    "nr=%u ctx=%u ret=%d", cmd->resource_id, cmd->blob_mem,
 	    cmd->blob_flags, (unsigned long)cmd->blob_id,
 	    (unsigned long)cmd->size, n, hdr->ctx_id, ret);
-	/* Bind to the creating context (same convention as our other creates). */
+	if (ret != 0)
+		EPRINTLN("vtgpu: create_blob id=%u FAILED ret=%d (mem=%u "
+		    "flags=0x%x blob_id=%lu size=%lu nr=%u ctx=%u)",
+		    cmd->resource_id, ret, cmd->blob_mem, cmd->blob_flags,
+		    (unsigned long)cmd->blob_id, (unsigned long)cmd->size, n,
+		    hdr->ctx_id);
+	/*
+	 * Host-visible blobs (BLOB_MEM_HOST3D == 2) are few and expensive --
+	 * CK3 asks for them 256MB at a time -- so log the successful ones too,
+	 * unconditionally.  venus sets its per-VkDeviceMemory "exported" flag
+	 * before the export completes and never clears it, so a partial
+	 * failure poisons that memory permanently and every later attempt
+	 * reports "mem has been exported".  Without a record of the export
+	 * that succeeded, those later failures cannot be traced back to the
+	 * one that actually broke, and the success path is otherwise visible
+	 * only under debug=on, which costs 53% and changes the timing.
+	 */
+	if (ret == 0 && cmd->blob_mem == 2)
+		EPRINTLN("vtgpu: create_blob id=%u OK blob_id=%lu size=%lu "
+		    "flags=0x%x ctx=%u", cmd->resource_id,
+		    (unsigned long)cmd->blob_id, (unsigned long)cmd->size,
+		    cmd->blob_flags, hdr->ctx_id);
+	/*
+	 * Attaching here is a leftover from the removed mvisor mode, whose
+	 * guest driver never sent CTX_ATTACH_RESOURCE.  It is harmless -- for
+	 * a context-created blob proxy_context_attach_resource finds the
+	 * resource already present and returns -- but the standard Linux guest
+	 * sends the attach itself, so keep it only until that is confirmed
+	 * across all guest drivers we care about.
+	 */
 	if (ret == 0 && hdr->ctx_id != 0)
 		virgl_renderer_ctx_attach_resource(hdr->ctx_id,
 		    (int)cmd->resource_id);
@@ -765,8 +830,8 @@ vtgpu_cmd_resource_map_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	int i, ret;
 
 	if (sc->vsc_hostvis_gpa == 0) {
-		DPRINTF("map_blob res=%u but host-visible BAR not mapped",
-		    cmd->resource_id);
+		EPRINTLN("vtgpu: map_blob res=%u REJECTED - host-visible BAR "
+		    "not mapped by the guest", cmd->resource_id);
 		goto err;
 	}
 	/* Find a free tracking slot. */
@@ -777,8 +842,9 @@ vtgpu_cmd_resource_map_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
 			break;
 		}
 	if (bm == NULL) {
-		DPRINTF("map_blob res=%u: no free blob-map slots",
-		    cmd->resource_id);
+		EPRINTLN("vtgpu: map_blob res=%u REJECTED - all %d blob-map "
+		    "slots in use (leak, or raise VTGPU_MAX_BLOB_MAPS)",
+		    cmd->resource_id, VTGPU_MAX_BLOB_MAPS);
 		goto err;
 	}
 
@@ -791,8 +857,8 @@ vtgpu_cmd_resource_map_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	 */
 	ret = virgl_renderer_resource_map(cmd->resource_id, &hva, &map_size);
 	if (ret != 0 || hva == NULL) {
-		DPRINTF("map_blob res=%u resource_map ret=%d hva=%p",
-		    cmd->resource_id, ret, hva);
+		EPRINTLN("vtgpu: map_blob res=%u FAILED resource_map ret=%d "
+		    "hva=%p", cmd->resource_id, ret, hva);
 		goto err;
 	}
 	/*
@@ -935,6 +1001,8 @@ vtgpu_cmd_get_capset(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	    cmd->capset_id, cmd->capset_version, max_ver, max_size);
 
 	if (max_size == 0) {
+		EPRINTLN("vtgpu: get_capset id=%u ver=%u REJECTED - unknown "
+		    "capset", cmd->capset_id, cmd->capset_version);
 		vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 		    VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER, wiov, nwiov);
 		return;
@@ -943,6 +1011,8 @@ vtgpu_cmd_get_capset(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	size_t total = sizeof(struct virtio_gpu_resp_capset) + max_size;
 	struct virtio_gpu_resp_capset *resp = calloc(1, total);
 	if (resp == NULL) {
+		EPRINTLN("vtgpu: get_capset id=%u FAILED - out of memory for "
+		    "%zu bytes", cmd->capset_id, total);
 		vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 		    VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, wiov, nwiov);
 		return;
@@ -1005,6 +1075,7 @@ vtgpu_cmd_ctx_attach_resource(struct vtgpu_softc *sc, struct vqueue_info *vq,
     const struct virtio_gpu_ctx_resource *cmd,
     struct iovec *wiov, int nwiov)
 {
+	DPRINTF("ctx_attach_res ctx=%u res=%u", hdr->ctx_id, cmd->resource_id);
 	virgl_renderer_ctx_attach_resource(hdr->ctx_id, (int)cmd->resource_id);
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 	    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
@@ -1016,6 +1087,7 @@ vtgpu_cmd_ctx_detach_resource(struct vtgpu_softc *sc, struct vqueue_info *vq,
     const struct virtio_gpu_ctx_resource *cmd,
     struct iovec *wiov, int nwiov)
 {
+	DPRINTF("ctx_detach_res ctx=%u res=%u", hdr->ctx_id, cmd->resource_id);
 	virgl_renderer_ctx_detach_resource(hdr->ctx_id, (int)cmd->resource_id);
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 	    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
@@ -1203,8 +1275,10 @@ vtgpu_process_controlq(struct vtgpu_softc *sc, int qidx)
 			    (const void *)hdr;
 			const struct virtio_gpu_mem_entry *ents =
 			    (const void *)(ab + 1);
+			uint32_t maxe = cmdlen > sizeof(*ab) ?
+			    (cmdlen - sizeof(*ab)) / sizeof(*ents) : 0;
 			vtgpu_cmd_resource_attach_backing(sc, vq, hdr, req.idx,
-			    ab, ents, wiov, nwiov);
+			    ab, ents, maxe, wiov, nwiov);
 			break;
 		}
 
@@ -1219,8 +1293,10 @@ vtgpu_process_controlq(struct vtgpu_softc *sc, int qidx)
 			    (const void *)hdr;
 			const struct virtio_gpu_mem_entry *ents =
 			    (const void *)(cb + 1);
+			uint32_t maxe = cmdlen > sizeof(*cb) ?
+			    (cmdlen - sizeof(*cb)) / sizeof(*ents) : 0;
 			vtgpu_cmd_resource_create_blob(sc, vq, hdr, req.idx,
-			    cb, ents, wiov, nwiov);
+			    cb, ents, maxe, wiov, nwiov);
 			break;
 		}
 
@@ -1337,6 +1413,50 @@ vtgpu_process_cursorq(struct vtgpu_softc *sc)
 
 static int vtgpu_virgl_init(struct vtgpu_softc *sc);
 
+/*
+ * Build the kqueue the worker waits on.  Any failure here is non-fatal:
+ * vsc_kq stays -1 and the worker uses the condvar path, which is correct
+ * but wakes on a fixed timeout while fences are outstanding.  Notably
+ * this is the expected outcome if Capsicum denies CAP_EVENT on
+ * virglrenderer's fd, so it must degrade rather than abort.
+ */
+static void
+vtgpu_kq_setup(struct vtgpu_softc *sc)
+{
+	struct kevent kev[2];
+	int n = 0;
+
+	sc->vsc_poll_fd = virgl_renderer_get_poll_fd();
+	sc->vsc_kq = kqueue();
+	if (sc->vsc_kq < 0) {
+		EPRINTLN("vtgpu: kqueue() failed (%s), using timed wait",
+		    strerror(errno));
+		return;
+	}
+
+	/*
+	 * EV_CLEAR on both: the user event must re-arm per trigger rather
+	 * than stay permanently ready, and the fence fd must not spin us if
+	 * virgl_renderer_poll() leaves it readable.
+	 */
+	EV_SET(&kev[n++], VTGPU_KQ_NOTIFY, EVFILT_USER, EV_ADD | EV_CLEAR,
+	    0, 0, NULL);
+	if (sc->vsc_poll_fd >= 0)
+		EV_SET(&kev[n++], sc->vsc_poll_fd, EVFILT_READ,
+		    EV_ADD | EV_CLEAR, 0, 0, NULL);
+
+	if (kevent(sc->vsc_kq, kev, n, NULL, 0, NULL) < 0) {
+		EPRINTLN("vtgpu: kevent register failed (%s), using timed wait",
+		    strerror(errno));
+		close(sc->vsc_kq);
+		sc->vsc_kq = -1;
+		return;
+	}
+	EPRINTLN("vtgpu: event-driven wait active (fence fd=%d%s)",
+	    sc->vsc_poll_fd,
+	    sc->vsc_poll_fd < 0 ? ", queue kicks only" : "");
+}
+
 static void *
 vtgpu_worker(void *arg)
 {
@@ -1358,6 +1478,7 @@ vtgpu_worker(void *arg)
 		pthread_mutex_unlock(&sc->vsc_mtx);
 		return (NULL);
 	}
+	vtgpu_kq_setup(sc);
 
 	while (sc->vsc_running) {
 		while (sc->vsc_running &&
@@ -1366,26 +1487,64 @@ vtgpu_worker(void *arg)
 			if (!TAILQ_EMPTY(&sc->vsc_fences)) {
 				/*
 				 * Fenced commands are awaiting GPU completion.
-				 * The guest may be blocked waiting for one of
-				 * those fences and will not ring a queue again,
-				 * so we must not sleep indefinitely: poll
-				 * virglrenderer for fence progress on a short
-				 * timeout until the fence list drains
-				 * (write_fence releases each chain as its fence
-				 * fires).  Without this the guest hangs forever
-				 * on the first fenced submit/transfer.
+				 * The guest may be blocked on one of those
+				 * fences and will not ring a queue again, so we
+				 * must not sleep indefinitely: wait for fence
+				 * progress until the list drains (write_fence
+				 * releases each chain as its fence fires).
+				 * Without this the guest hangs forever on the
+				 * first fenced submit/transfer.
 				 */
-				struct timespec ts;
+				sc->vsc_fwait++;
+				if (sc->vsc_kq >= 0) {
+					struct kevent ev[2];
+					struct timespec ts = {
+						.tv_sec = 0,
+						.tv_nsec =
+						    VTGPU_KQ_BACKSTOP_MS *
+						    1000000L
+					};
+					int nev;
 
-				clock_gettime(CLOCK_REALTIME, &ts);
-				ts.tv_nsec += 1000000;		/* 1 ms */
-				if (ts.tv_nsec >= 1000000000L) {
-					ts.tv_sec++;
-					ts.tv_nsec -= 1000000000L;
+					/*
+					 * kevent() blocks, so the mutex must be
+					 * dropped around it.  A queue kick in
+					 * that window is not lost: the user
+					 * event stays pending and returns
+					 * immediately below.
+					 */
+					pthread_mutex_unlock(&sc->vsc_mtx);
+					nev = kevent(sc->vsc_kq, NULL, 0, ev,
+					    nitems(ev), &ts);
+					pthread_mutex_lock(&sc->vsc_mtx);
+					if (nev == 0)
+						sc->vsc_fwait_late++;
+				} else {
+					struct timespec ts;
+
+					clock_gettime(CLOCK_REALTIME, &ts);
+					ts.tv_nsec += 1000000;	/* 1 ms */
+					if (ts.tv_nsec >= 1000000000L) {
+						ts.tv_sec++;
+						ts.tv_nsec -= 1000000000L;
+					}
+					pthread_cond_timedwait(&sc->vsc_cnd,
+					    &sc->vsc_mtx, &ts);
+					sc->vsc_fwait_late++;
 				}
-				pthread_cond_timedwait(&sc->vsc_cnd,
-				    &sc->vsc_mtx, &ts);
 				virgl_renderer_poll();
+
+				/*
+				 * Periodic, and rare enough to be free: tells
+				 * us whether this path is hot at all and how
+				 * often we fall through to the backstop rather
+				 * than being woken by an event.
+				 */
+				if ((sc->vsc_fwait & 0xffff) == 0)
+					EPRINTLN("vtgpu: fence waits=%ju "
+					    "backstop=%ju", (uintmax_t)
+					    sc->vsc_fwait, (uintmax_t)
+					    sc->vsc_fwait_late);
 			} else {
 				pthread_cond_wait(&sc->vsc_cnd, &sc->vsc_mtx);
 			}
@@ -1394,30 +1553,8 @@ vtgpu_worker(void *arg)
 		if (!sc->vsc_running)
 			break;
 
-		if (sc->vsc_mvisor) {
-			/*
-			 * mvisor's driver uses a different queue split:
-			 * queue 0 = COMMAND (3D submit stream), queue 1 =
-			 * CONTROL (capset/context/resource/transfer).  Both
-			 * carry standard virtio-gpu commands dispatched by
-			 * hdr.type and there is no cursor queue, so run the
-			 * command handler on both.
-			 *
-			 * Process CONTROL (queue 1) first: it carries
-			 * GET_CAPSET_INFO/GET_CAPSET and CTX_CREATE/CTX_DESTROY,
-			 * while COMMAND (queue 0) carries the resource
-			 * create/attach/transfer and SUBMIT_3D that all
-			 * reference the virgl context created on queue 1.
-			 * Servicing COMMAND first would run a submit before its
-			 * context exists -> virglrenderer context/command
-			 * errors.
-			 */
-			vtgpu_process_controlq(sc, 1);
-			vtgpu_process_controlq(sc, 0);
-		} else {
-			vtgpu_process_controlq(sc, VTGPU_CONTROLQ);
-			vtgpu_process_cursorq(sc);
-		}
+		vtgpu_process_controlq(sc, VTGPU_CONTROLQ);
+		vtgpu_process_cursorq(sc);
 	}
 	pthread_mutex_unlock(&sc->vsc_mtx);
 	return (NULL);
@@ -1432,6 +1569,21 @@ vtgpu_qnotify(void *arg, struct vqueue_info *vq __unused)
 {
 	struct vtgpu_softc *sc = arg;
 
+	/*
+	 * Trigger before signalling: an EVFILT_USER trigger is sticky, so
+	 * one racing with the worker's descriptor check is still pending
+	 * when it calls kevent() and wakes it immediately.  A condvar
+	 * signal delivered with no waiter is simply lost, which is why the
+	 * kqueue path -- not a bare poll() on the fence fd -- is what makes
+	 * an event-driven wait correct here.
+	 */
+	if (sc->vsc_kq >= 0) {
+		struct kevent kev;
+
+		EV_SET(&kev, VTGPU_KQ_NOTIFY, EVFILT_USER, 0, NOTE_TRIGGER,
+		    0, NULL);
+		(void)kevent(sc->vsc_kq, &kev, 1, NULL, 0, NULL);
+	}
 	pthread_mutex_lock(&sc->vsc_mtx);
 	pthread_cond_signal(&sc->vsc_cnd);
 	pthread_mutex_unlock(&sc->vsc_mtx);
@@ -1449,16 +1601,9 @@ static int
 vtgpu_cfgread(void *arg, int offset, int size, uint32_t *retval)
 {
 	struct vtgpu_softc *sc = arg;
-	const uint8_t *base;
-	size_t cfgsize;
+	const uint8_t *base = (const uint8_t *)&sc->vsc_cfg;
+	size_t cfgsize = sizeof(sc->vsc_cfg);
 
-	if (sc->vsc_mvisor) {
-		base = (const uint8_t *)&sc->vsc_vgpu_cfg;
-		cfgsize = sizeof(sc->vsc_vgpu_cfg);
-	} else {
-		base = (const uint8_t *)&sc->vsc_cfg;
-		cfgsize = sizeof(sc->vsc_cfg);
-	}
 	*retval = 0;
 	if (offset < 0 || (size_t)offset + size > cfgsize)
 		return (0);		/* out-of-range read reads as zero */
@@ -1651,8 +1796,8 @@ vtgpu_common_read(struct vtgpu_softc *sc, uint64_t off)
 {
 	uint16_t q = sc->vsc_qsel;
 	bool qok = (q < VTGPU_MAXQ);
-	uint64_t feat = sc->vsc_mvisor ? VTGPU_MVISOR_FEATURES :
-	    (sc->vsc_venus ? VTGPU_VENUS_FEATURES : VTGPU_MODERN_FEATURES);
+	uint64_t feat = sc->vsc_venus ? VTGPU_VENUS_FEATURES :
+	    VTGPU_MODERN_FEATURES;
 
 	switch (off) {
 	case VTGPU_CC_DFSELECT:	return sc->vsc_dev_feature_sel;
@@ -1906,13 +2051,27 @@ vtgpu_virgl_init(struct vtgpu_softc *sc)
 	 */
 	flags = VIRGL_RENDERER_USE_EGL;
 	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0) {
-		DPRINTF("virgl init ok (flags=0x%x venus=0x%x)",
+		/*
+		 * Unconditional: this fires once per VM start, costs nothing,
+		 * and is the first thing wanted when the guest shows no
+		 * acceleration.  Hiding it behind debug=on (which must stay
+		 * off for performance) leaves no way to tell whether virgl
+		 * came up at all.
+		 */
+		EPRINTLN("vtgpu: virgl init ok (flags=0x%x venus=0x%x)",
 		    flags, venus);
 		return (0);
 	}
 	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLES;
 	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0) {
-		DPRINTF("virgl init ok (flags=0x%x venus=0x%x)",
+		/*
+		 * Unconditional: this fires once per VM start, costs nothing,
+		 * and is the first thing wanted when the guest shows no
+		 * acceleration.  Hiding it behind debug=on (which must stay
+		 * off for performance) leaves no way to tell whether virgl
+		 * came up at all.
+		 */
+		EPRINTLN("vtgpu: virgl init ok (flags=0x%x venus=0x%x)",
 		    flags, venus);
 		return (0);
 	}
@@ -1920,14 +2079,28 @@ vtgpu_virgl_init(struct vtgpu_softc *sc)
 	/* Headless via surfaceless EGL (no window system, no render-node fd). */
 	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_SURFACELESS;
 	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0) {
-		DPRINTF("virgl init ok (flags=0x%x venus=0x%x)",
+		/*
+		 * Unconditional: this fires once per VM start, costs nothing,
+		 * and is the first thing wanted when the guest shows no
+		 * acceleration.  Hiding it behind debug=on (which must stay
+		 * off for performance) leaves no way to tell whether virgl
+		 * came up at all.
+		 */
+		EPRINTLN("vtgpu: virgl init ok (flags=0x%x venus=0x%x)",
 		    flags, venus);
 		return (0);
 	}
 	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLES |
 	    VIRGL_RENDERER_USE_SURFACELESS;
 	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0) {
-		DPRINTF("virgl init ok (flags=0x%x venus=0x%x)",
+		/*
+		 * Unconditional: this fires once per VM start, costs nothing,
+		 * and is the first thing wanted when the guest shows no
+		 * acceleration.  Hiding it behind debug=on (which must stay
+		 * off for performance) leaves no way to tell whether virgl
+		 * came up at all.
+		 */
+		EPRINTLN("vtgpu: virgl init ok (flags=0x%x venus=0x%x)",
 		    flags, venus);
 		return (0);
 	}
@@ -1937,24 +2110,47 @@ vtgpu_virgl_init(struct vtgpu_softc *sc)
 		vtgpu_probe_wayland();
 	flags = VIRGL_RENDERER_USE_EGL;
 	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0) {
-		DPRINTF("virgl init ok (flags=0x%x venus=0x%x)",
+		/*
+		 * Unconditional: this fires once per VM start, costs nothing,
+		 * and is the first thing wanted when the guest shows no
+		 * acceleration.  Hiding it behind debug=on (which must stay
+		 * off for performance) leaves no way to tell whether virgl
+		 * came up at all.
+		 */
+		EPRINTLN("vtgpu: virgl init ok (flags=0x%x venus=0x%x)",
 		    flags, venus);
 		return (0);
 	}
 	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLES;
 	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0) {
-		DPRINTF("virgl init ok (flags=0x%x venus=0x%x)",
+		/*
+		 * Unconditional: this fires once per VM start, costs nothing,
+		 * and is the first thing wanted when the guest shows no
+		 * acceleration.  Hiding it behind debug=on (which must stay
+		 * off for performance) leaves no way to tell whether virgl
+		 * came up at all.
+		 */
+		EPRINTLN("vtgpu: virgl init ok (flags=0x%x venus=0x%x)",
 		    flags, venus);
 		return (0);
 	}
 
 	flags = VIRGL_RENDERER_USE_GLX;
 	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0) {
-		DPRINTF("virgl init ok (flags=0x%x venus=0x%x)",
+		/*
+		 * Unconditional: this fires once per VM start, costs nothing,
+		 * and is the first thing wanted when the guest shows no
+		 * acceleration.  Hiding it behind debug=on (which must stay
+		 * off for performance) leaves no way to tell whether virgl
+		 * came up at all.
+		 */
+		EPRINTLN("vtgpu: virgl init ok (flags=0x%x venus=0x%x)",
 		    flags, venus);
 		return (0);
 	}
 
+	EPRINTLN("vtgpu: virgl init FAILED - every backend rejected "
+	    "(no GL/EGL?  check the render node and virglrenderer)");
 	return (1);
 }
 
@@ -1973,6 +2169,8 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 	sc->vsc_width  = VTGPU_DEFAULT_WIDTH;
 	sc->vsc_height = VTGPU_DEFAULT_HEIGHT;
 	sc->vsc_drm_fd = -1;
+	sc->vsc_kq = -1;
+	sc->vsc_poll_fd = -1;
 	TAILQ_INIT(&sc->vsc_fences);
 
 	render_node     = NULL;
@@ -1986,8 +2184,6 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 		if (h) sc->vsc_height = (uint32_t)atoi(h);
 		render_node     = get_config_value_node(nvl, "render");
 		wayland_display = get_config_value_node(nvl, "wayland");
-		sc->vsc_mvisor  = get_config_bool_node_default(nvl, "mvisor",
-		    false);
 		sc->vsc_venus   = get_config_bool_node_default(nvl, "venus",
 		    false);
 		pci_vtgpu_debug = get_config_bool_node_default(nvl, "debug",
@@ -2026,16 +2222,6 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 	 * (VIRGL + VIRGL2); with venus=on a third (VENUS) is added. */
 	sc->vsc_cfg.num_scanouts = VTGPU_NUM_SCANOUTS;
 	sc->vsc_cfg.num_capsets  = sc->vsc_venus ? 3 : 2;
-	if (sc->vsc_mvisor) {
-		/* Mirror mvisor's vgpu_config so its Windows driver attaches. */
-		sc->vsc_vgpu_cfg.staging     = 0;
-		sc->vsc_vgpu_cfg.num_queues  = VTGPU_MAXQ;
-		sc->vsc_vgpu_cfg.num_capsets = 2;
-		sc->vsc_vgpu_cfg.memory_size = 1ULL << 30;	/* 1 GiB */
-		sc->vsc_vgpu_cfg.capabilities =
-		    VTGPU_PARAM_3D_FEATURES | VTGPU_PARAM_CAPSET_QUERY_FIX |
-		    VTGPU_PARAM_CONTEXT_INIT | VTGPU_PARAM_SUPPORTED_CAPSET_IDS;
-	}
 
 	pthread_mutex_init(&sc->vsc_mtx, NULL);
 	pthread_cond_init(&sc->vsc_cnd, NULL);
@@ -2081,18 +2267,14 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 	/*
 	 * PCI identity.  Device ID 0x1040+type routes the guest down the
 	 * modern virtio-pci probe path; revision >= 1 marks it
-	 * non-transitional.  In mvisor mode we present mvisor's device id
-	 * (0x105B) so its Windows vgpu driver binds; otherwise the standard
-	 * virtio-gpu id (0x1050) for the in-kernel Linux driver.
+	 * non-transitional.
 	 */
-	pci_set_cfgdata16(pi, PCIR_DEVICE,
-	    sc->vsc_mvisor ? VTGPU_DEV_VGPU : VIRTIO_DEV_GPU);
+	pci_set_cfgdata16(pi, PCIR_DEVICE, VIRTIO_DEV_GPU);
 	pci_set_cfgdata16(pi, PCIR_VENDOR, VIRTIO_VENDOR);
 	pci_set_cfgdata8(pi, PCIR_REVID, 1);
 	pci_set_cfgdata8(pi, PCIR_CLASS, PCIC_DISPLAY);
 	pci_set_cfgdata8(pi, PCIR_SUBCLASS, PCIS_DISPLAY_OTHER);
-	pci_set_cfgdata16(pi, PCIR_SUBDEV_0,
-	    sc->vsc_mvisor ? (VTGPU_DEV_VGPU - 0x1040) : VIRTIO_ID_GPU);
+	pci_set_cfgdata16(pi, PCIR_SUBDEV_0, VIRTIO_ID_GPU);
 	pci_set_cfgdata16(pi, PCIR_SUBVEND_0, VIRTIO_VENDOR);
 
 	/*
