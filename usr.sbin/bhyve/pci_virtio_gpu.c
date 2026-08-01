@@ -141,46 +141,11 @@ struct virgl_box {
 	 (1ULL << VIRTIO_GPU_F_RESOURCE_BLOB))
 
 /*
- * mvisor-compatible "virtio-vgpu" mode (device option `mvisor=on`).
- *
- * mvisor's Windows guest driver drives the *same* virtio-gpu 3D command
- * protocol this device already implements, but binds a device with a
- * different PCI id (0x105B == 0x1040 + type 27) and a different, purely-3D
- * config space (`struct vgpu_config`) that advertises capabilities via a
- * bitfield rather than the VIRTIO_GPU_F_VIRGL feature bit.  In this mode we
- * present that identity/config so the mvisor driver attaches; the transport
- * and command handling are shared with the standard virtio-gpu path.
- */
-#define	VTGPU_DEV_VGPU		0x105B
-
-/* VIRTGPU_PARAM_* bits reported in vgpu_config.capabilities (mvisor). */
-#define	VTGPU_PARAM_3D_FEATURES		(1u << 0)
-#define	VTGPU_PARAM_CAPSET_QUERY_FIX	(1u << 1)
-#define	VTGPU_PARAM_RESOURCE_BLOB	(1u << 2)
-#define	VTGPU_PARAM_HOST_VISIBLE	(1u << 3)
-#define	VTGPU_PARAM_CROSS_DEVICE	(1u << 4)
-#define	VTGPU_PARAM_CONTEXT_INIT	(1u << 5)
-#define	VTGPU_PARAM_SUPPORTED_CAPSET_IDS	(1u << 6)
-
-/*
  * Capset id for the Venus (Vulkan) renderer.  virtio_gpu.h only defines the
  * VIRGL/VIRGL2 capsets; VENUS is advertised as a third capset (index 2) when
  * the device is started with venus=on.
  */
 #define	VIRTIO_GPU_CAPSET_VENUS		4
-
-/* mvisor's device config space (see mvisor devices/virtio/virtio_vgpu.h). */
-struct vgpu_config {
-	uint8_t		staging;
-	uint8_t		num_queues;
-	uint32_t	num_capsets;
-	uint64_t	memory_size;
-	uint64_t	capabilities;
-} __attribute__((packed));
-
-/* In mvisor mode 3D is signalled via vgpu_config.capabilities, not a
- * feature bit, so only VIRTIO_F_VERSION_1 is offered. */
-#define	VTGPU_MVISOR_FEATURES	(1ULL << VTGPU_F_VERSION_1_BIT)
 
 /* device_status bits (virtio 1.0 s2.1). */
 #define	VTGPU_S_ACKNOWLEDGE	0x01
@@ -266,9 +231,7 @@ struct vtgpu_fence {
 struct vtgpu_softc {
 	struct virtio_softc	vsc_vs;
 	struct virtio_gpu_config vsc_cfg;
-	bool			vsc_mvisor;	/* present mvisor vgpu identity */
 	bool			vsc_venus;	/* advertise Venus (Vulkan) capset */
-	struct vgpu_config	vsc_vgpu_cfg;	/* device config in mvisor mode */
 	struct vqueue_info	vsc_queues[VTGPU_MAXQ];
 	pthread_mutex_t		vsc_mtx;
 
@@ -499,10 +462,6 @@ vtgpu_cmd_resource_create_2d(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	DPRINTF("create_2d id=%u fmt=%u %ux%u ctx=%u ret=%d",
 	    cmd->resource_id, cmd->format, cmd->width, cmd->height,
 	    hdr->ctx_id, ret);
-	/* See vtgpu_cmd_resource_create_3d: mvisor never sends the attach. */
-	if (ret == 0 && sc->vsc_mvisor && hdr->ctx_id != 0)
-		virgl_renderer_ctx_attach_resource(hdr->ctx_id,
-		    (int)cmd->resource_id);
 	uint32_t type = ret ? VIRTIO_GPU_RESP_ERR_UNSPEC
 	                    : VIRTIO_GPU_RESP_OK_NODATA;
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx, type, wiov, nwiov);
@@ -533,18 +492,6 @@ vtgpu_cmd_resource_create_3d(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	    cmd->resource_id, cmd->target, cmd->format, cmd->bind,
 	    cmd->width, cmd->height, cmd->depth, cmd->array_size,
 	    cmd->last_level, cmd->nr_samples, hdr->ctx_id, ret);
-	/*
-	 * mvisor's guest driver never emits CTX_ATTACH_RESOURCE (its
-	 * AttachResource path is dead code); it expects the host to bind the
-	 * new resource to the context named in the create command's ctx_id.
-	 * Without this the resource exists globally but stays invisible to the
-	 * context, so vrend surface-create / transfers report "Illegal
-	 * resource".  Standard virtio-gpu guests send the attach themselves,
-	 * so only do this in mvisor mode.
-	 */
-	if (ret == 0 && sc->vsc_mvisor && hdr->ctx_id != 0)
-		virgl_renderer_ctx_attach_resource(hdr->ctx_id,
-		    (int)cmd->resource_id);
 	uint32_t type = ret ? VIRTIO_GPU_RESP_ERR_UNSPEC
 	                    : VIRTIO_GPU_RESP_OK_NODATA;
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx, type, wiov, nwiov);
@@ -617,19 +564,6 @@ vtgpu_cmd_resource_attach_backing(struct vtgpu_softc *sc,
 	uint32_t i;
 
 	/*
-	 * mvisor's driver uses a different ATTACH_BACKING layout: it backs
-	 * each resource with a single contiguous allocation described by an
-	 * inline (gpa, size) pair and never fills in nr_entries (it is left
-	 * zero).  Those two fields land at exactly the offsets our first
-	 * virtio_gpu_mem_entry occupies (addr @ +32, length @ +40), so we can
-	 * reuse the entries[] path by forcing a single entry.  Without this
-	 * the standard nr_entries==0 read attaches no backing at all, leaving
-	 * the resource dataless -> virglrenderer "illegal resource".
-	 */
-	if (sc->vsc_mvisor)
-		n = 1;
-
-	/*
 	 * Validate nr_entries against what the command buffer actually
 	 * contains before indexing entries[]; the guest controls the count.
 	 * Rejections are logged unconditionally: silently dropping the
@@ -637,7 +571,7 @@ vtgpu_cmd_resource_attach_backing(struct vtgpu_softc *sc,
 	 * virglrenderer "illegal resource", which is very hard to trace back
 	 * to here.
 	 */
-	if ((!sc->vsc_mvisor && n > max_entries) || n > VTGPU_MAX_BACKING) {
+	if (n > max_entries || n > VTGPU_MAX_BACKING) {
 		EPRINTLN("vtgpu: attach_backing id=%u REJECTED nr_entries=%u "
 		    "(buffer holds %u, ceiling %u)", cmd->resource_id, n,
 		    max_entries, VTGPU_MAX_BACKING);
@@ -1456,30 +1390,8 @@ vtgpu_worker(void *arg)
 		if (!sc->vsc_running)
 			break;
 
-		if (sc->vsc_mvisor) {
-			/*
-			 * mvisor's driver uses a different queue split:
-			 * queue 0 = COMMAND (3D submit stream), queue 1 =
-			 * CONTROL (capset/context/resource/transfer).  Both
-			 * carry standard virtio-gpu commands dispatched by
-			 * hdr.type and there is no cursor queue, so run the
-			 * command handler on both.
-			 *
-			 * Process CONTROL (queue 1) first: it carries
-			 * GET_CAPSET_INFO/GET_CAPSET and CTX_CREATE/CTX_DESTROY,
-			 * while COMMAND (queue 0) carries the resource
-			 * create/attach/transfer and SUBMIT_3D that all
-			 * reference the virgl context created on queue 1.
-			 * Servicing COMMAND first would run a submit before its
-			 * context exists -> virglrenderer context/command
-			 * errors.
-			 */
-			vtgpu_process_controlq(sc, 1);
-			vtgpu_process_controlq(sc, 0);
-		} else {
-			vtgpu_process_controlq(sc, VTGPU_CONTROLQ);
-			vtgpu_process_cursorq(sc);
-		}
+		vtgpu_process_controlq(sc, VTGPU_CONTROLQ);
+		vtgpu_process_cursorq(sc);
 	}
 	pthread_mutex_unlock(&sc->vsc_mtx);
 	return (NULL);
@@ -1511,16 +1423,9 @@ static int
 vtgpu_cfgread(void *arg, int offset, int size, uint32_t *retval)
 {
 	struct vtgpu_softc *sc = arg;
-	const uint8_t *base;
-	size_t cfgsize;
+	const uint8_t *base = (const uint8_t *)&sc->vsc_cfg;
+	size_t cfgsize = sizeof(sc->vsc_cfg);
 
-	if (sc->vsc_mvisor) {
-		base = (const uint8_t *)&sc->vsc_vgpu_cfg;
-		cfgsize = sizeof(sc->vsc_vgpu_cfg);
-	} else {
-		base = (const uint8_t *)&sc->vsc_cfg;
-		cfgsize = sizeof(sc->vsc_cfg);
-	}
 	*retval = 0;
 	if (offset < 0 || (size_t)offset + size > cfgsize)
 		return (0);		/* out-of-range read reads as zero */
@@ -1713,8 +1618,8 @@ vtgpu_common_read(struct vtgpu_softc *sc, uint64_t off)
 {
 	uint16_t q = sc->vsc_qsel;
 	bool qok = (q < VTGPU_MAXQ);
-	uint64_t feat = sc->vsc_mvisor ? VTGPU_MVISOR_FEATURES :
-	    (sc->vsc_venus ? VTGPU_VENUS_FEATURES : VTGPU_MODERN_FEATURES);
+	uint64_t feat = sc->vsc_venus ? VTGPU_VENUS_FEATURES :
+	    VTGPU_MODERN_FEATURES;
 
 	switch (off) {
 	case VTGPU_CC_DFSELECT:	return sc->vsc_dev_feature_sel;
@@ -2100,8 +2005,6 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 		if (h) sc->vsc_height = (uint32_t)atoi(h);
 		render_node     = get_config_value_node(nvl, "render");
 		wayland_display = get_config_value_node(nvl, "wayland");
-		sc->vsc_mvisor  = get_config_bool_node_default(nvl, "mvisor",
-		    false);
 		sc->vsc_venus   = get_config_bool_node_default(nvl, "venus",
 		    false);
 		pci_vtgpu_debug = get_config_bool_node_default(nvl, "debug",
@@ -2140,16 +2043,6 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 	 * (VIRGL + VIRGL2); with venus=on a third (VENUS) is added. */
 	sc->vsc_cfg.num_scanouts = VTGPU_NUM_SCANOUTS;
 	sc->vsc_cfg.num_capsets  = sc->vsc_venus ? 3 : 2;
-	if (sc->vsc_mvisor) {
-		/* Mirror mvisor's vgpu_config so its Windows driver attaches. */
-		sc->vsc_vgpu_cfg.staging     = 0;
-		sc->vsc_vgpu_cfg.num_queues  = VTGPU_MAXQ;
-		sc->vsc_vgpu_cfg.num_capsets = 2;
-		sc->vsc_vgpu_cfg.memory_size = 1ULL << 30;	/* 1 GiB */
-		sc->vsc_vgpu_cfg.capabilities =
-		    VTGPU_PARAM_3D_FEATURES | VTGPU_PARAM_CAPSET_QUERY_FIX |
-		    VTGPU_PARAM_CONTEXT_INIT | VTGPU_PARAM_SUPPORTED_CAPSET_IDS;
-	}
 
 	pthread_mutex_init(&sc->vsc_mtx, NULL);
 	pthread_cond_init(&sc->vsc_cnd, NULL);
@@ -2195,18 +2088,14 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 	/*
 	 * PCI identity.  Device ID 0x1040+type routes the guest down the
 	 * modern virtio-pci probe path; revision >= 1 marks it
-	 * non-transitional.  In mvisor mode we present mvisor's device id
-	 * (0x105B) so its Windows vgpu driver binds; otherwise the standard
-	 * virtio-gpu id (0x1050) for the in-kernel Linux driver.
+	 * non-transitional.
 	 */
-	pci_set_cfgdata16(pi, PCIR_DEVICE,
-	    sc->vsc_mvisor ? VTGPU_DEV_VGPU : VIRTIO_DEV_GPU);
+	pci_set_cfgdata16(pi, PCIR_DEVICE, VIRTIO_DEV_GPU);
 	pci_set_cfgdata16(pi, PCIR_VENDOR, VIRTIO_VENDOR);
 	pci_set_cfgdata8(pi, PCIR_REVID, 1);
 	pci_set_cfgdata8(pi, PCIR_CLASS, PCIC_DISPLAY);
 	pci_set_cfgdata8(pi, PCIR_SUBCLASS, PCIS_DISPLAY_OTHER);
-	pci_set_cfgdata16(pi, PCIR_SUBDEV_0,
-	    sc->vsc_mvisor ? (VTGPU_DEV_VGPU - 0x1040) : VIRTIO_ID_GPU);
+	pci_set_cfgdata16(pi, PCIR_SUBDEV_0, VIRTIO_ID_GPU);
 	pci_set_cfgdata16(pi, PCIR_SUBVEND_0, VIRTIO_VENDOR);
 
 	/*
