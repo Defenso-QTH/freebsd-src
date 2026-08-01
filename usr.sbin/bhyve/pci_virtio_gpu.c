@@ -95,7 +95,15 @@ struct virgl_box {
 #define	VTGPU_DEFAULT_HEIGHT	1080
 
 /* Max iov entries we copy for an ATTACH_BACKING command. */
-#define	VTGPU_MAX_BACKING	256
+/*
+ * Upper bound on mem entries accepted in one ATTACH_BACKING / CREATE_BLOB.
+ * The real limit is how many entries the received command buffer actually
+ * holds (checked per-command); this is only a sanity ceiling so a bogus
+ * nr_entries cannot make us allocate absurdly.  It must be generous: a
+ * 1280x720 BGRA surface is 900 pages, and a scattered 4K one is ~2000, so
+ * the old value of 256 silently rejected ordinary compositor buffers.
+ */
+#define	VTGPU_MAX_BACKING	65536
 
 /*
  * virtio-gpu is a modern-only device: its Linux driver refuses any device
@@ -601,7 +609,7 @@ vtgpu_cmd_resource_attach_backing(struct vtgpu_softc *sc,
     struct vqueue_info *vq, const struct virtio_gpu_ctrl_hdr *hdr,
     uint16_t chain_idx,
     const struct virtio_gpu_resource_attach_backing *cmd,
-    const struct virtio_gpu_mem_entry *entries,
+    const struct virtio_gpu_mem_entry *entries, uint32_t max_entries,
     struct iovec *wiov, int nwiov)
 {
 	uint32_t n = cmd->nr_entries;
@@ -621,7 +629,18 @@ vtgpu_cmd_resource_attach_backing(struct vtgpu_softc *sc,
 	if (sc->vsc_mvisor)
 		n = 1;
 
-	if (n > VTGPU_MAX_BACKING) {
+	/*
+	 * Validate nr_entries against what the command buffer actually
+	 * contains before indexing entries[]; the guest controls the count.
+	 * Rejections are logged unconditionally: silently dropping the
+	 * backing leaves the resource dataless and every later use fails with
+	 * virglrenderer "illegal resource", which is very hard to trace back
+	 * to here.
+	 */
+	if ((!sc->vsc_mvisor && n > max_entries) || n > VTGPU_MAX_BACKING) {
+		EPRINTLN("vtgpu: attach_backing id=%u REJECTED nr_entries=%u "
+		    "(buffer holds %u, ceiling %u)", cmd->resource_id, n,
+		    max_entries, VTGPU_MAX_BACKING);
 		vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 		    VIRTIO_GPU_RESP_ERR_UNSPEC, wiov, nwiov);
 		return;
@@ -678,7 +697,7 @@ static void
 vtgpu_cmd_resource_create_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
     const struct virtio_gpu_ctrl_hdr *hdr, uint16_t chain_idx,
     const struct virtio_gpu_resource_create_blob *cmd,
-    const struct virtio_gpu_mem_entry *entries,
+    const struct virtio_gpu_mem_entry *entries, uint32_t max_entries,
     struct iovec *wiov, int nwiov)
 {
 	struct virgl_renderer_resource_create_blob_args args;
@@ -687,7 +706,10 @@ vtgpu_cmd_resource_create_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	uint32_t i;
 	int ret;
 
-	if (n > VTGPU_MAX_BACKING) {
+	if (n > max_entries || n > VTGPU_MAX_BACKING) {
+		EPRINTLN("vtgpu: create_blob id=%u REJECTED nr_entries=%u "
+		    "(buffer holds %u, ceiling %u)", cmd->resource_id, n,
+		    max_entries, VTGPU_MAX_BACKING);
 		vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 		    VIRTIO_GPU_RESP_ERR_UNSPEC, wiov, nwiov);
 		return;
@@ -1214,8 +1236,10 @@ vtgpu_process_controlq(struct vtgpu_softc *sc, int qidx)
 			    (const void *)hdr;
 			const struct virtio_gpu_mem_entry *ents =
 			    (const void *)(ab + 1);
+			uint32_t maxe = cmdlen > sizeof(*ab) ?
+			    (cmdlen - sizeof(*ab)) / sizeof(*ents) : 0;
 			vtgpu_cmd_resource_attach_backing(sc, vq, hdr, req.idx,
-			    ab, ents, wiov, nwiov);
+			    ab, ents, maxe, wiov, nwiov);
 			break;
 		}
 
@@ -1230,8 +1254,10 @@ vtgpu_process_controlq(struct vtgpu_softc *sc, int qidx)
 			    (const void *)hdr;
 			const struct virtio_gpu_mem_entry *ents =
 			    (const void *)(cb + 1);
+			uint32_t maxe = cmdlen > sizeof(*cb) ?
+			    (cmdlen - sizeof(*cb)) / sizeof(*ents) : 0;
 			vtgpu_cmd_resource_create_blob(sc, vq, hdr, req.idx,
-			    cb, ents, wiov, nwiov);
+			    cb, ents, maxe, wiov, nwiov);
 			break;
 		}
 
@@ -1942,13 +1968,27 @@ vtgpu_virgl_init(struct vtgpu_softc *sc)
 	 */
 	flags = VIRGL_RENDERER_USE_EGL;
 	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0) {
-		DPRINTF("virgl init ok (flags=0x%x venus=0x%x)",
+		/*
+		 * Unconditional: this fires once per VM start, costs nothing,
+		 * and is the first thing wanted when the guest shows no
+		 * acceleration.  Hiding it behind debug=on (which must stay
+		 * off for performance) leaves no way to tell whether virgl
+		 * came up at all.
+		 */
+		EPRINTLN("vtgpu: virgl init ok (flags=0x%x venus=0x%x)",
 		    flags, venus);
 		return (0);
 	}
 	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLES;
 	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0) {
-		DPRINTF("virgl init ok (flags=0x%x venus=0x%x)",
+		/*
+		 * Unconditional: this fires once per VM start, costs nothing,
+		 * and is the first thing wanted when the guest shows no
+		 * acceleration.  Hiding it behind debug=on (which must stay
+		 * off for performance) leaves no way to tell whether virgl
+		 * came up at all.
+		 */
+		EPRINTLN("vtgpu: virgl init ok (flags=0x%x venus=0x%x)",
 		    flags, venus);
 		return (0);
 	}
@@ -1956,14 +1996,28 @@ vtgpu_virgl_init(struct vtgpu_softc *sc)
 	/* Headless via surfaceless EGL (no window system, no render-node fd). */
 	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_SURFACELESS;
 	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0) {
-		DPRINTF("virgl init ok (flags=0x%x venus=0x%x)",
+		/*
+		 * Unconditional: this fires once per VM start, costs nothing,
+		 * and is the first thing wanted when the guest shows no
+		 * acceleration.  Hiding it behind debug=on (which must stay
+		 * off for performance) leaves no way to tell whether virgl
+		 * came up at all.
+		 */
+		EPRINTLN("vtgpu: virgl init ok (flags=0x%x venus=0x%x)",
 		    flags, venus);
 		return (0);
 	}
 	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLES |
 	    VIRGL_RENDERER_USE_SURFACELESS;
 	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0) {
-		DPRINTF("virgl init ok (flags=0x%x venus=0x%x)",
+		/*
+		 * Unconditional: this fires once per VM start, costs nothing,
+		 * and is the first thing wanted when the guest shows no
+		 * acceleration.  Hiding it behind debug=on (which must stay
+		 * off for performance) leaves no way to tell whether virgl
+		 * came up at all.
+		 */
+		EPRINTLN("vtgpu: virgl init ok (flags=0x%x venus=0x%x)",
 		    flags, venus);
 		return (0);
 	}
@@ -1973,24 +2027,47 @@ vtgpu_virgl_init(struct vtgpu_softc *sc)
 		vtgpu_probe_wayland();
 	flags = VIRGL_RENDERER_USE_EGL;
 	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0) {
-		DPRINTF("virgl init ok (flags=0x%x venus=0x%x)",
+		/*
+		 * Unconditional: this fires once per VM start, costs nothing,
+		 * and is the first thing wanted when the guest shows no
+		 * acceleration.  Hiding it behind debug=on (which must stay
+		 * off for performance) leaves no way to tell whether virgl
+		 * came up at all.
+		 */
+		EPRINTLN("vtgpu: virgl init ok (flags=0x%x venus=0x%x)",
 		    flags, venus);
 		return (0);
 	}
 	flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLES;
 	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0) {
-		DPRINTF("virgl init ok (flags=0x%x venus=0x%x)",
+		/*
+		 * Unconditional: this fires once per VM start, costs nothing,
+		 * and is the first thing wanted when the guest shows no
+		 * acceleration.  Hiding it behind debug=on (which must stay
+		 * off for performance) leaves no way to tell whether virgl
+		 * came up at all.
+		 */
+		EPRINTLN("vtgpu: virgl init ok (flags=0x%x venus=0x%x)",
 		    flags, venus);
 		return (0);
 	}
 
 	flags = VIRGL_RENDERER_USE_GLX;
 	if (virgl_renderer_init(sc, flags | venus, &vtgpu_virgl_cbs) == 0) {
-		DPRINTF("virgl init ok (flags=0x%x venus=0x%x)",
+		/*
+		 * Unconditional: this fires once per VM start, costs nothing,
+		 * and is the first thing wanted when the guest shows no
+		 * acceleration.  Hiding it behind debug=on (which must stay
+		 * off for performance) leaves no way to tell whether virgl
+		 * came up at all.
+		 */
+		EPRINTLN("vtgpu: virgl init ok (flags=0x%x venus=0x%x)",
 		    flags, venus);
 		return (0);
 	}
 
+	EPRINTLN("vtgpu: virgl init FAILED - every backend rejected "
+	    "(no GL/EGL?  check the render node and virglrenderer)");
 	return (1);
 }
 
