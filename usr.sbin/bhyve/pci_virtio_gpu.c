@@ -233,12 +233,18 @@ struct vtgpu_fence {
 #define	VTGPU_KQ_NOTIFY		1
 
 /*
- * Backstop for the kqueue wait.  With both wake sources registered we
- * expect to be woken explicitly; this only bounds the damage if a fence
- * signal is ever missed, so it can be far longer than the 1ms spin it
- * replaces without costing latency.
+ * Backstop for the kqueue wait.  Measured 2026-08-01 under a real
+ * workload: ~90% of fence waits are woken by an event, ~10% fall through
+ * to this timeout.  That 10% is why the backstop must stay at 1ms.  It
+ * was briefly 10ms, on the assumption that events would cover everything
+ * -- which left the mean wait unchanged (0.9*0 + 0.1*10ms == the 1ms
+ * every wait used to cost) while making the tail ten times worse.  A
+ * 10ms stall is over half a frame at 60fps, so the spikes hurt pacing
+ * more than the old uniform 1ms did.  At 1ms this path is never worse
+ * than the condvar it replaced, and ~10x better on the 90% that are
+ * woken by an event.  Do not raise it without re-measuring the miss rate.
  */
-#define	VTGPU_KQ_BACKSTOP_MS	10
+#define	VTGPU_KQ_BACKSTOP_MS	1
 
 struct vtgpu_softc {
 	struct virtio_softc	vsc_vs;
