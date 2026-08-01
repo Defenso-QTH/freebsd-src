@@ -37,6 +37,7 @@
  */
 
 #include <sys/param.h>
+#include <sys/event.h>
 #include <sys/linker_set.h>
 #include <sys/queue.h>
 #include <sys/uio.h>
@@ -47,6 +48,7 @@
 #include <pthread.h>
 #include <pthread_np.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -227,6 +229,17 @@ struct vtgpu_fence {
 	TAILQ_ENTRY(vtgpu_fence) vf_link;
 };
 
+/* kqueue ident for the queue-kick user event. */
+#define	VTGPU_KQ_NOTIFY		1
+
+/*
+ * Backstop for the kqueue wait.  With both wake sources registered we
+ * expect to be woken explicitly; this only bounds the damage if a fence
+ * signal is ever missed, so it can be far longer than the 1ms spin it
+ * replaces without costing latency.
+ */
+#define	VTGPU_KQ_BACKSTOP_MS	10
+
 struct vtgpu_softc {
 	struct virtio_softc	vsc_vs;
 	struct virtio_gpu_config vsc_cfg;
@@ -261,6 +274,19 @@ struct vtgpu_softc {
 	 * context that needs no Wayland/X display.  -1 if none was opened.
 	 */
 	int			vsc_drm_fd;
+	/*
+	 * Event-driven wake-up.  vsc_kq multiplexes the two independent
+	 * sources that can make the worker runnable: virglrenderer fence
+	 * progress (EVFILT_READ on vsc_poll_fd) and a guest queue kick
+	 * (EVFILT_USER, triggered by vtgpu_qnotify).  Both are needed: a
+	 * fence-blocked guest never rings a queue, and a queue kick can
+	 * arrive with no fence outstanding.  Either being < 0 means the
+	 * kqueue path is unavailable and we fall back to the condvar.
+	 */
+	int			vsc_kq;
+	int			vsc_poll_fd;
+	uint64_t		vsc_fwait;	/* fence waits entered */
+	uint64_t		vsc_fwait_late;	/* ... that hit the backstop */
 
 	/*
 	 * Host-visible memory window (venus).  vsc_hostvis_base is the bhyve
@@ -1299,6 +1325,50 @@ vtgpu_process_cursorq(struct vtgpu_softc *sc)
 
 static int vtgpu_virgl_init(struct vtgpu_softc *sc);
 
+/*
+ * Build the kqueue the worker waits on.  Any failure here is non-fatal:
+ * vsc_kq stays -1 and the worker uses the condvar path, which is correct
+ * but wakes on a fixed timeout while fences are outstanding.  Notably
+ * this is the expected outcome if Capsicum denies CAP_EVENT on
+ * virglrenderer's fd, so it must degrade rather than abort.
+ */
+static void
+vtgpu_kq_setup(struct vtgpu_softc *sc)
+{
+	struct kevent kev[2];
+	int n = 0;
+
+	sc->vsc_poll_fd = virgl_renderer_get_poll_fd();
+	sc->vsc_kq = kqueue();
+	if (sc->vsc_kq < 0) {
+		EPRINTLN("vtgpu: kqueue() failed (%s), using timed wait",
+		    strerror(errno));
+		return;
+	}
+
+	/*
+	 * EV_CLEAR on both: the user event must re-arm per trigger rather
+	 * than stay permanently ready, and the fence fd must not spin us if
+	 * virgl_renderer_poll() leaves it readable.
+	 */
+	EV_SET(&kev[n++], VTGPU_KQ_NOTIFY, EVFILT_USER, EV_ADD | EV_CLEAR,
+	    0, 0, NULL);
+	if (sc->vsc_poll_fd >= 0)
+		EV_SET(&kev[n++], sc->vsc_poll_fd, EVFILT_READ,
+		    EV_ADD | EV_CLEAR, 0, 0, NULL);
+
+	if (kevent(sc->vsc_kq, kev, n, NULL, 0, NULL) < 0) {
+		EPRINTLN("vtgpu: kevent register failed (%s), using timed wait",
+		    strerror(errno));
+		close(sc->vsc_kq);
+		sc->vsc_kq = -1;
+		return;
+	}
+	EPRINTLN("vtgpu: event-driven wait active (fence fd=%d%s)",
+	    sc->vsc_poll_fd,
+	    sc->vsc_poll_fd < 0 ? ", queue kicks only" : "");
+}
+
 static void *
 vtgpu_worker(void *arg)
 {
@@ -1320,6 +1390,7 @@ vtgpu_worker(void *arg)
 		pthread_mutex_unlock(&sc->vsc_mtx);
 		return (NULL);
 	}
+	vtgpu_kq_setup(sc);
 
 	while (sc->vsc_running) {
 		while (sc->vsc_running &&
@@ -1328,26 +1399,64 @@ vtgpu_worker(void *arg)
 			if (!TAILQ_EMPTY(&sc->vsc_fences)) {
 				/*
 				 * Fenced commands are awaiting GPU completion.
-				 * The guest may be blocked waiting for one of
-				 * those fences and will not ring a queue again,
-				 * so we must not sleep indefinitely: poll
-				 * virglrenderer for fence progress on a short
-				 * timeout until the fence list drains
-				 * (write_fence releases each chain as its fence
-				 * fires).  Without this the guest hangs forever
-				 * on the first fenced submit/transfer.
+				 * The guest may be blocked on one of those
+				 * fences and will not ring a queue again, so we
+				 * must not sleep indefinitely: wait for fence
+				 * progress until the list drains (write_fence
+				 * releases each chain as its fence fires).
+				 * Without this the guest hangs forever on the
+				 * first fenced submit/transfer.
 				 */
-				struct timespec ts;
+				sc->vsc_fwait++;
+				if (sc->vsc_kq >= 0) {
+					struct kevent ev[2];
+					struct timespec ts = {
+						.tv_sec = 0,
+						.tv_nsec =
+						    VTGPU_KQ_BACKSTOP_MS *
+						    1000000L
+					};
+					int nev;
 
-				clock_gettime(CLOCK_REALTIME, &ts);
-				ts.tv_nsec += 1000000;		/* 1 ms */
-				if (ts.tv_nsec >= 1000000000L) {
-					ts.tv_sec++;
-					ts.tv_nsec -= 1000000000L;
+					/*
+					 * kevent() blocks, so the mutex must be
+					 * dropped around it.  A queue kick in
+					 * that window is not lost: the user
+					 * event stays pending and returns
+					 * immediately below.
+					 */
+					pthread_mutex_unlock(&sc->vsc_mtx);
+					nev = kevent(sc->vsc_kq, NULL, 0, ev,
+					    nitems(ev), &ts);
+					pthread_mutex_lock(&sc->vsc_mtx);
+					if (nev == 0)
+						sc->vsc_fwait_late++;
+				} else {
+					struct timespec ts;
+
+					clock_gettime(CLOCK_REALTIME, &ts);
+					ts.tv_nsec += 1000000;	/* 1 ms */
+					if (ts.tv_nsec >= 1000000000L) {
+						ts.tv_sec++;
+						ts.tv_nsec -= 1000000000L;
+					}
+					pthread_cond_timedwait(&sc->vsc_cnd,
+					    &sc->vsc_mtx, &ts);
+					sc->vsc_fwait_late++;
 				}
-				pthread_cond_timedwait(&sc->vsc_cnd,
-				    &sc->vsc_mtx, &ts);
 				virgl_renderer_poll();
+
+				/*
+				 * Periodic, and rare enough to be free: tells
+				 * us whether this path is hot at all and how
+				 * often we fall through to the backstop rather
+				 * than being woken by an event.
+				 */
+				if ((sc->vsc_fwait & 0xffff) == 0)
+					EPRINTLN("vtgpu: fence waits=%ju "
+					    "backstop=%ju", (uintmax_t)
+					    sc->vsc_fwait, (uintmax_t)
+					    sc->vsc_fwait_late);
 			} else {
 				pthread_cond_wait(&sc->vsc_cnd, &sc->vsc_mtx);
 			}
@@ -1372,6 +1481,21 @@ vtgpu_qnotify(void *arg, struct vqueue_info *vq __unused)
 {
 	struct vtgpu_softc *sc = arg;
 
+	/*
+	 * Trigger before signalling: an EVFILT_USER trigger is sticky, so
+	 * one racing with the worker's descriptor check is still pending
+	 * when it calls kevent() and wakes it immediately.  A condvar
+	 * signal delivered with no waiter is simply lost, which is why the
+	 * kqueue path -- not a bare poll() on the fence fd -- is what makes
+	 * an event-driven wait correct here.
+	 */
+	if (sc->vsc_kq >= 0) {
+		struct kevent kev;
+
+		EV_SET(&kev, VTGPU_KQ_NOTIFY, EVFILT_USER, 0, NOTE_TRIGGER,
+		    0, NULL);
+		(void)kevent(sc->vsc_kq, &kev, 1, NULL, 0, NULL);
+	}
 	pthread_mutex_lock(&sc->vsc_mtx);
 	pthread_cond_signal(&sc->vsc_cnd);
 	pthread_mutex_unlock(&sc->vsc_mtx);
@@ -1957,6 +2081,8 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 	sc->vsc_width  = VTGPU_DEFAULT_WIDTH;
 	sc->vsc_height = VTGPU_DEFAULT_HEIGHT;
 	sc->vsc_drm_fd = -1;
+	sc->vsc_kq = -1;
+	sc->vsc_poll_fd = -1;
 	TAILQ_INIT(&sc->vsc_fences);
 
 	render_node     = NULL;
