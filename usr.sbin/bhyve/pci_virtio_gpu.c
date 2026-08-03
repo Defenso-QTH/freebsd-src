@@ -630,10 +630,42 @@ vtgpu_cmd_set_scanout(struct vtgpu_softc *sc, struct vqueue_info *vq,
 				sc->vsc_scanout_bufsz =
 				    sc->vsc_scanout_buf ? need : 0;
 			}
+			struct virgl_renderer_resource_info_ext info;
+			int iret;
+
 			EPRINTLN("vtgpu: scanout %u bound to res=%u %ux%u "
 			    "(%zu KiB readback)", cmd->scanout_id,
 			    cmd->resource_id, cmd->r.width, cmd->r.height,
 			    need / 1024);
+
+			/*
+			 * Can this resource be handed to the host compositor
+			 * as a dma_buf instead of being read back?  If so the
+			 * readback above is a cost a zero-copy present would
+			 * never pay, and the timing below is measuring the
+			 * wrong design.  FreeBSD RADV has historically had no
+			 * dma_buf export -- it returns OPAQUE fds -- so ask
+			 * rather than assume.
+			 */
+			memset(&info, 0, sizeof(info));
+			info.version = VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION;
+			iret = virgl_renderer_resource_get_info_ext(
+			    (int)cmd->resource_id, &info);
+			if (iret != 0) {
+				EPRINTLN("vtgpu: scanout res=%u get_info_ext "
+				    "failed ret=%d", cmd->resource_id, iret);
+			} else {
+				EPRINTLN("vtgpu: scanout res=%u dmabuf_export=%s "
+				    "fourcc=0x%08x stride=%u planes=%d "
+				    "modifier=0x%016jx fmt=%u %ux%u",
+				    cmd->resource_id,
+				    info.has_dmabuf_export ? "YES" : "no",
+				    (unsigned)info.base.drm_fourcc,
+				    info.base.stride, info.planes,
+				    (uintmax_t)info.modifiers,
+				    info.base.virgl_format,
+				    info.base.width, info.base.height);
+			}
 		}
 	}
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
