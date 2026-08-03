@@ -1084,7 +1084,7 @@ pci_emul_add_boot_device(struct pci_devinst *pi, int bootindex)
 }
 
 #define	CAP_START_OFFSET	0x40
-static int
+int
 pci_emul_add_capability(struct pci_devinst *pi, u_char *capdata, int caplen)
 {
 	int i, capoff, reallen;
