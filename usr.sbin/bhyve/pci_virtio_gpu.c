@@ -171,7 +171,25 @@ struct virgl_box {
  * guest kernel reports "+host_visible" and the venus ICD will attach.
  */
 #define	VTGPU_HOSTVIS_BAR	2		/* MEM64 -> consumes BARs 2 and 3 */
-#define	VTGPU_HOSTVIS_SZ	(256ULL << 20)	/* 256 MiB */
+/*
+ * Size of the host-visible window, and therefore the size of the only
+ * heap the guest can allocate mappable Vulkan memory from -- the guest
+ * driver reads it off the BAR and refuses anything larger itself, which
+ * is why exhausting it produces no host-side error at all.
+ *
+ * 256 MiB was chosen when vkcube was the only workload.  A real game
+ * blows through it: CK3 asks for a 162 MiB texture alongside 67 and 84
+ * MiB blobs, which cannot coexist in 256 MiB, and DXVK reports the
+ * refusal as a failed CreateTexture2D.
+ *
+ * Enlarging it is close to free.  The BAR is backed by a devmem segment,
+ * which vm_alloc_memseg() creates as an OBJT_SWAP object, so pages are
+ * committed on first touch rather than up front -- and blob mappings
+ * alias real host memory over the range anyway, so most of it is never
+ * touched.  The cost is guest address space, and bhyve's 64-bit MMIO
+ * window is 32 GB (PCI_EMUL_MEMSIZE64).
+ */
+#define	VTGPU_HOSTVIS_SZ	(4ULL << 30)	/* 4 GiB */
 
 /*
  * Modern config BAR (BAR 4, MEM64) layout.  One 4 KiB page per structure
@@ -291,6 +309,8 @@ struct vtgpu_softc {
 	 */
 	int			vsc_kq;
 	int			vsc_poll_fd;
+	uint64_t		vsc_blob_hv;	/* host-visible blobs created */
+	uint64_t		vsc_unref;	/* RESOURCE_UNREF commands seen */
 	uint64_t		vsc_fwait;	/* fence waits entered */
 	uint64_t		vsc_fwait_late;	/* ... that hit the backstop */
 
@@ -552,6 +572,7 @@ vtgpu_cmd_resource_unref(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	 * Releasing the tracking slot also matters on its own: without it the
 	 * fixed-size table fills up and every later map_blob fails.
 	 */
+	sc->vsc_unref++;
 	bm = vtgpu_blob_map_find(sc, cmd->resource_id);
 	if (bm != NULL) {
 		EPRINTLN("vtgpu: unref res=%u releasing blob map gpa=0x%lx "
@@ -771,11 +792,24 @@ vtgpu_cmd_resource_create_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	 * one that actually broke, and the success path is otherwise visible
 	 * only under debug=on, which costs 53% and changes the timing.
 	 */
-	if (ret == 0 && cmd->blob_mem == 2)
+	if (ret == 0 && cmd->blob_mem == 2) {
 		EPRINTLN("vtgpu: create_blob id=%u OK blob_id=%lu size=%lu "
 		    "flags=0x%x ctx=%u", cmd->resource_id,
 		    (unsigned long)cmd->blob_id, (unsigned long)cmd->size,
 		    cmd->blob_flags, hdr->ctx_id);
+		/*
+		 * Whether these are ever reclaimed cannot be read off the
+		 * unref lines above: those only fire for a blob that still
+		 * had a mapping, so one unmapped first, or never mapped at
+		 * all, is released silently.  Report the totals instead --
+		 * if unref stays near zero while created climbs, resources
+		 * really are accumulating.
+		 */
+		if ((++sc->vsc_blob_hv & 0x3f) == 0)
+			EPRINTLN("vtgpu: host-visible blobs created=%ju "
+			    "unref-cmds=%ju", (uintmax_t)sc->vsc_blob_hv,
+			    (uintmax_t)sc->vsc_unref);
+	}
 	/*
 	 * Attaching here is a leftover from the removed mvisor mode, whose
 	 * guest driver never sent CTX_ATTACH_RESOURCE.  It is harmless -- for
