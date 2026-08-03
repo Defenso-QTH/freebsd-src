@@ -291,6 +291,8 @@ struct vtgpu_softc {
 	 */
 	int			vsc_kq;
 	int			vsc_poll_fd;
+	uint64_t		vsc_blob_hv;	/* host-visible blobs created */
+	uint64_t		vsc_unref;	/* RESOURCE_UNREF commands seen */
 	uint64_t		vsc_fwait;	/* fence waits entered */
 	uint64_t		vsc_fwait_late;	/* ... that hit the backstop */
 
@@ -552,6 +554,7 @@ vtgpu_cmd_resource_unref(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	 * Releasing the tracking slot also matters on its own: without it the
 	 * fixed-size table fills up and every later map_blob fails.
 	 */
+	sc->vsc_unref++;
 	bm = vtgpu_blob_map_find(sc, cmd->resource_id);
 	if (bm != NULL) {
 		EPRINTLN("vtgpu: unref res=%u releasing blob map gpa=0x%lx "
@@ -771,11 +774,24 @@ vtgpu_cmd_resource_create_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	 * one that actually broke, and the success path is otherwise visible
 	 * only under debug=on, which costs 53% and changes the timing.
 	 */
-	if (ret == 0 && cmd->blob_mem == 2)
+	if (ret == 0 && cmd->blob_mem == 2) {
 		EPRINTLN("vtgpu: create_blob id=%u OK blob_id=%lu size=%lu "
 		    "flags=0x%x ctx=%u", cmd->resource_id,
 		    (unsigned long)cmd->blob_id, (unsigned long)cmd->size,
 		    cmd->blob_flags, hdr->ctx_id);
+		/*
+		 * Whether these are ever reclaimed cannot be read off the
+		 * unref lines above: those only fire for a blob that still
+		 * had a mapping, so one unmapped first, or never mapped at
+		 * all, is released silently.  Report the totals instead --
+		 * if unref stays near zero while created climbs, resources
+		 * really are accumulating.
+		 */
+		if ((++sc->vsc_blob_hv & 0x3f) == 0)
+			EPRINTLN("vtgpu: host-visible blobs created=%ju "
+			    "unref-cmds=%ju", (uintmax_t)sc->vsc_blob_hv,
+			    (uintmax_t)sc->vsc_unref);
+	}
 	/*
 	 * Attaching here is a leftover from the removed mvisor mode, whose
 	 * guest driver never sent CTX_ATTACH_RESOURCE.  It is harmless -- for
