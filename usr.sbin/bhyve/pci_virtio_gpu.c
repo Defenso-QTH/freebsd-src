@@ -72,6 +72,7 @@ struct virgl_box {
 #include "config.h"
 #include "debug.h"
 #include "pci_emul.h"
+#include "gpu_display.h"
 #include "virtio.h"
 
 /* Import the protocol structs from the kernel tree. */
@@ -170,6 +171,10 @@ struct virgl_box {
  * virtio SHARED_MEMORY cap with shmid VIRTIO_GPU_SHM_ID_HOST_VISIBLE so the
  * guest kernel reports "+host_visible" and the venus ICD will attach.
  */
+/* virgl_hw.h resource bind bits we care about here. */
+#define	VTGPU_BIND_SCANOUT	(1u << 18)
+#define	VTGPU_BIND_LINEAR	(1u << 22)
+
 #define	VTGPU_HOSTVIS_BAR	2		/* MEM64 -> consumes BARs 2 and 3 */
 /*
  * Size of the host-visible window, and therefore the size of the only
@@ -309,6 +314,40 @@ struct vtgpu_softc {
 	 */
 	int			vsc_kq;
 	int			vsc_poll_fd;
+	/*
+	 * Scanout readback probe (scanout_probe=on).  Measures what it would
+	 * cost to present the guest's scanout from the host: on RESOURCE_FLUSH
+	 * of the scanout resource, read it back with transfer_read_iov into a
+	 * host buffer and time it.  Nothing is displayed -- this only answers
+	 * whether a host-side present is affordable before anything is built
+	 * on top of it.
+	 */
+	/*
+	 * External viewer (display=unix:/path).  NULL when unconfigured, which
+	 * is the default: the device then behaves exactly as before.
+	 */
+	struct gpu_display	*vsc_display;
+	bool			vsc_scanout_probe;
+	bool			vsc_scanout_linear;
+	/*
+	 * Scanout resource ids already reported.  A page-flipping compositor
+	 * rebinds the scanout every frame -- sway alternates two buffers -- so
+	 * without this the probe would query virglrenderer and write two log
+	 * lines sixty times a second, on the worker thread, in the guest's
+	 * command path.  Each distinct buffer is worth describing once.
+	 */
+	uint32_t		vsc_seen_scanout[8];
+	unsigned		vsc_seen_n;
+	uint32_t		vsc_scanout_res;	/* 0 = none bound */
+	uint32_t		vsc_scanout_w;
+	uint32_t		vsc_scanout_h;
+	void			*vsc_scanout_buf;
+	size_t			vsc_scanout_bufsz;
+	uint64_t		vsc_ro_n;		/* readbacks timed */
+	uint64_t		vsc_ro_ns;		/* cumulative ns */
+	uint64_t		vsc_ro_min;
+	uint64_t		vsc_ro_max;
+	uint64_t		vsc_ro_fail;
 	uint64_t		vsc_blob_hv;	/* host-visible blobs created */
 	uint64_t		vsc_unref;	/* RESOURCE_UNREF commands seen */
 	uint64_t		vsc_fwait;	/* fence waits entered */
@@ -523,11 +562,29 @@ vtgpu_cmd_resource_create_3d(struct vtgpu_softc *sc, struct vqueue_info *vq,
     const struct virtio_gpu_resource_create_3d *cmd,
     struct iovec *wiov, int nwiov)
 {
+	uint32_t bind = cmd->bind;
+
+	/*
+	 * A resource the guest will scan out is one we may have to hand to a
+	 * host compositor as a dma_buf, and the host allocates render targets
+	 * compressed: on RDNA3 that means DCC, whose parameters live in a
+	 * format modifier virglrenderer does not report -- it returns
+	 * DRM_FORMAT_MOD_INVALID whatever the guest does.  An importer that
+	 * cannot know the layout reads the compressed blocks as pixels, which
+	 * is exactly the periodic corruption observed.
+	 *
+	 * Asking for it linear costs some render bandwidth and removes the
+	 * guesswork entirely.  Only worth doing when a viewer is attached, so
+	 * it is opt-in.
+	 */
+	if (sc->vsc_scanout_linear && (bind & VTGPU_BIND_SCANOUT) != 0)
+		bind |= VTGPU_BIND_LINEAR;
+
 	struct virgl_renderer_resource_create_args args = {
 		.handle         = cmd->resource_id,
 		.target         = cmd->target,
 		.format         = cmd->format,
-		.bind           = cmd->bind,
+		.bind           = bind,
 		.width          = cmd->width,
 		.height         = cmd->height,
 		.depth          = cmd->depth,
@@ -537,6 +594,15 @@ vtgpu_cmd_resource_create_3d(struct vtgpu_softc *sc, struct vqueue_info *vq,
 		.flags          = cmd->flags,
 	};
 	int ret = virgl_renderer_resource_create(&args, NULL, 0);
+	/*
+	 * Scanout-capable resources are rare -- a couple per mode set -- so
+	 * report them unconditionally: whether the guest asks for SCANOUT at
+	 * all decides whether forcing linear can work.
+	 */
+	if ((cmd->bind & VTGPU_BIND_SCANOUT) != 0)
+		EPRINTLN("vtgpu: create_3d id=%u SCANOUT bind=0x%x->0x%x "
+		    "fmt=%u %ux%u ret=%d", cmd->resource_id, cmd->bind, bind,
+		    cmd->format, cmd->width, cmd->height, ret);
 	DPRINTF("create_3d id=%u tgt=%u fmt=%u bind=0x%x %ux%ux%u "
 	    "array=%u levels=%u samples=%u ctx=%u ret=%d",
 	    cmd->resource_id, cmd->target, cmd->format, cmd->bind,
@@ -587,12 +653,154 @@ vtgpu_cmd_resource_unref(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
 }
 
+/*
+ * Hand the scanout buffer to an external viewer, if one is configured and the
+ * resource can be exported.  Zero-copy: the viewer imports the dma_buf into
+ * the host compositor, so the pixels are never read back, encoded or copied.
+ *
+ * When the resource cannot be exported -- FreeBSD RADV has historically
+ * handed back OPAQUE fds rather than dma_bufs -- nothing is published and the
+ * viewer simply sees no scanout.  The shm fallback (read back into a shared
+ * segment and publish that instead) is deliberately not written yet: whether
+ * it is needed depends on what has_dmabuf_export actually reports on this
+ * hardware, and writing it before knowing would be guessing.
+ */
+static void
+vtgpu_scanout_publish(struct vtgpu_softc *sc,
+    const struct virtio_gpu_set_scanout *cmd,
+    const struct virgl_renderer_resource_info_ext *info)
+{
+	struct gpu_display_scanout so;
+	int dfd = -1, stride = 0, offset = 0;
+
+	if (sc->vsc_display == NULL)
+		return;
+
+	/*
+	 * A DRM compositor page-flips: sway alternates between two resources,
+	 * rebinding the scanout every frame.  Export each buffer once and
+	 * thereafter just say which one is on screen -- re-exporting would
+	 * hand over a fresh dma_buf fd sixty times a second to describe
+	 * memory the viewer already has.
+	 */
+	if (gpu_display_have_buffer(sc->vsc_display, cmd->resource_id)) {
+		gpu_display_frame(sc->vsc_display, cmd->resource_id, cmd->r.x,
+		    cmd->r.y, cmd->r.width, cmd->r.height);
+		return;
+	}
+
+	if (!info->has_dmabuf_export)
+		return;
+
+	if (virgl_renderer_get_fd_for_texture2(info->base.tex_id, &dfd,
+	    &stride, &offset) != 0 || dfd < 0) {
+		EPRINTLN("vtgpu: scanout res=%u dmabuf export failed despite "
+		    "has_dmabuf_export", cmd->resource_id);
+		return;
+	}
+
+	memset(&so, 0, sizeof(so));
+	so.buffer_id = cmd->resource_id;
+	so.transport = GPU_DISPLAY_XPORT_DMABUF;
+	so.width = cmd->r.width;
+	so.height = cmd->r.height;
+	so.stride = stride != 0 ? (uint32_t)stride : info->base.stride;
+	so.drm_fourcc = (uint32_t)info->base.drm_fourcc;
+	so.planes = (uint32_t)info->planes;
+	/*
+	 * The texture need not start at byte 0 of the dma_buf; dropping this
+	 * makes every row read from the wrong place.
+	 */
+	so.offset = (uint32_t)offset;
+	so.modifier = info->modifiers;
+	EPRINTLN("vtgpu: scanout res=%u published fourcc=0x%08x stride=%u "
+	    "offset=%d planes=%d modifier=0x%016jx", cmd->resource_id,
+	    so.drm_fourcc, so.stride, offset, info->planes,
+	    (uintmax_t)info->modifiers);
+	gpu_display_scanout(sc->vsc_display, &so, dfd);	/* consumes dfd */
+	gpu_display_frame(sc->vsc_display, cmd->resource_id, cmd->r.x,
+	    cmd->r.y, cmd->r.width, cmd->r.height);
+}
+
 static void
 vtgpu_cmd_set_scanout(struct vtgpu_softc *sc, struct vqueue_info *vq,
     const struct virtio_gpu_ctrl_hdr *hdr, uint16_t chain_idx,
-    struct iovec *wiov, int nwiov)
+    const struct virtio_gpu_set_scanout *cmd, struct iovec *wiov, int nwiov)
 {
-	/* Headless: accept the scanout binding but don't present anywhere. */
+	/*
+	 * Record what the guest bound so the rest of the device knows which
+	 * resource is the display and how big it is.  Needed whenever a viewer
+	 * is attached or the readback probe is running; resource_id 0 unbinds.
+	 *
+	 * A page-flipping compositor comes through here every frame, so the
+	 * expensive part -- the virglrenderer query, the log line, sizing the
+	 * readback buffer -- is done once per distinct buffer, not per flip.
+	 */
+	if ((sc->vsc_scanout_probe || sc->vsc_display != NULL) && cmd != NULL) {
+		bool seen = false;
+
+		for (unsigned i = 0; i < sc->vsc_seen_n; i++)
+			if (sc->vsc_seen_scanout[i] == cmd->resource_id) {
+				seen = true;
+				break;
+			}
+		if (!seen && cmd->resource_id != 0 &&
+		    sc->vsc_seen_n < nitems(sc->vsc_seen_scanout))
+			sc->vsc_seen_scanout[sc->vsc_seen_n++] =
+			    cmd->resource_id;
+
+		sc->vsc_scanout_res = cmd->resource_id;
+		sc->vsc_scanout_w = cmd->r.width;
+		sc->vsc_scanout_h = cmd->r.height;
+		if (cmd->resource_id != 0 && !seen) {
+			size_t need = (size_t)cmd->r.width * cmd->r.height * 4;
+
+			if (sc->vsc_scanout_probe &&
+			    need > sc->vsc_scanout_bufsz) {
+				free(sc->vsc_scanout_buf);
+				sc->vsc_scanout_buf = malloc(need);
+				sc->vsc_scanout_bufsz =
+				    sc->vsc_scanout_buf ? need : 0;
+			}
+			struct virgl_renderer_resource_info_ext info;
+			int iret;
+
+			EPRINTLN("vtgpu: scanout %u bound to res=%u %ux%u "
+			    "(%zu KiB readback)", cmd->scanout_id,
+			    cmd->resource_id, cmd->r.width, cmd->r.height,
+			    need / 1024);
+
+			/*
+			 * Can this resource be handed to the host compositor
+			 * as a dma_buf instead of being read back?  If so the
+			 * readback above is a cost a zero-copy present would
+			 * never pay, and the timing below is measuring the
+			 * wrong design.  FreeBSD RADV has historically had no
+			 * dma_buf export -- it returns OPAQUE fds -- so ask
+			 * rather than assume.
+			 */
+			memset(&info, 0, sizeof(info));
+			info.version = VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION;
+			iret = virgl_renderer_resource_get_info_ext(
+			    (int)cmd->resource_id, &info);
+			if (iret != 0) {
+				EPRINTLN("vtgpu: scanout res=%u get_info_ext "
+				    "failed ret=%d", cmd->resource_id, iret);
+			} else {
+				vtgpu_scanout_publish(sc, cmd, &info);
+				EPRINTLN("vtgpu: scanout res=%u dmabuf_export=%s "
+				    "fourcc=0x%08x stride=%u planes=%d "
+				    "modifier=0x%016jx fmt=%u %ux%u",
+				    cmd->resource_id,
+				    info.has_dmabuf_export ? "YES" : "no",
+				    (unsigned)info.base.drm_fourcc,
+				    info.base.stride, info.planes,
+				    (uintmax_t)info.modifiers,
+				    info.base.virgl_format,
+				    info.base.width, info.base.height);
+			}
+		}
+	}
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 	    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
 }
@@ -600,12 +808,74 @@ vtgpu_cmd_set_scanout(struct vtgpu_softc *sc, struct vqueue_info *vq,
 static void
 vtgpu_cmd_resource_flush(struct vtgpu_softc *sc, struct vqueue_info *vq,
     const struct virtio_gpu_ctrl_hdr *hdr, uint16_t chain_idx,
-    struct iovec *wiov, int nwiov)
+    const struct virtio_gpu_resource_flush *cmd, struct iovec *wiov, int nwiov)
 {
 	/*
-	 * Headless: the "scanout" is whatever RDP grabs from the guest's
-	 * own framebuffer; we don't blit anywhere on the host side.
+	 * Headless: nothing is presented.  Under scanout_probe, read the
+	 * scanout resource back into a host buffer and time it -- that read
+	 * is the per-frame cost a host-side present would pay, and it is the
+	 * one number worth having before building a display path on it.
 	 */
+	if (sc->vsc_scanout_probe && cmd != NULL &&
+	    cmd->resource_id != 0 &&
+	    cmd->resource_id == sc->vsc_scanout_res &&
+	    sc->vsc_scanout_buf != NULL) {
+		struct virgl_box box = {
+			.x = 0, .y = 0, .z = 0,
+			.w = sc->vsc_scanout_w, .h = sc->vsc_scanout_h, .d = 1,
+		};
+		struct iovec iov = {
+			.iov_base = sc->vsc_scanout_buf,
+			.iov_len = (size_t)sc->vsc_scanout_w *
+			    sc->vsc_scanout_h * 4,
+		};
+		struct timespec t0, t1;
+		uint64_t ns;
+		int ret;
+
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		ret = virgl_renderer_transfer_read_iov(cmd->resource_id, 0, 0,
+		    sc->vsc_scanout_w * 4, 0, &box, 0, &iov, 1);
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+
+		if (ret != 0) {
+			if (sc->vsc_ro_fail++ == 0)
+				EPRINTLN("vtgpu: scanout readback res=%u "
+				    "FAILED ret=%d (reported once)",
+				    cmd->resource_id, ret);
+		} else {
+			ns = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ULL +
+			    (t1.tv_nsec - t0.tv_nsec);
+			if (sc->vsc_ro_n == 0 || ns < sc->vsc_ro_min)
+				sc->vsc_ro_min = ns;
+			if (ns > sc->vsc_ro_max)
+				sc->vsc_ro_max = ns;
+			sc->vsc_ro_ns += ns;
+			if ((++sc->vsc_ro_n % 60) == 0)
+				EPRINTLN("vtgpu: scanout readback %ux%u n=%ju "
+				    "avg=%juus min=%juus max=%juus "
+				    "(avg caps ~%ju fps)",
+				    sc->vsc_scanout_w, sc->vsc_scanout_h,
+				    (uintmax_t)sc->vsc_ro_n,
+				    (uintmax_t)(sc->vsc_ro_ns /
+					sc->vsc_ro_n / 1000),
+				    (uintmax_t)(sc->vsc_ro_min / 1000),
+				    (uintmax_t)(sc->vsc_ro_max / 1000),
+				    (uintmax_t)(sc->vsc_ro_ns ?
+					1000000000ULL /
+					(sc->vsc_ro_ns / sc->vsc_ro_n) : 0));
+		}
+	}
+	/*
+	 * Still forwarded for guests that draw into one resource and flush it
+	 * (the 2D/fbdev path), but a page-flipping compositor never gets here
+	 * -- for those the flip is SET_SCANOUT and the frame is reported from
+	 * vtgpu_scanout_publish() instead.
+	 */
+	if (sc->vsc_display != NULL && cmd != NULL &&
+	    cmd->resource_id == sc->vsc_scanout_res)
+		gpu_display_frame(sc->vsc_display, cmd->resource_id, cmd->r.x,
+		    cmd->r.y, cmd->r.width, cmd->r.height);
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 	    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
 }
@@ -1290,12 +1560,16 @@ vtgpu_process_controlq(struct vtgpu_softc *sc, int qidx)
 		case VIRTIO_GPU_CMD_SET_SCANOUT:
 		case VIRTIO_GPU_CMD_SET_SCANOUT_BLOB:
 			vtgpu_cmd_set_scanout(sc, vq, hdr, req.idx,
+			    cmdlen >= sizeof(struct virtio_gpu_set_scanout) ?
+			    (const struct virtio_gpu_set_scanout *)hdr : NULL,
 			    wiov, nwiov);
 			break;
 
 		case VIRTIO_GPU_CMD_RESOURCE_FLUSH:
 			vtgpu_cmd_resource_flush(sc, vq, hdr, req.idx,
-			    wiov, nwiov);
+			    cmdlen >= sizeof(struct virtio_gpu_resource_flush) ?
+			    (const struct virtio_gpu_resource_flush *)hdr :
+			    NULL, wiov, nwiov);
 			break;
 
 		case VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D:
@@ -2220,6 +2494,25 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 		wayland_display = get_config_value_node(nvl, "wayland");
 		sc->vsc_venus   = get_config_bool_node_default(nvl, "venus",
 		    false);
+		sc->vsc_scanout_probe = get_config_bool_node_default(nvl,
+		    "scanout_probe", false);
+		sc->vsc_scanout_linear = get_config_bool_node_default(nvl,
+		    "scanout_linear", false);
+		{
+			const char *disp = get_config_value_node(nvl, "display");
+
+			/*
+			 * display=unix:/path publishes the scanout to an
+			 * external viewer.  Unset (the default) leaves
+			 * vsc_display NULL and every path below inert.
+			 */
+			if (disp != NULL && strncmp(disp, "unix:", 5) == 0) {
+				sc->vsc_display = gpu_display_init(disp + 5);
+			} else if (disp != NULL) {
+				EPRINTLN("vtgpu: display=%s not understood, "
+				    "expected unix:/path", disp);
+			}
+		}
 		pci_vtgpu_debug = get_config_bool_node_default(nvl, "debug",
 		    false);
 	}
