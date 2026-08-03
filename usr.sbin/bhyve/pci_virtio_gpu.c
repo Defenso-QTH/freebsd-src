@@ -171,7 +171,25 @@ struct virgl_box {
  * guest kernel reports "+host_visible" and the venus ICD will attach.
  */
 #define	VTGPU_HOSTVIS_BAR	2		/* MEM64 -> consumes BARs 2 and 3 */
-#define	VTGPU_HOSTVIS_SZ	(256ULL << 20)	/* 256 MiB */
+/*
+ * Size of the host-visible window, and therefore the size of the only
+ * heap the guest can allocate mappable Vulkan memory from -- the guest
+ * driver reads it off the BAR and refuses anything larger itself, which
+ * is why exhausting it produces no host-side error at all.
+ *
+ * 256 MiB was chosen when vkcube was the only workload.  A real game
+ * blows through it: CK3 asks for a 162 MiB texture alongside 67 and 84
+ * MiB blobs, which cannot coexist in 256 MiB, and DXVK reports the
+ * refusal as a failed CreateTexture2D.
+ *
+ * Enlarging it is close to free.  The BAR is backed by a devmem segment,
+ * which vm_alloc_memseg() creates as an OBJT_SWAP object, so pages are
+ * committed on first touch rather than up front -- and blob mappings
+ * alias real host memory over the range anyway, so most of it is never
+ * touched.  The cost is guest address space, and bhyve's 64-bit MMIO
+ * window is 32 GB (PCI_EMUL_MEMSIZE64).
+ */
+#define	VTGPU_HOSTVIS_SZ	(4ULL << 30)	/* 4 GiB */
 
 /*
  * Modern config BAR (BAR 4, MEM64) layout.  One 4 KiB page per structure
