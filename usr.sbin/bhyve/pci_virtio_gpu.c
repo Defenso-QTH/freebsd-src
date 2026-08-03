@@ -308,7 +308,14 @@ struct vtgpu_softc {
 	 * offset; we track the guest range so RESOURCE_UNMAP_BLOB (which carries
 	 * only the resource id) can tear it down.
 	 */
-#define	VTGPU_MAX_BLOB_MAPS	64
+/*
+ * Concurrent host-visible blob mappings.  64 was chosen when only vkcube and
+ * vulkaninfo had ever run; a real game holds far more mapped at once.  Slots
+ * are released by RESOURCE_UNMAP_BLOB and RESOURCE_UNREF, so this bounds live
+ * mappings rather than lifetime allocations -- but exhausting it drops guest
+ * commands, so map_blob logs unconditionally when it does.
+ */
+#define	VTGPU_MAX_BLOB_MAPS	1024
 	struct vtgpu_blob_map {
 		uint32_t	res_id;
 		uint64_t	gpa;	/* guest phys addr in the window */
@@ -520,12 +527,37 @@ vtgpu_cmd_resource_create_3d(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx, type, wiov, nwiov);
 }
 
+/* Defined below, next to the rest of the blob-map helpers. */
+static struct vtgpu_blob_map *vtgpu_blob_map_find(struct vtgpu_softc *sc,
+    uint32_t res_id);
+
 static void
 vtgpu_cmd_resource_unref(struct vtgpu_softc *sc, struct vqueue_info *vq,
     const struct virtio_gpu_ctrl_hdr *hdr, uint16_t chain_idx,
     const struct virtio_gpu_resource_unref *cmd,
     struct iovec *wiov, int nwiov)
 {
+	struct vtgpu_blob_map *bm;
+
+	/*
+	 * A blob resource may be unref'd while still mapped: the guest is not
+	 * obliged to send RESOURCE_UNMAP_BLOB first, and a guest that exits or
+	 * crashes never will.  Tear the mapping down here before dropping the
+	 * reference.
+	 *
+	 * Order matters.  virgl_renderer_resource_unref() can free the storage
+	 * the blob is backed by, so the guest alias installed by map_blob must
+	 * be removed BEFORE the unref -- otherwise the guest is left with a
+	 * window onto freed host memory that it can still read and write.
+	 * Releasing the tracking slot also matters on its own: without it the
+	 * fixed-size table fills up and every later map_blob fails.
+	 */
+	bm = vtgpu_blob_map_find(sc, cmd->resource_id);
+	if (bm != NULL) {
+		vm_munmap_blob(sc->vsc_ctx, bm->gpa, bm->len);
+		memset(bm, 0, sizeof(*bm));
+		virgl_renderer_resource_unmap(cmd->resource_id);
+	}
 	virgl_renderer_resource_unref(cmd->resource_id);
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 	    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
@@ -765,8 +797,9 @@ vtgpu_cmd_resource_map_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
 			break;
 		}
 	if (bm == NULL) {
-		DPRINTF("map_blob res=%u: no free blob-map slots",
-		    cmd->resource_id);
+		EPRINTLN("vtgpu: map_blob res=%u REJECTED - all %d blob-map "
+		    "slots in use (leak, or raise VTGPU_MAX_BLOB_MAPS)",
+		    cmd->resource_id, VTGPU_MAX_BLOB_MAPS);
 		goto err;
 	}
 
@@ -779,8 +812,8 @@ vtgpu_cmd_resource_map_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	 */
 	ret = virgl_renderer_resource_map(cmd->resource_id, &hva, &map_size);
 	if (ret != 0 || hva == NULL) {
-		DPRINTF("map_blob res=%u resource_map ret=%d hva=%p",
-		    cmd->resource_id, ret, hva);
+		EPRINTLN("vtgpu: map_blob res=%u FAILED resource_map ret=%d "
+		    "hva=%p", cmd->resource_id, ret, hva);
 		goto err;
 	}
 	/*
