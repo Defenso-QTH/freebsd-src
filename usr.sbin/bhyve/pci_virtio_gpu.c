@@ -636,6 +636,8 @@ vtgpu_cmd_resource_attach_backing(struct vtgpu_softc *sc,
 	}
 	iovs = calloc(n, sizeof(*iovs));
 	if (iovs == NULL) {
+		EPRINTLN("vtgpu: attach_backing id=%u FAILED - out of memory "
+		    "for %u iovecs", cmd->resource_id, n);
 		vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 		    VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, wiov, nwiov);
 		return;
@@ -645,6 +647,10 @@ vtgpu_cmd_resource_attach_backing(struct vtgpu_softc *sc,
 		    entries[i].addr, entries[i].length);
 		iovs[i].iov_len  = entries[i].length;
 		if (iovs[i].iov_base == NULL) {
+			EPRINTLN("vtgpu: attach_backing id=%u FAILED - entry %u "
+			    "gpa=0x%lx len=%u is not guest memory",
+			    cmd->resource_id, i,
+			    (unsigned long)entries[i].addr, entries[i].length);
 			free(iovs);
 			vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 			    VIRTIO_GPU_RESP_ERR_UNSPEC, wiov, nwiov);
@@ -706,6 +712,8 @@ vtgpu_cmd_resource_create_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	if (n > 0) {
 		iovs = calloc(n, sizeof(*iovs));
 		if (iovs == NULL) {
+			EPRINTLN("vtgpu: create_blob id=%u FAILED - out of "
+			    "memory for %u iovecs", cmd->resource_id, n);
 			vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 			    VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, wiov, nwiov);
 			return;
@@ -715,6 +723,11 @@ vtgpu_cmd_resource_create_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
 			    entries[i].addr, entries[i].length);
 			iovs[i].iov_len  = entries[i].length;
 			if (iovs[i].iov_base == NULL) {
+				EPRINTLN("vtgpu: create_blob id=%u FAILED - "
+				    "entry %u gpa=0x%lx len=%u is not guest "
+				    "memory", cmd->resource_id, i,
+				    (unsigned long)entries[i].addr,
+				    entries[i].length);
 				free(iovs);
 				vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 				    VIRTIO_GPU_RESP_ERR_UNSPEC, wiov, nwiov);
@@ -738,6 +751,12 @@ vtgpu_cmd_resource_create_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	    "nr=%u ctx=%u ret=%d", cmd->resource_id, cmd->blob_mem,
 	    cmd->blob_flags, (unsigned long)cmd->blob_id,
 	    (unsigned long)cmd->size, n, hdr->ctx_id, ret);
+	if (ret != 0)
+		EPRINTLN("vtgpu: create_blob id=%u FAILED ret=%d (mem=%u "
+		    "flags=0x%x blob_id=%lu size=%lu nr=%u ctx=%u)",
+		    cmd->resource_id, ret, cmd->blob_mem, cmd->blob_flags,
+		    (unsigned long)cmd->blob_id, (unsigned long)cmd->size, n,
+		    hdr->ctx_id);
 	/* Bind to the creating context (same convention as our other creates). */
 	if (ret == 0 && hdr->ctx_id != 0)
 		virgl_renderer_ctx_attach_resource(hdr->ctx_id,
@@ -785,8 +804,8 @@ vtgpu_cmd_resource_map_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	int i, ret;
 
 	if (sc->vsc_hostvis_gpa == 0) {
-		DPRINTF("map_blob res=%u but host-visible BAR not mapped",
-		    cmd->resource_id);
+		EPRINTLN("vtgpu: map_blob res=%u REJECTED - host-visible BAR "
+		    "not mapped by the guest", cmd->resource_id);
 		goto err;
 	}
 	/* Find a free tracking slot. */
@@ -956,6 +975,8 @@ vtgpu_cmd_get_capset(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	    cmd->capset_id, cmd->capset_version, max_ver, max_size);
 
 	if (max_size == 0) {
+		EPRINTLN("vtgpu: get_capset id=%u ver=%u REJECTED - unknown "
+		    "capset", cmd->capset_id, cmd->capset_version);
 		vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 		    VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER, wiov, nwiov);
 		return;
@@ -964,6 +985,8 @@ vtgpu_cmd_get_capset(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	size_t total = sizeof(struct virtio_gpu_resp_capset) + max_size;
 	struct virtio_gpu_resp_capset *resp = calloc(1, total);
 	if (resp == NULL) {
+		EPRINTLN("vtgpu: get_capset id=%u FAILED - out of memory for "
+		    "%zu bytes", cmd->capset_id, total);
 		vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 		    VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, wiov, nwiov);
 		return;
