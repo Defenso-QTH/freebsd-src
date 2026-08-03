@@ -554,6 +554,9 @@ vtgpu_cmd_resource_unref(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	 */
 	bm = vtgpu_blob_map_find(sc, cmd->resource_id);
 	if (bm != NULL) {
+		EPRINTLN("vtgpu: unref res=%u releasing blob map gpa=0x%lx "
+		    "len=%lu", cmd->resource_id, (unsigned long)bm->gpa,
+		    (unsigned long)bm->len);
 		vm_munmap_blob(sc->vsc_ctx, bm->gpa, bm->len);
 		memset(bm, 0, sizeof(*bm));
 		virgl_renderer_resource_unmap(cmd->resource_id);
@@ -757,7 +760,30 @@ vtgpu_cmd_resource_create_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
 		    cmd->resource_id, ret, cmd->blob_mem, cmd->blob_flags,
 		    (unsigned long)cmd->blob_id, (unsigned long)cmd->size, n,
 		    hdr->ctx_id);
-	/* Bind to the creating context (same convention as our other creates). */
+	/*
+	 * Host-visible blobs (BLOB_MEM_HOST3D == 2) are few and expensive --
+	 * CK3 asks for them 256MB at a time -- so log the successful ones too,
+	 * unconditionally.  venus sets its per-VkDeviceMemory "exported" flag
+	 * before the export completes and never clears it, so a partial
+	 * failure poisons that memory permanently and every later attempt
+	 * reports "mem has been exported".  Without a record of the export
+	 * that succeeded, those later failures cannot be traced back to the
+	 * one that actually broke, and the success path is otherwise visible
+	 * only under debug=on, which costs 53% and changes the timing.
+	 */
+	if (ret == 0 && cmd->blob_mem == 2)
+		EPRINTLN("vtgpu: create_blob id=%u OK blob_id=%lu size=%lu "
+		    "flags=0x%x ctx=%u", cmd->resource_id,
+		    (unsigned long)cmd->blob_id, (unsigned long)cmd->size,
+		    cmd->blob_flags, hdr->ctx_id);
+	/*
+	 * Attaching here is a leftover from the removed mvisor mode, whose
+	 * guest driver never sent CTX_ATTACH_RESOURCE.  It is harmless -- for
+	 * a context-created blob proxy_context_attach_resource finds the
+	 * resource already present and returns -- but the standard Linux guest
+	 * sends the attach itself, so keep it only until that is confirmed
+	 * across all guest drivers we care about.
+	 */
 	if (ret == 0 && hdr->ctx_id != 0)
 		virgl_renderer_ctx_attach_resource(hdr->ctx_id,
 		    (int)cmd->resource_id);
