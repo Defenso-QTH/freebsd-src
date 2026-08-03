@@ -72,6 +72,7 @@ struct virgl_box {
 #include "config.h"
 #include "debug.h"
 #include "pci_emul.h"
+#include "gpu_display.h"
 #include "virtio.h"
 
 /* Import the protocol structs from the kernel tree. */
@@ -317,6 +318,11 @@ struct vtgpu_softc {
 	 * whether a host-side present is affordable before anything is built
 	 * on top of it.
 	 */
+	/*
+	 * External viewer (display=unix:/path).  NULL when unconfigured, which
+	 * is the default: the device then behaves exactly as before.
+	 */
+	struct gpu_display	*vsc_display;
 	bool			vsc_scanout_probe;
 	uint32_t		vsc_scanout_res;	/* 0 = none bound */
 	uint32_t		vsc_scanout_w;
@@ -606,6 +612,47 @@ vtgpu_cmd_resource_unref(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
 }
 
+/*
+ * Hand the scanout buffer to an external viewer, if one is configured and the
+ * resource can be exported.  Zero-copy: the viewer imports the dma_buf into
+ * the host compositor, so the pixels are never read back, encoded or copied.
+ *
+ * When the resource cannot be exported -- FreeBSD RADV has historically
+ * handed back OPAQUE fds rather than dma_bufs -- nothing is published and the
+ * viewer simply sees no scanout.  The shm fallback (read back into a shared
+ * segment and publish that instead) is deliberately not written yet: whether
+ * it is needed depends on what has_dmabuf_export actually reports on this
+ * hardware, and writing it before knowing would be guessing.
+ */
+static void
+vtgpu_scanout_publish(struct vtgpu_softc *sc,
+    const struct virtio_gpu_set_scanout *cmd,
+    const struct virgl_renderer_resource_info_ext *info)
+{
+	struct gpu_display_scanout so;
+	int dfd = -1, stride = 0, offset = 0;
+
+	if (sc->vsc_display == NULL || !info->has_dmabuf_export)
+		return;
+
+	if (virgl_renderer_get_fd_for_texture2(info->base.tex_id, &dfd,
+	    &stride, &offset) != 0 || dfd < 0) {
+		EPRINTLN("vtgpu: scanout res=%u dmabuf export failed despite "
+		    "has_dmabuf_export", cmd->resource_id);
+		return;
+	}
+
+	memset(&so, 0, sizeof(so));
+	so.transport = GPU_DISPLAY_XPORT_DMABUF;
+	so.width = cmd->r.width;
+	so.height = cmd->r.height;
+	so.stride = stride != 0 ? (uint32_t)stride : info->base.stride;
+	so.drm_fourcc = (uint32_t)info->base.drm_fourcc;
+	so.planes = (uint32_t)info->planes;
+	so.modifier = info->modifiers;
+	gpu_display_scanout(sc->vsc_display, &so, dfd);	/* consumes dfd */
+}
+
 static void
 vtgpu_cmd_set_scanout(struct vtgpu_softc *sc, struct vqueue_info *vq,
     const struct virtio_gpu_ctrl_hdr *hdr, uint16_t chain_idx,
@@ -655,6 +702,7 @@ vtgpu_cmd_set_scanout(struct vtgpu_softc *sc, struct vqueue_info *vq,
 				EPRINTLN("vtgpu: scanout res=%u get_info_ext "
 				    "failed ret=%d", cmd->resource_id, iret);
 			} else {
+				vtgpu_scanout_publish(sc, cmd, &info);
 				EPRINTLN("vtgpu: scanout res=%u dmabuf_export=%s "
 				    "fourcc=0x%08x stride=%u planes=%d "
 				    "modifier=0x%016jx fmt=%u %ux%u",
@@ -733,6 +781,10 @@ vtgpu_cmd_resource_flush(struct vtgpu_softc *sc, struct vqueue_info *vq,
 					(sc->vsc_ro_ns / sc->vsc_ro_n) : 0));
 		}
 	}
+	if (sc->vsc_display != NULL && cmd != NULL &&
+	    cmd->resource_id == sc->vsc_scanout_res)
+		gpu_display_frame(sc->vsc_display, cmd->r.x, cmd->r.y,
+		    cmd->r.width, cmd->r.height);
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 	    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
 }
@@ -2353,6 +2405,22 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 		    false);
 		sc->vsc_scanout_probe = get_config_bool_node_default(nvl,
 		    "scanout_probe", false);
+		{
+			const char *disp = get_config_value_node(nvl, "display");
+
+			/*
+			 * display=unix:/path publishes the scanout to an
+			 * external viewer.  Unset (the default) leaves
+			 * vsc_display NULL and every path below inert.
+			 */
+			if (disp != NULL && strncmp(disp, "unix:", 5) == 0) {
+				sc->vsc_display = gpu_display_init(disp + 5);
+				sc->vsc_scanout_probe = true;
+			} else if (disp != NULL) {
+				EPRINTLN("vtgpu: display=%s not understood, "
+				    "expected unix:/path", disp);
+			}
+		}
 		pci_vtgpu_debug = get_config_bool_node_default(nvl, "debug",
 		    false);
 	}

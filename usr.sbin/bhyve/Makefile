@@ -76,7 +76,7 @@ SRCS+=	snapshot.c
 .endif
 
 .if defined(BHYVE_VIRGL_SUPPORT)
-SRCS+=	pci_virtio_gpu.c
+SRCS+=	pci_virtio_gpu.c gpu_display.c
 CFLAGS+= -I/usr/local/include/virgl
 # Absolute path so the cross-linker (lld with --sysroot) finds it on the build
 # host rather than inside the FreeBSD sysroot where no ports library exists.

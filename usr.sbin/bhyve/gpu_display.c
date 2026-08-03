@@ -1,0 +1,402 @@
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Copyright (c) 2026 Defenso
+ */
+
+/*
+ * Host side of the virtio-gpu external viewer protocol; see gpu_display.h for
+ * why it exists and what goes over the wire.
+ *
+ * Threading: gpu_display_scanout() and gpu_display_frame() are called from the
+ * virtio-gpu worker thread while it processes guest commands.  The listen and
+ * input paths run on the mevent thread.  A single mutex covers the connection
+ * state, and the sends are non-blocking so a slow or wedged viewer can never
+ * stall the guest -- frames are dropped instead.
+ *
+ * Only one viewer is served at a time; a second connection replaces the first,
+ * which keeps reconnect handling trivial.
+ */
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "config.h"
+#include "console.h"
+#include "debug.h"
+#include "gpu_display.h"
+#include "mevent.h"
+
+struct gpu_display {
+	pthread_mutex_t	mtx;
+	int		lfd;		/* listening socket */
+	int		cfd;		/* connected viewer, -1 if none */
+	struct mevent	*levp;
+	struct mevent	*cevp;
+	char		*path;
+
+	/* Last scanout, replayed to a viewer that connects mid-session. */
+	bool		have_scanout;
+	struct gpu_display_scanout last;
+	int		last_fd;	/* dup kept for replay, -1 if none */
+
+	uint64_t	frames_sent;
+	uint64_t	frames_dropped;
+
+	/* Partial input message accumulator. */
+	uint8_t		inbuf[GPU_DISPLAY_MAX_MSG];
+	size_t		inlen;
+};
+
+/*
+ * Write a message, optionally with one fd attached.  Returns false if the
+ * viewer could not take it; the caller decides whether that is fatal.
+ *
+ * The socket is non-blocking.  A short write would desynchronise the stream,
+ * so it is treated as a lost viewer rather than retried: dropping the
+ * connection is recoverable (it reconnects), a corrupt stream is not.
+ */
+static bool
+gd_send(struct gpu_display *gd, const void *msg, size_t len, int fd)
+{
+	struct msghdr mh;
+	struct iovec iov;
+	union {
+		struct cmsghdr hdr;
+		unsigned char buf[CMSG_SPACE(sizeof(int))];
+	} cmsgbuf;
+	ssize_t n;
+
+	if (gd->cfd < 0)
+		return (false);
+
+	memset(&mh, 0, sizeof(mh));
+	iov.iov_base = __DECONST(void *, msg);
+	iov.iov_len = len;
+	mh.msg_iov = &iov;
+	mh.msg_iovlen = 1;
+
+	if (fd >= 0) {
+		memset(&cmsgbuf, 0, sizeof(cmsgbuf));
+		mh.msg_control = cmsgbuf.buf;
+		mh.msg_controllen = sizeof(cmsgbuf.buf);
+		cmsgbuf.hdr.cmsg_len = CMSG_LEN(sizeof(int));
+		cmsgbuf.hdr.cmsg_level = SOL_SOCKET;
+		cmsgbuf.hdr.cmsg_type = SCM_RIGHTS;
+		memcpy(CMSG_DATA(&cmsgbuf.hdr), &fd, sizeof(fd));
+	}
+
+	n = sendmsg(gd->cfd, &mh, MSG_NOSIGNAL);
+	return (n == (ssize_t)len);
+}
+
+/* Caller holds gd->mtx. */
+static void
+gd_drop_client(struct gpu_display *gd)
+{
+
+	if (gd->cfd < 0)
+		return;
+	if (gd->cevp != NULL) {
+		mevent_delete(gd->cevp);
+		gd->cevp = NULL;
+	}
+	close(gd->cfd);
+	gd->cfd = -1;
+	gd->inlen = 0;
+	EPRINTLN("gpu_display: viewer disconnected (frames sent=%ju "
+	    "dropped=%ju)", (uintmax_t)gd->frames_sent,
+	    (uintmax_t)gd->frames_dropped);
+}
+
+/*
+ * One complete message from the viewer.  Input is handed to the same console
+ * entry points rfb.c uses, so it reaches whatever keyboard and pointer the
+ * guest was configured with and nothing in console.c changes.
+ */
+static void
+gd_handle_input(const struct gpu_display_hdr *hdr, size_t len)
+{
+
+	switch (hdr->type) {
+	case GPU_DISPLAY_MSG_KEY: {
+		const struct gpu_display_key *k = (const void *)hdr;
+
+		if (len < sizeof(*k))
+			return;
+		console_key_event((int)k->down, k->keysym, k->keycode);
+		break;
+	}
+	case GPU_DISPLAY_MSG_PTR: {
+		const struct gpu_display_ptr *p = (const void *)hdr;
+
+		if (len < sizeof(*p))
+			return;
+		console_ptr_event((uint8_t)p->button, p->x, p->y);
+		break;
+	}
+	default:
+		/* Unknown types are skipped by length, not fatal. */
+		break;
+	}
+}
+
+static void
+gd_client_readable(int fd, enum ev_type ev __unused, void *arg)
+{
+	struct gpu_display *gd = arg;
+	ssize_t n;
+
+	pthread_mutex_lock(&gd->mtx);
+	if (fd != gd->cfd) {
+		pthread_mutex_unlock(&gd->mtx);
+		return;
+	}
+
+	n = read(fd, gd->inbuf + gd->inlen, sizeof(gd->inbuf) - gd->inlen);
+	if (n <= 0) {
+		if (n < 0 && (errno == EAGAIN || errno == EINTR)) {
+			pthread_mutex_unlock(&gd->mtx);
+			return;
+		}
+		gd_drop_client(gd);
+		pthread_mutex_unlock(&gd->mtx);
+		return;
+	}
+	gd->inlen += (size_t)n;
+
+	/* Drain every complete message the buffer now holds. */
+	for (;;) {
+		struct gpu_display_hdr hdr;
+
+		if (gd->inlen < sizeof(hdr))
+			break;
+		memcpy(&hdr, gd->inbuf, sizeof(hdr));
+		if (hdr.len < sizeof(hdr) || hdr.len > sizeof(gd->inbuf)) {
+			EPRINTLN("gpu_display: viewer sent bad length %u, "
+			    "dropping", hdr.len);
+			gd_drop_client(gd);
+			break;
+		}
+		if (gd->inlen < hdr.len)
+			break;
+		gd_handle_input((const struct gpu_display_hdr *)gd->inbuf,
+		    hdr.len);
+		memmove(gd->inbuf, gd->inbuf + hdr.len, gd->inlen - hdr.len);
+		gd->inlen -= hdr.len;
+	}
+	pthread_mutex_unlock(&gd->mtx);
+}
+
+static void
+gd_accept(int fd, enum ev_type ev __unused, void *arg)
+{
+	struct gpu_display *gd = arg;
+	struct gpu_display_hello hello;
+	int cfd;
+
+	cfd = accept(fd, NULL, NULL);
+	if (cfd < 0)
+		return;
+
+	pthread_mutex_lock(&gd->mtx);
+	/* A new viewer replaces the old one. */
+	gd_drop_client(gd);
+
+	if (fcntl(cfd, F_SETFL, O_NONBLOCK) != 0) {
+		close(cfd);
+		pthread_mutex_unlock(&gd->mtx);
+		return;
+	}
+	gd->cfd = cfd;
+
+	memset(&hello, 0, sizeof(hello));
+	hello.hdr.type = GPU_DISPLAY_MSG_HELLO;
+	hello.hdr.len = sizeof(hello);
+	hello.version = GPU_DISPLAY_VERSION;
+	if (!gd_send(gd, &hello, sizeof(hello), -1)) {
+		gd_drop_client(gd);
+		pthread_mutex_unlock(&gd->mtx);
+		return;
+	}
+
+	gd->cevp = mevent_add(cfd, EVF_READ, gd_client_readable, gd);
+	if (gd->cevp == NULL) {
+		gd_drop_client(gd);
+		pthread_mutex_unlock(&gd->mtx);
+		return;
+	}
+
+	/*
+	 * Replay the current scanout so a viewer that connects mid-session
+	 * gets a picture without waiting for the guest to rebind one, which
+	 * it may not do for a long time.
+	 */
+	if (gd->have_scanout && gd->last_fd >= 0) {
+		int dup_fd = dup(gd->last_fd);
+
+		if (dup_fd >= 0) {
+			if (!gd_send(gd, &gd->last, sizeof(gd->last), dup_fd))
+				gd_drop_client(gd);
+			close(dup_fd);
+		}
+	}
+	EPRINTLN("gpu_display: viewer connected on %s", gd->path);
+	pthread_mutex_unlock(&gd->mtx);
+}
+
+struct gpu_display *
+gpu_display_init(const char *path)
+{
+	struct gpu_display *gd;
+	struct sockaddr_un sun;
+
+	if (path == NULL || strlen(path) >= sizeof(sun.sun_path)) {
+		EPRINTLN("gpu_display: bad socket path");
+		return (NULL);
+	}
+
+	gd = calloc(1, sizeof(*gd));
+	if (gd == NULL)
+		return (NULL);
+	gd->cfd = -1;
+	gd->last_fd = -1;
+	pthread_mutex_init(&gd->mtx, NULL);
+
+	gd->lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (gd->lfd < 0) {
+		EPRINTLN("gpu_display: socket failed: %s", strerror(errno));
+		goto fail;
+	}
+
+	memset(&sun, 0, sizeof(sun));
+	sun.sun_family = AF_UNIX;
+	strlcpy(sun.sun_path, path, sizeof(sun.sun_path));
+	(void)unlink(path);
+	if (bind(gd->lfd, (struct sockaddr *)&sun, sizeof(sun)) != 0) {
+		EPRINTLN("gpu_display: bind %s failed: %s", path,
+		    strerror(errno));
+		goto fail;
+	}
+	if (listen(gd->lfd, 1) != 0) {
+		EPRINTLN("gpu_display: listen failed: %s", strerror(errno));
+		goto fail;
+	}
+
+	gd->path = strdup(path);
+	gd->levp = mevent_add(gd->lfd, EVF_READ, gd_accept, gd);
+	if (gd->levp == NULL) {
+		EPRINTLN("gpu_display: mevent_add failed");
+		goto fail;
+	}
+
+	EPRINTLN("gpu_display: listening on %s", path);
+	return (gd);
+
+fail:
+	if (gd->lfd >= 0)
+		close(gd->lfd);
+	free(gd->path);
+	free(gd);
+	return (NULL);
+}
+
+void
+gpu_display_scanout(struct gpu_display *gd, const struct gpu_display_scanout *info,
+    int fd)
+{
+	struct gpu_display_scanout msg;
+
+	if (gd == NULL) {
+		if (fd >= 0)
+			close(fd);
+		return;
+	}
+
+	msg = *info;
+	msg.hdr.type = GPU_DISPLAY_MSG_SCANOUT;
+	msg.hdr.len = sizeof(msg);
+
+	pthread_mutex_lock(&gd->mtx);
+
+	/* Keep it for replay to a viewer that connects later. */
+	if (gd->last_fd >= 0)
+		close(gd->last_fd);
+	gd->last_fd = fd >= 0 ? dup(fd) : -1;
+	gd->last = msg;
+	gd->have_scanout = true;
+
+	if (gd->cfd >= 0 && !gd_send(gd, &msg, sizeof(msg), fd))
+		gd_drop_client(gd);
+	pthread_mutex_unlock(&gd->mtx);
+
+	if (fd >= 0)
+		close(fd);
+}
+
+void
+gpu_display_frame(struct gpu_display *gd, uint32_t x, uint32_t y, uint32_t w,
+    uint32_t h)
+{
+	struct gpu_display_frame msg;
+
+	if (gd == NULL)
+		return;
+
+	memset(&msg, 0, sizeof(msg));
+	msg.hdr.type = GPU_DISPLAY_MSG_FRAME;
+	msg.hdr.len = sizeof(msg);
+	msg.x = x;
+	msg.y = y;
+	msg.w = w;
+	msg.h = h;
+
+	pthread_mutex_lock(&gd->mtx);
+	if (gd->cfd < 0) {
+		pthread_mutex_unlock(&gd->mtx);
+		return;
+	}
+	/*
+	 * Called from the guest command path.  A viewer that is not draining
+	 * must not become the guest's problem, so a frame that will not fit
+	 * in the socket buffer is dropped and counted, not retried.
+	 */
+	if (gd_send(gd, &msg, sizeof(msg), -1))
+		gd->frames_sent++;
+	else if (errno == EAGAIN || errno == EWOULDBLOCK)
+		gd->frames_dropped++;
+	else
+		gd_drop_client(gd);
+	pthread_mutex_unlock(&gd->mtx);
+}
+
+void
+gpu_display_unbind(struct gpu_display *gd)
+{
+	struct gpu_display_hdr hdr;
+
+	if (gd == NULL)
+		return;
+
+	hdr.type = GPU_DISPLAY_MSG_UNBIND;
+	hdr.len = sizeof(hdr);
+
+	pthread_mutex_lock(&gd->mtx);
+	gd->have_scanout = false;
+	if (gd->last_fd >= 0) {
+		close(gd->last_fd);
+		gd->last_fd = -1;
+	}
+	if (gd->cfd >= 0 && !gd_send(gd, &hdr, sizeof(hdr), -1))
+		gd_drop_client(gd);
+	pthread_mutex_unlock(&gd->mtx);
+}
