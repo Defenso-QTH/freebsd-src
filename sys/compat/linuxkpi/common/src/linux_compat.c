@@ -1278,7 +1278,7 @@ linux_file_kqfilter(struct file *file, struct knote *kn)
  * on failure it is freed and NULL is returned.  The caller then passes the
  * object to vm_mmap_object() with a zero offset.
  */
-vm_object_t
+static vm_object_t
 lkpi_vma_to_vm_object(struct vm_area_struct *vmap, vm_size_t size,
     vm_prot_t nprot, vm_ooffset_t offset, struct thread *td)
 {
@@ -1358,7 +1358,6 @@ lkpi_vma_to_vm_object(struct vm_area_struct *vmap, vm_size_t size,
 	}
 	return (object);
 }
-EXPORT_SYMBOL(lkpi_vma_to_vm_object);
 
 /*
  * lkpi_driver_mmap_object() - full driver-mmap helper for file types with
@@ -1486,74 +1485,14 @@ linux_file_mmap_single(struct file *fp, const struct file_operations *fop,
 	attr = pgprot2cachemode(vmap->vm_page_prot);
 
 	if (vmap->vm_ops != NULL) {
-		struct vm_area_struct *ptr;
-		void *vm_private_data;
-		bool vm_no_fault;
-
-		if (vmap->vm_ops->open == NULL ||
-		    vmap->vm_ops->close == NULL ||
-		    vmap->vm_private_data == NULL) {
-			/* free allocated VM area struct */
-			linux_cdev_handle_free(vmap);
+		/*
+		 * lkpi_vma_to_vm_object() consumes the vma and applies the
+		 * cache mode itself; the memattr fixup below is then a no-op
+		 * for this branch and is left only for the sglist case.
+		 */
+		*object = lkpi_vma_to_vm_object(vmap, size, nprot, *offset, td);
+		if (*object == NULL)
 			return (EINVAL);
-		}
-
-		vm_private_data = vmap->vm_private_data;
-
-		rw_wlock(&linux_vma_lock);
-		TAILQ_FOREACH(ptr, &linux_vma_head, vm_entry) {
-			if (ptr->vm_private_data == vm_private_data)
-				break;
-		}
-		/* check if there is an existing VM area struct */
-		if (ptr != NULL) {
-			/* check if the VM area structure is invalid */
-			if (ptr->vm_ops == NULL ||
-			    ptr->vm_ops->open == NULL ||
-			    ptr->vm_ops->close == NULL) {
-				error = ESTALE;
-				vm_no_fault = 1;
-			} else {
-				error = EEXIST;
-				vm_no_fault = (ptr->vm_ops->fault == NULL);
-			}
-		} else {
-			/* insert VM area structure into list */
-			TAILQ_INSERT_TAIL(&linux_vma_head, vmap, vm_entry);
-			error = 0;
-			vm_no_fault = (vmap->vm_ops->fault == NULL);
-		}
-		rw_wunlock(&linux_vma_lock);
-
-		if (error != 0) {
-			/* free allocated VM area struct */
-			linux_cdev_handle_free(vmap);
-			/* check for stale VM area struct */
-			if (error != EEXIST)
-				return (error);
-		}
-
-		/* check if there is no fault handler */
-		if (vm_no_fault) {
-			*object = cdev_pager_allocate(vm_private_data, OBJT_DEVICE,
-			    &linux_cdev_pager_ops[1], size, nprot, *offset,
-			    td->td_ucred);
-		} else {
-			*object = cdev_pager_allocate(vm_private_data, OBJT_MGTDEVICE,
-			    &linux_cdev_pager_ops[0], size, nprot, *offset,
-			    td->td_ucred);
-		}
-
-		/* check if allocating the VM object failed */
-		if (*object == NULL) {
-			if (error == 0) {
-				/* remove VM area struct from list */
-				linux_cdev_handle_remove(vmap);
-				/* free allocated VM area struct */
-				linux_cdev_handle_free(vmap);
-			}
-			return (EINVAL);
-		}
 	} else {
 		struct sglist *sg;
 

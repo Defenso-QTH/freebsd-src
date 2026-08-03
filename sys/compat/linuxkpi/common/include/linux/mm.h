@@ -132,8 +132,6 @@ struct vm_area_struct {
  * implement fo_mmap directly and so bypass linux_file_mmap_single() (notably
  * a mmap'd dma_buf fd), which otherwise leaves the mapping unbacked.
  */
-vm_object_t lkpi_vma_to_vm_object(struct vm_area_struct *vmap, vm_size_t size,
-    vm_prot_t nprot, vm_ooffset_t offset, struct thread *td);
 vm_object_t lkpi_driver_mmap_object(vm_size_t size, vm_prot_t nprot,
     vm_ooffset_t offset, bool is_shared, struct thread *td,
     int (*mmap_cb)(void *, struct vm_area_struct *), void *cb_arg);
