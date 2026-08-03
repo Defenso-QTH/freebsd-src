@@ -1277,10 +1277,15 @@ linux_file_kqfilter(struct file *file, struct knote *kn)
  * it is inserted into linux_vma_head and a referenced VM object is returned;
  * on failure it is freed and NULL is returned.  The caller then passes the
  * object to vm_mmap_object() with a zero offset.
+ *
+ * *errp receives the errno a caller returning one should use: ESTALE for a
+ * vma left behind by a driver that did not fill in vm_ops, EINVAL otherwise,
+ * and 0 on success.  It exists so linux_file_mmap_single() keeps reporting the
+ * same errors it did before this tail was shared.
  */
 static vm_object_t
 lkpi_vma_to_vm_object(struct vm_area_struct *vmap, vm_size_t size,
-    vm_prot_t nprot, vm_ooffset_t offset, struct thread *td)
+    vm_prot_t nprot, vm_ooffset_t offset, struct thread *td, int *errp)
 {
 	struct vm_area_struct *ptr;
 	vm_object_t object;
@@ -1288,6 +1293,8 @@ lkpi_vma_to_vm_object(struct vm_area_struct *vmap, vm_size_t size,
 	vm_memattr_t attr;
 	bool vm_no_fault;
 	int error;
+
+	*errp = EINVAL;
 
 	if (vmap->vm_ops == NULL || vmap->vm_ops->open == NULL ||
 	    vmap->vm_ops->close == NULL || vmap->vm_private_data == NULL) {
@@ -1329,8 +1336,10 @@ lkpi_vma_to_vm_object(struct vm_area_struct *vmap, vm_size_t size,
 		 */
 		vmap->vm_ops->close(vmap);
 		linux_cdev_handle_free(vmap);
-		if (error != EEXIST)
+		if (error != EEXIST) {
+			*errp = error;		/* ESTALE */
 			return (NULL);
+		}
 	}
 
 	if (vm_no_fault) {
@@ -1356,6 +1365,7 @@ lkpi_vma_to_vm_object(struct vm_area_struct *vmap, vm_size_t size,
 		vm_object_set_memattr(object, attr);
 		VM_OBJECT_WUNLOCK(object);
 	}
+	*errp = 0;
 	return (object);
 }
 
@@ -1421,7 +1431,7 @@ lkpi_driver_mmap_object(vm_size_t size, vm_prot_t nprot, vm_ooffset_t offset,
 		return (NULL);
 	}
 
-	return (lkpi_vma_to_vm_object(vmap, size, nprot, offset, td));
+	return (lkpi_vma_to_vm_object(vmap, size, nprot, offset, td, &error));
 }
 EXPORT_SYMBOL(lkpi_driver_mmap_object);
 
@@ -1490,9 +1500,10 @@ linux_file_mmap_single(struct file *fp, const struct file_operations *fop,
 		 * cache mode itself; the memattr fixup below is then a no-op
 		 * for this branch and is left only for the sglist case.
 		 */
-		*object = lkpi_vma_to_vm_object(vmap, size, nprot, *offset, td);
+		*object = lkpi_vma_to_vm_object(vmap, size, nprot, *offset, td,
+		    &error);
 		if (*object == NULL)
-			return (EINVAL);
+			return (error);
 	} else {
 		struct sglist *sg;
 
