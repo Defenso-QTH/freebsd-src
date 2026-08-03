@@ -309,6 +309,25 @@ struct vtgpu_softc {
 	 */
 	int			vsc_kq;
 	int			vsc_poll_fd;
+	/*
+	 * Scanout readback probe (scanout_probe=on).  Measures what it would
+	 * cost to present the guest's scanout from the host: on RESOURCE_FLUSH
+	 * of the scanout resource, read it back with transfer_read_iov into a
+	 * host buffer and time it.  Nothing is displayed -- this only answers
+	 * whether a host-side present is affordable before anything is built
+	 * on top of it.
+	 */
+	bool			vsc_scanout_probe;
+	uint32_t		vsc_scanout_res;	/* 0 = none bound */
+	uint32_t		vsc_scanout_w;
+	uint32_t		vsc_scanout_h;
+	void			*vsc_scanout_buf;
+	size_t			vsc_scanout_bufsz;
+	uint64_t		vsc_ro_n;		/* readbacks timed */
+	uint64_t		vsc_ro_ns;		/* cumulative ns */
+	uint64_t		vsc_ro_min;
+	uint64_t		vsc_ro_max;
+	uint64_t		vsc_ro_fail;
 	uint64_t		vsc_blob_hv;	/* host-visible blobs created */
 	uint64_t		vsc_unref;	/* RESOURCE_UNREF commands seen */
 	uint64_t		vsc_fwait;	/* fence waits entered */
@@ -590,9 +609,33 @@ vtgpu_cmd_resource_unref(struct vtgpu_softc *sc, struct vqueue_info *vq,
 static void
 vtgpu_cmd_set_scanout(struct vtgpu_softc *sc, struct vqueue_info *vq,
     const struct virtio_gpu_ctrl_hdr *hdr, uint16_t chain_idx,
-    struct iovec *wiov, int nwiov)
+    const struct virtio_gpu_set_scanout *cmd, struct iovec *wiov, int nwiov)
 {
-	/* Headless: accept the scanout binding but don't present anywhere. */
+	/*
+	 * Headless: accept the scanout binding but don't present anywhere.
+	 * Under scanout_probe we still record what the guest bound, so
+	 * RESOURCE_FLUSH knows which resource is the display and how big it
+	 * is.  resource_id 0 unbinds.
+	 */
+	if (sc->vsc_scanout_probe && cmd != NULL) {
+		sc->vsc_scanout_res = cmd->resource_id;
+		sc->vsc_scanout_w = cmd->r.width;
+		sc->vsc_scanout_h = cmd->r.height;
+		if (cmd->resource_id != 0) {
+			size_t need = (size_t)cmd->r.width * cmd->r.height * 4;
+
+			if (need > sc->vsc_scanout_bufsz) {
+				free(sc->vsc_scanout_buf);
+				sc->vsc_scanout_buf = malloc(need);
+				sc->vsc_scanout_bufsz =
+				    sc->vsc_scanout_buf ? need : 0;
+			}
+			EPRINTLN("vtgpu: scanout %u bound to res=%u %ux%u "
+			    "(%zu KiB readback)", cmd->scanout_id,
+			    cmd->resource_id, cmd->r.width, cmd->r.height,
+			    need / 1024);
+		}
+	}
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 	    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
 }
@@ -600,12 +643,64 @@ vtgpu_cmd_set_scanout(struct vtgpu_softc *sc, struct vqueue_info *vq,
 static void
 vtgpu_cmd_resource_flush(struct vtgpu_softc *sc, struct vqueue_info *vq,
     const struct virtio_gpu_ctrl_hdr *hdr, uint16_t chain_idx,
-    struct iovec *wiov, int nwiov)
+    const struct virtio_gpu_resource_flush *cmd, struct iovec *wiov, int nwiov)
 {
 	/*
-	 * Headless: the "scanout" is whatever RDP grabs from the guest's
-	 * own framebuffer; we don't blit anywhere on the host side.
+	 * Headless: nothing is presented.  Under scanout_probe, read the
+	 * scanout resource back into a host buffer and time it -- that read
+	 * is the per-frame cost a host-side present would pay, and it is the
+	 * one number worth having before building a display path on it.
 	 */
+	if (sc->vsc_scanout_probe && cmd != NULL &&
+	    cmd->resource_id != 0 &&
+	    cmd->resource_id == sc->vsc_scanout_res &&
+	    sc->vsc_scanout_buf != NULL) {
+		struct virgl_box box = {
+			.x = 0, .y = 0, .z = 0,
+			.w = sc->vsc_scanout_w, .h = sc->vsc_scanout_h, .d = 1,
+		};
+		struct iovec iov = {
+			.iov_base = sc->vsc_scanout_buf,
+			.iov_len = (size_t)sc->vsc_scanout_w *
+			    sc->vsc_scanout_h * 4,
+		};
+		struct timespec t0, t1;
+		uint64_t ns;
+		int ret;
+
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		ret = virgl_renderer_transfer_read_iov(cmd->resource_id, 0, 0,
+		    sc->vsc_scanout_w * 4, 0, &box, 0, &iov, 1);
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+
+		if (ret != 0) {
+			if (sc->vsc_ro_fail++ == 0)
+				EPRINTLN("vtgpu: scanout readback res=%u "
+				    "FAILED ret=%d (reported once)",
+				    cmd->resource_id, ret);
+		} else {
+			ns = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ULL +
+			    (t1.tv_nsec - t0.tv_nsec);
+			if (sc->vsc_ro_n == 0 || ns < sc->vsc_ro_min)
+				sc->vsc_ro_min = ns;
+			if (ns > sc->vsc_ro_max)
+				sc->vsc_ro_max = ns;
+			sc->vsc_ro_ns += ns;
+			if ((++sc->vsc_ro_n % 60) == 0)
+				EPRINTLN("vtgpu: scanout readback %ux%u n=%ju "
+				    "avg=%juus min=%juus max=%juus "
+				    "(avg caps ~%ju fps)",
+				    sc->vsc_scanout_w, sc->vsc_scanout_h,
+				    (uintmax_t)sc->vsc_ro_n,
+				    (uintmax_t)(sc->vsc_ro_ns /
+					sc->vsc_ro_n / 1000),
+				    (uintmax_t)(sc->vsc_ro_min / 1000),
+				    (uintmax_t)(sc->vsc_ro_max / 1000),
+				    (uintmax_t)(sc->vsc_ro_ns ?
+					1000000000ULL /
+					(sc->vsc_ro_ns / sc->vsc_ro_n) : 0));
+		}
+	}
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 	    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
 }
@@ -1290,12 +1385,16 @@ vtgpu_process_controlq(struct vtgpu_softc *sc, int qidx)
 		case VIRTIO_GPU_CMD_SET_SCANOUT:
 		case VIRTIO_GPU_CMD_SET_SCANOUT_BLOB:
 			vtgpu_cmd_set_scanout(sc, vq, hdr, req.idx,
+			    cmdlen >= sizeof(struct virtio_gpu_set_scanout) ?
+			    (const struct virtio_gpu_set_scanout *)hdr : NULL,
 			    wiov, nwiov);
 			break;
 
 		case VIRTIO_GPU_CMD_RESOURCE_FLUSH:
 			vtgpu_cmd_resource_flush(sc, vq, hdr, req.idx,
-			    wiov, nwiov);
+			    cmdlen >= sizeof(struct virtio_gpu_resource_flush) ?
+			    (const struct virtio_gpu_resource_flush *)hdr :
+			    NULL, wiov, nwiov);
 			break;
 
 		case VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D:
@@ -2220,6 +2319,8 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 		wayland_display = get_config_value_node(nvl, "wayland");
 		sc->vsc_venus   = get_config_bool_node_default(nvl, "venus",
 		    false);
+		sc->vsc_scanout_probe = get_config_bool_node_default(nvl,
+		    "scanout_probe", false);
 		pci_vtgpu_debug = get_config_bool_node_default(nvl, "debug",
 		    false);
 	}
