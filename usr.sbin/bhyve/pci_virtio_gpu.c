@@ -171,6 +171,10 @@ struct virgl_box {
  * virtio SHARED_MEMORY cap with shmid VIRTIO_GPU_SHM_ID_HOST_VISIBLE so the
  * guest kernel reports "+host_visible" and the venus ICD will attach.
  */
+/* virgl_hw.h resource bind bits we care about here. */
+#define	VTGPU_BIND_SCANOUT	(1u << 18)
+#define	VTGPU_BIND_LINEAR	(1u << 22)
+
 #define	VTGPU_HOSTVIS_BAR	2		/* MEM64 -> consumes BARs 2 and 3 */
 /*
  * Size of the host-visible window, and therefore the size of the only
@@ -324,6 +328,7 @@ struct vtgpu_softc {
 	 */
 	struct gpu_display	*vsc_display;
 	bool			vsc_scanout_probe;
+	bool			vsc_scanout_linear;
 	uint32_t		vsc_scanout_res;	/* 0 = none bound */
 	uint32_t		vsc_scanout_w;
 	uint32_t		vsc_scanout_h;
@@ -548,11 +553,29 @@ vtgpu_cmd_resource_create_3d(struct vtgpu_softc *sc, struct vqueue_info *vq,
     const struct virtio_gpu_resource_create_3d *cmd,
     struct iovec *wiov, int nwiov)
 {
+	uint32_t bind = cmd->bind;
+
+	/*
+	 * A resource the guest will scan out is one we may have to hand to a
+	 * host compositor as a dma_buf, and the host allocates render targets
+	 * compressed: on RDNA3 that means DCC, whose parameters live in a
+	 * format modifier virglrenderer does not report -- it returns
+	 * DRM_FORMAT_MOD_INVALID whatever the guest does.  An importer that
+	 * cannot know the layout reads the compressed blocks as pixels, which
+	 * is exactly the periodic corruption observed.
+	 *
+	 * Asking for it linear costs some render bandwidth and removes the
+	 * guesswork entirely.  Only worth doing when a viewer is attached, so
+	 * it is opt-in.
+	 */
+	if (sc->vsc_scanout_linear && (bind & VTGPU_BIND_SCANOUT) != 0)
+		bind |= VTGPU_BIND_LINEAR;
+
 	struct virgl_renderer_resource_create_args args = {
 		.handle         = cmd->resource_id,
 		.target         = cmd->target,
 		.format         = cmd->format,
-		.bind           = cmd->bind,
+		.bind           = bind,
 		.width          = cmd->width,
 		.height         = cmd->height,
 		.depth          = cmd->depth,
@@ -562,6 +585,15 @@ vtgpu_cmd_resource_create_3d(struct vtgpu_softc *sc, struct vqueue_info *vq,
 		.flags          = cmd->flags,
 	};
 	int ret = virgl_renderer_resource_create(&args, NULL, 0);
+	/*
+	 * Scanout-capable resources are rare -- a couple per mode set -- so
+	 * report them unconditionally: whether the guest asks for SCANOUT at
+	 * all decides whether forcing linear can work.
+	 */
+	if ((cmd->bind & VTGPU_BIND_SCANOUT) != 0)
+		EPRINTLN("vtgpu: create_3d id=%u SCANOUT bind=0x%x->0x%x "
+		    "fmt=%u %ux%u ret=%d", cmd->resource_id, cmd->bind, bind,
+		    cmd->format, cmd->width, cmd->height, ret);
 	DPRINTF("create_3d id=%u tgt=%u fmt=%u bind=0x%x %ux%ux%u "
 	    "array=%u levels=%u samples=%u ctx=%u ret=%d",
 	    cmd->resource_id, cmd->target, cmd->format, cmd->bind,
@@ -2439,6 +2471,8 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 		    false);
 		sc->vsc_scanout_probe = get_config_bool_node_default(nvl,
 		    "scanout_probe", false);
+		sc->vsc_scanout_linear = get_config_bool_node_default(nvl,
+		    "scanout_linear", false);
 		{
 			const char *disp = get_config_value_node(nvl, "display");
 
