@@ -329,6 +329,15 @@ struct vtgpu_softc {
 	struct gpu_display	*vsc_display;
 	bool			vsc_scanout_probe;
 	bool			vsc_scanout_linear;
+	/*
+	 * Scanout resource ids already reported.  A page-flipping compositor
+	 * rebinds the scanout every frame -- sway alternates two buffers -- so
+	 * without this the probe would query virglrenderer and write two log
+	 * lines sixty times a second, on the worker thread, in the guest's
+	 * command path.  Each distinct buffer is worth describing once.
+	 */
+	uint32_t		vsc_seen_scanout[8];
+	unsigned		vsc_seen_n;
 	uint32_t		vsc_scanout_res;	/* 0 = none bound */
 	uint32_t		vsc_scanout_w;
 	uint32_t		vsc_scanout_h;
@@ -725,10 +734,22 @@ vtgpu_cmd_set_scanout(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	 * is.  resource_id 0 unbinds.
 	 */
 	if (sc->vsc_scanout_probe && cmd != NULL) {
+		bool seen = false;
+
+		for (unsigned i = 0; i < sc->vsc_seen_n; i++)
+			if (sc->vsc_seen_scanout[i] == cmd->resource_id) {
+				seen = true;
+				break;
+			}
+		if (!seen && cmd->resource_id != 0 &&
+		    sc->vsc_seen_n < nitems(sc->vsc_seen_scanout))
+			sc->vsc_seen_scanout[sc->vsc_seen_n++] =
+			    cmd->resource_id;
+
 		sc->vsc_scanout_res = cmd->resource_id;
 		sc->vsc_scanout_w = cmd->r.width;
 		sc->vsc_scanout_h = cmd->r.height;
-		if (cmd->resource_id != 0) {
+		if (cmd->resource_id != 0 && !seen) {
 			size_t need = (size_t)cmd->r.width * cmd->r.height * 4;
 
 			if (need > sc->vsc_scanout_bufsz) {
