@@ -632,7 +632,23 @@ vtgpu_scanout_publish(struct vtgpu_softc *sc,
 	struct gpu_display_scanout so;
 	int dfd = -1, stride = 0, offset = 0;
 
-	if (sc->vsc_display == NULL || !info->has_dmabuf_export)
+	if (sc->vsc_display == NULL)
+		return;
+
+	/*
+	 * A DRM compositor page-flips: sway alternates between two resources,
+	 * rebinding the scanout every frame.  Export each buffer once and
+	 * thereafter just say which one is on screen -- re-exporting would
+	 * hand over a fresh dma_buf fd sixty times a second to describe
+	 * memory the viewer already has.
+	 */
+	if (gpu_display_have_buffer(sc->vsc_display, cmd->resource_id)) {
+		gpu_display_frame(sc->vsc_display, cmd->resource_id, cmd->r.x,
+		    cmd->r.y, cmd->r.width, cmd->r.height);
+		return;
+	}
+
+	if (!info->has_dmabuf_export)
 		return;
 
 	if (virgl_renderer_get_fd_for_texture2(info->base.tex_id, &dfd,
@@ -643,6 +659,7 @@ vtgpu_scanout_publish(struct vtgpu_softc *sc,
 	}
 
 	memset(&so, 0, sizeof(so));
+	so.buffer_id = cmd->resource_id;
 	so.transport = GPU_DISPLAY_XPORT_DMABUF;
 	so.width = cmd->r.width;
 	so.height = cmd->r.height;
@@ -651,6 +668,8 @@ vtgpu_scanout_publish(struct vtgpu_softc *sc,
 	so.planes = (uint32_t)info->planes;
 	so.modifier = info->modifiers;
 	gpu_display_scanout(sc->vsc_display, &so, dfd);	/* consumes dfd */
+	gpu_display_frame(sc->vsc_display, cmd->resource_id, cmd->r.x,
+	    cmd->r.y, cmd->r.width, cmd->r.height);
 }
 
 static void
@@ -781,10 +800,16 @@ vtgpu_cmd_resource_flush(struct vtgpu_softc *sc, struct vqueue_info *vq,
 					(sc->vsc_ro_ns / sc->vsc_ro_n) : 0));
 		}
 	}
+	/*
+	 * Still forwarded for guests that draw into one resource and flush it
+	 * (the 2D/fbdev path), but a page-flipping compositor never gets here
+	 * -- for those the flip is SET_SCANOUT and the frame is reported from
+	 * vtgpu_scanout_publish() instead.
+	 */
 	if (sc->vsc_display != NULL && cmd != NULL &&
 	    cmd->resource_id == sc->vsc_scanout_res)
-		gpu_display_frame(sc->vsc_display, cmd->r.x, cmd->r.y,
-		    cmd->r.width, cmd->r.height);
+		gpu_display_frame(sc->vsc_display, cmd->resource_id, cmd->r.x,
+		    cmd->r.y, cmd->r.width, cmd->r.height);
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 	    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
 }

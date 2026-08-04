@@ -30,6 +30,7 @@
 #ifndef _GPU_DISPLAY_H_
 #define	_GPU_DISPLAY_H_
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #define	GPU_DISPLAY_VERSION	1
@@ -79,6 +80,7 @@ struct gpu_display_hello {
 /* Carries exactly one fd via SCM_RIGHTS. */
 struct gpu_display_scanout {
 	struct gpu_display_hdr	hdr;
+	uint32_t		buffer_id;	/* names this buffer for FRAME */
 	uint32_t		transport;	/* enum gpu_display_transport */
 	uint32_t		width;
 	uint32_t		height;
@@ -90,8 +92,15 @@ struct gpu_display_scanout {
 	uint64_t		size;		/* SHM only: bytes to map */
 };
 
+/*
+ * A compositor page-flips between a small set of buffers -- sway uses two --
+ * so each is exported once and named, and a flip is just a reference to one
+ * of them.  Re-exporting a dma_buf per frame would pass a new fd sixty times
+ * a second for no reason.
+ */
 struct gpu_display_frame {
 	struct gpu_display_hdr	hdr;
+	uint32_t		buffer_id;	/* which buffer is now scanned out */
 	uint32_t		x;
 	uint32_t		y;
 	uint32_t		w;
@@ -143,12 +152,19 @@ void	gpu_display_scanout(struct gpu_display *gd,
 	    const struct gpu_display_scanout *info, int fd);
 
 /*
- * Tell the viewer the scanout contents changed.  Called from the virtio-gpu
- * worker on RESOURCE_FLUSH, so it never blocks: if the viewer is not keeping
- * up the frame is dropped rather than stalling the guest.
+ * Tell the viewer which buffer is now on screen.  For a DRM page-flipping
+ * compositor this is driven by SET_SCANOUT, not RESOURCE_FLUSH: the flip IS
+ * the scanout change, and RESOURCE_FLUSH never arrives at all.
+ *
+ * Called from the virtio-gpu worker while it processes guest commands, so it
+ * never blocks -- a viewer that is not keeping up loses frames rather than
+ * stalling the guest.
  */
-void	gpu_display_frame(struct gpu_display *gd, uint32_t x, uint32_t y,
-	    uint32_t w, uint32_t h);
+void	gpu_display_frame(struct gpu_display *gd, uint32_t buffer_id,
+	    uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+
+/* Has this buffer already been exported to the viewer? */
+bool	gpu_display_have_buffer(struct gpu_display *gd, uint32_t buffer_id);
 
 void	gpu_display_unbind(struct gpu_display *gd);
 

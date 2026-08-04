@@ -44,10 +44,19 @@ struct gpu_display {
 	struct mevent	*cevp;
 	char		*path;
 
-	/* Last scanout, replayed to a viewer that connects mid-session. */
-	bool		have_scanout;
-	struct gpu_display_scanout last;
-	int		last_fd;	/* dup kept for replay, -1 if none */
+	/*
+	 * Buffers already handed to the viewer.  A compositor cycles through a
+	 * couple of them, so they are exported once and thereafter referenced
+	 * by id; the fds are kept so a viewer connecting mid-session can be
+	 * given the whole set rather than waiting for a mode change.
+	 */
+#define	GPU_DISPLAY_MAX_BUFS	8
+	struct {
+		uint32_t		id;
+		bool			used;
+		struct gpu_display_scanout info;
+		int			fd;
+	}		bufs[GPU_DISPLAY_MAX_BUFS];
 
 	uint64_t	frames_sent;
 	uint64_t	frames_dropped;
@@ -237,18 +246,22 @@ gd_accept(int fd, enum ev_type ev __unused, void *arg)
 	}
 
 	/*
-	 * Replay the current scanout so a viewer that connects mid-session
-	 * gets a picture without waiting for the guest to rebind one, which
-	 * it may not do for a long time.
+	 * Replay every known buffer so a viewer connecting mid-session can
+	 * present the next flip immediately instead of waiting for the guest
+	 * to allocate a new one, which it may never do.
 	 */
-	if (gd->have_scanout && gd->last_fd >= 0) {
-		int dup_fd = dup(gd->last_fd);
+	for (size_t i = 0; i < GPU_DISPLAY_MAX_BUFS; i++) {
+		int dup_fd;
 
-		if (dup_fd >= 0) {
-			if (!gd_send(gd, &gd->last, sizeof(gd->last), dup_fd))
-				gd_drop_client(gd);
-			close(dup_fd);
-		}
+		if (!gd->bufs[i].used || gd->bufs[i].fd < 0)
+			continue;
+		dup_fd = dup(gd->bufs[i].fd);
+		if (dup_fd < 0)
+			continue;
+		if (!gd_send(gd, &gd->bufs[i].info, sizeof(gd->bufs[i].info),
+		    dup_fd))
+			gd_drop_client(gd);
+		close(dup_fd);
 	}
 	EPRINTLN("gpu_display: viewer connected on %s", gd->path);
 	pthread_mutex_unlock(&gd->mtx);
@@ -269,7 +282,8 @@ gpu_display_init(const char *path)
 	if (gd == NULL)
 		return (NULL);
 	gd->cfd = -1;
-	gd->last_fd = -1;
+	for (size_t i = 0; i < GPU_DISPLAY_MAX_BUFS; i++)
+		gd->bufs[i].fd = -1;
 	pthread_mutex_init(&gd->mtx, NULL);
 
 	gd->lfd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -310,11 +324,31 @@ fail:
 	return (NULL);
 }
 
+bool
+gpu_display_have_buffer(struct gpu_display *gd, uint32_t buffer_id)
+{
+	bool found = false;
+
+	if (gd == NULL)
+		return (true);	/* nothing to publish to */
+
+	pthread_mutex_lock(&gd->mtx);
+	for (size_t i = 0; i < GPU_DISPLAY_MAX_BUFS; i++) {
+		if (gd->bufs[i].used && gd->bufs[i].id == buffer_id) {
+			found = true;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&gd->mtx);
+	return (found);
+}
+
 void
 gpu_display_scanout(struct gpu_display *gd, const struct gpu_display_scanout *info,
     int fd)
 {
 	struct gpu_display_scanout msg;
+	size_t slot;
 
 	if (gd == NULL) {
 		if (fd >= 0)
@@ -328,12 +362,25 @@ gpu_display_scanout(struct gpu_display *gd, const struct gpu_display_scanout *in
 
 	pthread_mutex_lock(&gd->mtx);
 
-	/* Keep it for replay to a viewer that connects later. */
-	if (gd->last_fd >= 0)
-		close(gd->last_fd);
-	gd->last_fd = fd >= 0 ? dup(fd) : -1;
-	gd->last = msg;
-	gd->have_scanout = true;
+	/* Reuse the slot for this id, else take a free one, else the oldest. */
+	slot = GPU_DISPLAY_MAX_BUFS;
+	for (size_t i = 0; i < GPU_DISPLAY_MAX_BUFS; i++) {
+		if (gd->bufs[i].used && gd->bufs[i].id == msg.buffer_id) {
+			slot = i;
+			break;
+		}
+		if (!gd->bufs[i].used && slot == GPU_DISPLAY_MAX_BUFS)
+			slot = i;
+	}
+	if (slot == GPU_DISPLAY_MAX_BUFS)
+		slot = 0;
+
+	if (gd->bufs[slot].used && gd->bufs[slot].fd >= 0)
+		close(gd->bufs[slot].fd);
+	gd->bufs[slot].id = msg.buffer_id;
+	gd->bufs[slot].info = msg;
+	gd->bufs[slot].fd = fd >= 0 ? dup(fd) : -1;
+	gd->bufs[slot].used = true;
 
 	if (gd->cfd >= 0 && !gd_send(gd, &msg, sizeof(msg), fd))
 		gd_drop_client(gd);
@@ -344,8 +391,8 @@ gpu_display_scanout(struct gpu_display *gd, const struct gpu_display_scanout *in
 }
 
 void
-gpu_display_frame(struct gpu_display *gd, uint32_t x, uint32_t y, uint32_t w,
-    uint32_t h)
+gpu_display_frame(struct gpu_display *gd, uint32_t buffer_id, uint32_t x,
+    uint32_t y, uint32_t w, uint32_t h)
 {
 	struct gpu_display_frame msg;
 
@@ -355,6 +402,7 @@ gpu_display_frame(struct gpu_display *gd, uint32_t x, uint32_t y, uint32_t w,
 	memset(&msg, 0, sizeof(msg));
 	msg.hdr.type = GPU_DISPLAY_MSG_FRAME;
 	msg.hdr.len = sizeof(msg);
+	msg.buffer_id = buffer_id;
 	msg.x = x;
 	msg.y = y;
 	msg.w = w;
@@ -391,10 +439,11 @@ gpu_display_unbind(struct gpu_display *gd)
 	hdr.len = sizeof(hdr);
 
 	pthread_mutex_lock(&gd->mtx);
-	gd->have_scanout = false;
-	if (gd->last_fd >= 0) {
-		close(gd->last_fd);
-		gd->last_fd = -1;
+	for (size_t i = 0; i < GPU_DISPLAY_MAX_BUFS; i++) {
+		if (gd->bufs[i].used && gd->bufs[i].fd >= 0)
+			close(gd->bufs[i].fd);
+		gd->bufs[i].used = false;
+		gd->bufs[i].fd = -1;
 	}
 	if (gd->cfd >= 0 && !gd_send(gd, &hdr, sizeof(hdr), -1))
 		gd_drop_client(gd);
