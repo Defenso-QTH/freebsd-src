@@ -666,7 +666,16 @@ vtgpu_scanout_publish(struct vtgpu_softc *sc,
 	so.stride = stride != 0 ? (uint32_t)stride : info->base.stride;
 	so.drm_fourcc = (uint32_t)info->base.drm_fourcc;
 	so.planes = (uint32_t)info->planes;
+	/*
+	 * The texture need not start at byte 0 of the dma_buf; dropping this
+	 * makes every row read from the wrong place.
+	 */
+	so.offset = (uint32_t)offset;
 	so.modifier = info->modifiers;
+	EPRINTLN("vtgpu: scanout res=%u published fourcc=0x%08x stride=%u "
+	    "offset=%d planes=%d modifier=0x%016jx", cmd->resource_id,
+	    so.drm_fourcc, so.stride, offset, info->planes,
+	    (uintmax_t)info->modifiers);
 	gpu_display_scanout(sc->vsc_display, &so, dfd);	/* consumes dfd */
 	gpu_display_frame(sc->vsc_display, cmd->resource_id, cmd->r.x,
 	    cmd->r.y, cmd->r.width, cmd->r.height);

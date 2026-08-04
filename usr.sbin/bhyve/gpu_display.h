@@ -87,7 +87,7 @@ struct gpu_display_scanout {
 	uint32_t		stride;
 	uint32_t		drm_fourcc;	/* DMABUF only */
 	uint32_t		planes;		/* DMABUF only */
-	uint32_t		pad;
+	uint32_t		offset;		/* DMABUF: byte offset of plane 0 */
 	uint64_t		modifier;	/* DMABUF only */
 	uint64_t		size;		/* SHM only: bytes to map */
 };
