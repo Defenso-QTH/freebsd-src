@@ -384,6 +384,8 @@ struct vtgpu_softc {
 	 * a few pages.
 	 */
 	uint32_t		*vsc_res_ctx;
+	uint32_t		vsc_last_submit_ctx;
+	uint8_t			*vsc_res_reported;
 	uint32_t		vsc_scanout_res;	/* 0 = none bound */
 	uint32_t		vsc_scanout_w;
 	uint32_t		vsc_scanout_h;
@@ -458,6 +460,25 @@ vtgpu_note_res_ctx(struct vtgpu_softc *sc, uint32_t res_id, uint32_t ctx_id)
 
 	if (sc->vsc_res_ctx != NULL && res_id < VTGPU_RES_CTX_MAX)
 		sc->vsc_res_ctx[res_id] = ctx_id;
+}
+
+/*
+ * Report once per resource, not N times overall.  A global cap of three was
+ * consumed by the two buffers the guest firmware presents before the
+ * compositor starts, so the resources actually being flipped -- the only ones
+ * in question -- produced no output at all and their behaviour was
+ * indistinguishable from silence.
+ */
+static void
+vtgpu_report_res(struct vtgpu_softc *sc, uint32_t res_id, const char *what)
+{
+
+	if (sc->vsc_res_reported == NULL || res_id >= VTGPU_RES_CTX_MAX)
+		return;
+	if (sc->vsc_res_reported[res_id])
+		return;
+	sc->vsc_res_reported[res_id] = 1;
+	EPRINTLN("vtgpu: frame res=%u %s", res_id, what);
 }
 
 static uint32_t
@@ -779,12 +800,10 @@ vtgpu_publish_fenced(struct vtgpu_softc *sc, uint32_t res_id,
 		return;
 
 	ctx_id = vtgpu_res_ctx(sc, res_id);
+	if (ctx_id == 0)
+		ctx_id = sc->vsc_last_submit_ctx;
 	if (ctx_id == 0) {
-		if (sc->vsc_fence_reports < 3) {
-			sc->vsc_fence_reports++;
-			EPRINTLN("vtgpu: frame res=%u has no recorded context, "
-			    "publishing unfenced", res_id);
-		}
+		vtgpu_report_res(sc, res_id, "publishing unfenced: no context");
 		goto publish_now;
 	}
 
@@ -797,15 +816,17 @@ vtgpu_publish_fenced(struct vtgpu_softc *sc, uint32_t res_id,
 	if ((vp = calloc(1, sizeof(*vp))) == NULL)
 		goto publish_now;
 
+
 	vp->vp_fence_id = fid;
 	vp->vp_res_id   = res_id;
 	vp->vp_x = x; vp->vp_y = y; vp->vp_w = w; vp->vp_h = h;
 	TAILQ_INSERT_TAIL(&sc->vsc_pubs, vp, vp_link);
 
-	if (sc->vsc_fence_reports < 3) {
-		sc->vsc_fence_reports++;
-		EPRINTLN("vtgpu: deferring frame res=%u until fence %u on "
-		    "ctx=%u retires", res_id, fid, ctx_id);
+	if (sc->vsc_res_reported != NULL && res_id < VTGPU_RES_CTX_MAX &&
+	    !sc->vsc_res_reported[res_id]) {
+		sc->vsc_res_reported[res_id] = 1;
+		EPRINTLN("vtgpu: frame res=%u deferred until fence on ctx=%u "
+		    "retires", res_id, ctx_id);
 	}
 	return;
 
@@ -1630,6 +1651,15 @@ vtgpu_cmd_submit_3d(struct vtgpu_softc *sc, struct vqueue_info *vq,
 {
 	int ret = virgl_renderer_submit_cmd((void *)(uintptr_t)buf,
 	    (int)hdr->ctx_id, cmd->size / 4);
+	/*
+	 * The context that renders a scanout is not the one that created it:
+	 * RESOURCE_CREATE_3D comes from the guest kernel on ctx 0, while the
+	 * drawing is submitted by the compositor's context.  Remember it, so
+	 * a frame whose resource has no creating context can still be fenced
+	 * against whoever last drew.
+	 */
+	if (ret == 0 && hdr->ctx_id != 0)
+		sc->vsc_last_submit_ctx = hdr->ctx_id;
 	DPRINTF("submit_3d ctx=%u size=%uB (%u dwords) ret=%d",
 	    hdr->ctx_id, cmd->size, cmd->size / 4, ret);
 	uint32_t type = ret ? VIRTIO_GPU_RESP_ERR_UNSPEC
@@ -2659,6 +2689,8 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 	TAILQ_INIT(&sc->vsc_fences);
 	TAILQ_INIT(&sc->vsc_pubs);
 	sc->vsc_res_ctx = calloc(VTGPU_RES_CTX_MAX, sizeof(*sc->vsc_res_ctx));
+	sc->vsc_res_reported = calloc(VTGPU_RES_CTX_MAX,
+	    sizeof(*sc->vsc_res_reported));
 
 	render_node     = NULL;
 	wayland_display = NULL;
