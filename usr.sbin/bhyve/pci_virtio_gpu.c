@@ -347,6 +347,7 @@ struct vtgpu_softc {
 	unsigned		vsc_seen_n;
 	/* Set by SET_SCANOUT, consumed by the response path. */
 	uint32_t		vsc_pending_publish;
+	unsigned		vsc_scanout_seen_total;
 	uint32_t		vsc_scanout_res;	/* 0 = none bound */
 	uint32_t		vsc_scanout_w;
 	uint32_t		vsc_scanout_h;
@@ -771,6 +772,20 @@ vtgpu_cmd_set_scanout(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	 */
 	if ((sc->vsc_scanout_probe || sc->vsc_display != NULL) && cmd != NULL) {
 		bool seen = false;
+
+		/*
+		 * Whether the guest fences these decides whether the publish
+		 * can be deferred to completion at all.  Report the first few
+		 * with their flags: if FENCE is never set, deferring is a
+		 * no-op and the ordering has to come from somewhere else.
+		 */
+		if (sc->vsc_scanout_seen_total++ < 3)
+			EPRINTLN("vtgpu: set_scanout #%u res=%u flags=0x%x "
+			    "fenced=%s fence_id=%ju",
+			    sc->vsc_scanout_seen_total, cmd->resource_id,
+			    hdr->flags,
+			    (hdr->flags & VIRTIO_GPU_FLAG_FENCE) ? "YES" : "no",
+			    (uintmax_t)hdr->fence_id);
 
 		for (unsigned i = 0; i < sc->vsc_seen_n; i++)
 			if (sc->vsc_seen_scanout[i] == cmd->resource_id) {
