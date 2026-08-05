@@ -396,6 +396,7 @@ struct vtgpu_softc {
 	uint32_t		*vsc_res_ctx;
 	uint32_t		vsc_last_submit_ctx;
 	uintmax_t		vsc_pub_late;
+	bool			vsc_defer_frames;
 	uint8_t			*vsc_res_reported;
 	uint32_t		vsc_scanout_res;	/* 0 = none bound */
 	uint32_t		vsc_scanout_w;
@@ -818,6 +819,25 @@ vtgpu_cmd_resource_unref(struct vtgpu_softc *sc, struct vqueue_info *vq,
  * hardware, and writing it before knowing would be guessing.
  */
 /*
+ * WARNING: disabled by default (frame_fence=on to enable), because it hangs
+ * the guest.
+ *
+ * The fences created here go on the guest's own contexts, and their ids come
+ * from a private range starting at 0x80000000 to keep them out of the way of
+ * the guest's.  That is precisely what breaks: virglrenderer retires fences
+ * in submission order per context and reports the last retired id, so a guest
+ * fence numbered after one of ours can be taken for already-retired and never
+ * signalled.  A guest fence that never signals is a guest blocked forever --
+ * observed as the entire display freezing, not just the application that was
+ * drawing.
+ *
+ * Fixing it needs a fence that orders against the guest's rendering without
+ * being injected into the guest's own fence sequence, which the current
+ * virglrenderer API does not obviously offer.  Left in place, off, because
+ * the diagnosis it produced is worth keeping: no frame ever exceeded the 50ms
+ * deadline, so these fences do retire promptly, and host-render completion is
+ * therefore not what makes the image double.
+ *
  * Publish a frame to the viewer once the host has finished rendering it.
  *
  * The guest is done when SET_SCANOUT arrives, but virglrenderer executes the
@@ -842,6 +862,12 @@ vtgpu_publish_fenced(struct vtgpu_softc *sc, uint32_t res_id,
 
 	if (sc->vsc_display == NULL)
 		return;
+
+	/*
+	 * Off unless explicitly asked for: see the warning above.
+	 */
+	if (!sc->vsc_defer_frames)
+		goto publish_now;
 
 	ctx_id = vtgpu_res_ctx(sc, res_id);
 	if (ctx_id == 0)
@@ -2013,8 +2039,10 @@ vtgpu_kq_setup(struct vtgpu_softc *sc)
 		sc->vsc_kq = -1;
 		return;
 	}
-	EPRINTLN("vtgpu: frame deferral active (timeout %dms)",
-	    VTGPU_PUB_TIMEOUT_MS);
+	if (sc->vsc_defer_frames)
+		EPRINTLN("vtgpu: frame deferral ENABLED (timeout %dms) -- "
+		    "known to hang the guest, see pci_virtio_gpu.c",
+		    VTGPU_PUB_TIMEOUT_MS);
 	EPRINTLN("vtgpu: event-driven wait active (fence fd=%d%s)",
 	    sc->vsc_poll_fd,
 	    sc->vsc_poll_fd < 0 ? ", queue kicks only" : "");
@@ -2767,6 +2795,8 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 		    "scanout_probe", false);
 		sc->vsc_scanout_linear = get_config_bool_node_default(nvl,
 		    "scanout_linear", false);
+		sc->vsc_defer_frames = get_config_bool_node_default(nvl,
+		    "frame_fence", false);
 		{
 			const char *disp = get_config_value_node(nvl, "display");
 
