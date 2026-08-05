@@ -374,11 +374,16 @@ struct vtgpu_softc {
 	 * be created on the context that did the drawing, and SET_SCANOUT
 	 * arrives on the control queue where ctx_id is not that context.
 	 */
-	struct {
-		uint32_t	res_id;
-		uint32_t	ctx_id;
-	}			vsc_scanout_ctx[8];
-	unsigned		vsc_scanout_ctx_n;
+	/*
+	 * res_id -> the context that created it, indexed directly.  An
+	 * eight-entry table keyed on scanout-bound 3D resources missed the
+	 * case that matters: a page-flipping compositor allocates its
+	 * scanouts as blobs through gbm, so nothing was ever recorded for
+	 * them and every frame went out unfenced.  Linux allocates resource
+	 * ids from a small IDA, so a flat array covers them for the cost of
+	 * a few pages.
+	 */
+	uint32_t		*vsc_res_ctx;
 	uint32_t		vsc_scanout_res;	/* 0 = none bound */
 	uint32_t		vsc_scanout_w;
 	uint32_t		vsc_scanout_h;
@@ -444,6 +449,25 @@ struct vtgpu_softc {
 	uint64_t		vsc_q_used[VTGPU_MAXQ];
 	uint16_t		vsc_q_enable[VTGPU_MAXQ];
 };
+
+#define	VTGPU_RES_CTX_MAX	4096
+
+static void
+vtgpu_note_res_ctx(struct vtgpu_softc *sc, uint32_t res_id, uint32_t ctx_id)
+{
+
+	if (sc->vsc_res_ctx != NULL && res_id < VTGPU_RES_CTX_MAX)
+		sc->vsc_res_ctx[res_id] = ctx_id;
+}
+
+static uint32_t
+vtgpu_res_ctx(const struct vtgpu_softc *sc, uint32_t res_id)
+{
+
+	if (sc->vsc_res_ctx == NULL || res_id >= VTGPU_RES_CTX_MAX)
+		return (0);
+	return (sc->vsc_res_ctx[res_id]);
+}
 
 /* ----------------------------------------------------------------------- */
 /* virglrenderer callbacks						   */
@@ -661,20 +685,7 @@ vtgpu_cmd_resource_create_3d(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	 * report them unconditionally: whether the guest asks for SCANOUT at
 	 * all decides whether forcing linear can work.
 	 */
-	if ((cmd->bind & VTGPU_BIND_SCANOUT) != 0) {
-		unsigned i;
-
-		for (i = 0; i < sc->vsc_scanout_ctx_n; i++)
-			if (sc->vsc_scanout_ctx[i].res_id == cmd->resource_id)
-				break;
-		if (i == sc->vsc_scanout_ctx_n &&
-		    i < nitems(sc->vsc_scanout_ctx))
-			sc->vsc_scanout_ctx_n++;
-		if (i < nitems(sc->vsc_scanout_ctx)) {
-			sc->vsc_scanout_ctx[i].res_id = cmd->resource_id;
-			sc->vsc_scanout_ctx[i].ctx_id = hdr->ctx_id;
-		}
-	}
+	vtgpu_note_res_ctx(sc, cmd->resource_id, hdr->ctx_id);
 	if ((cmd->bind & VTGPU_BIND_SCANOUT) != 0)
 		EPRINTLN("vtgpu: create_3d id=%u SCANOUT bind=0x%x->0x%x "
 		    "fmt=%u %ux%u ret=%d", cmd->resource_id, cmd->bind, bind,
@@ -761,19 +772,21 @@ static void
 vtgpu_publish_fenced(struct vtgpu_softc *sc, uint32_t res_id,
     uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
-	uint32_t ctx_id = 0, fid;
+	uint32_t ctx_id, fid;
 	struct vtgpu_pub *vp;
 
 	if (sc->vsc_display == NULL)
 		return;
 
-	for (unsigned i = 0; i < sc->vsc_scanout_ctx_n; i++)
-		if (sc->vsc_scanout_ctx[i].res_id == res_id) {
-			ctx_id = sc->vsc_scanout_ctx[i].ctx_id;
-			break;
+	ctx_id = vtgpu_res_ctx(sc, res_id);
+	if (ctx_id == 0) {
+		if (sc->vsc_fence_reports < 3) {
+			sc->vsc_fence_reports++;
+			EPRINTLN("vtgpu: frame res=%u has no recorded context, "
+			    "publishing unfenced", res_id);
 		}
-	if (ctx_id == 0)
 		goto publish_now;
+	}
 
 	if (sc->vsc_own_fence_next < VTGPU_OWN_FENCE_BASE)
 		sc->vsc_own_fence_next = VTGPU_OWN_FENCE_BASE;
@@ -1197,6 +1210,14 @@ vtgpu_cmd_resource_create_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	args.num_iovs   = n;
 
 	ret = virgl_renderer_resource_create_blob(&args);
+	/*
+	 * A page-flipping compositor allocates its scanouts here, not through
+	 * RESOURCE_CREATE_3D, so this is where the context that will render
+	 * into them gets recorded.  Without it every published frame goes out
+	 * unfenced.
+	 */
+	if (ret == 0)
+		vtgpu_note_res_ctx(sc, cmd->resource_id, hdr->ctx_id);
 	DPRINTF("create_blob id=%u mem=%u flags=0x%x blob_id=%lu size=%lu "
 	    "nr=%u ctx=%u ret=%d", cmd->resource_id, cmd->blob_mem,
 	    cmd->blob_flags, (unsigned long)cmd->blob_id,
@@ -2637,6 +2658,7 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 	sc->vsc_poll_fd = -1;
 	TAILQ_INIT(&sc->vsc_fences);
 	TAILQ_INIT(&sc->vsc_pubs);
+	sc->vsc_res_ctx = calloc(VTGPU_RES_CTX_MAX, sizeof(*sc->vsc_res_ctx));
 
 	render_node     = NULL;
 	wayland_display = NULL;
