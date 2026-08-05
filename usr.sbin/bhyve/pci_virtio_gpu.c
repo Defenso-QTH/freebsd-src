@@ -1999,7 +1999,8 @@ vtgpu_worker(void *arg)
 		while (sc->vsc_running &&
 		    !vq_has_descs(&sc->vsc_queues[VTGPU_CONTROLQ]) &&
 		    !vq_has_descs(&sc->vsc_queues[VTGPU_CURSORQ])) {
-			if (!TAILQ_EMPTY(&sc->vsc_fences)) {
+			if (!TAILQ_EMPTY(&sc->vsc_fences) ||
+			    !TAILQ_EMPTY(&sc->vsc_pubs)) {
 				/*
 				 * Fenced commands are awaiting GPU completion.
 				 * The guest may be blocked on one of those
@@ -2009,6 +2010,14 @@ vtgpu_worker(void *arg)
 				 * releases each chain as its fence fires).
 				 * Without this the guest hangs forever on the
 				 * first fenced submit/transfer.
+				 *
+				 * The same applies to frames held for their
+				 * rendering to complete: those fences also
+				 * only retire inside virgl_renderer_poll(),
+				 * and nothing obliges the guest to send more
+				 * work afterwards.  Waiting for a kick that
+				 * may never come left the display frozen
+				 * until the guest happened to draw again.
 				 */
 				sc->vsc_fwait++;
 				if (sc->vsc_kq >= 0) {
