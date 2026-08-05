@@ -81,6 +81,7 @@ struct virgl_box {
 #include "config.h"
 #include "debug.h"
 #include "pci_emul.h"
+#include "console.h"
 #include "gpu_display.h"
 #include "virtio.h"
 
@@ -2624,6 +2625,27 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 			 */
 			if (disp != NULL && strncmp(disp, "unix:", 5) == 0) {
 				sc->vsc_display = gpu_display_init(disp + 5);
+				/*
+				 * The USB tablet drops every event unless a
+				 * graphics context exists: umouse_event()
+				 * returns early when console_get_image() is
+				 * NULL, and scales the absolute coordinates it
+				 * reports against the image's dimensions.  The
+				 * fbuf device is what normally creates one, so
+				 * without graphics=yes the pointer is dead
+				 * while the PS/2 keyboard keeps working.
+				 *
+				 * Create one ourselves if nothing has, sized
+				 * to the scanout so the scaling comes out
+				 * right.  Only when the viewer is configured,
+				 * and only if fbuf has not already done it, so
+				 * that setups not using this option are
+				 * untouched.
+				 */
+				if (sc->vsc_display != NULL &&
+				    console_get_image() == NULL)
+					console_init((int)sc->vsc_width,
+					    (int)sc->vsc_height, NULL);
 			} else if (disp != NULL) {
 				EPRINTLN("vtgpu: display=%s not understood, "
 				    "expected unix:/path", disp);
