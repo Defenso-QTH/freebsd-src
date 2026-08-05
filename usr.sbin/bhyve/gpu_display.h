@@ -33,8 +33,15 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define	GPU_DISPLAY_VERSION	1
-#define	GPU_DISPLAY_MAX_MSG	4096	/* no message is near this */
+#define	GPU_DISPLAY_VERSION	2
+/*
+ * Large enough for a cursor image inline: 64x64 is the usual hardware cursor
+ * size and 128x128 is not unheard of, at 4 bytes a pixel.  Everything else is
+ * tiny.  Sending the pixels in the message rather than over a shared buffer
+ * keeps the cursor path free of fd lifetime rules for something updated a few
+ * times a second at most.
+ */
+#define	GPU_DISPLAY_MAX_MSG	(72 * 1024)
 
 enum gpu_display_msg_type {
 	/* host -> viewer */
@@ -42,10 +49,12 @@ enum gpu_display_msg_type {
 	GPU_DISPLAY_MSG_SCANOUT	= 2,	/* buffer handed over; carries an fd */
 	GPU_DISPLAY_MSG_FRAME	= 3,	/* contents changed; damage rect */
 	GPU_DISPLAY_MSG_UNBIND	= 4,	/* guest dropped the scanout */
+	GPU_DISPLAY_MSG_CURSOR	= 5,	/* hardware cursor image, or hide */
 
 	/* viewer -> host */
 	GPU_DISPLAY_MSG_KEY	= 128,
 	GPU_DISPLAY_MSG_PTR	= 129,
+	GPU_DISPLAY_MSG_RELEASE	= 130,	/* viewer has finished with a frame */
 };
 
 /*
@@ -74,6 +83,30 @@ struct gpu_display_hdr {
 struct gpu_display_hello {
 	struct gpu_display_hdr	hdr;
 	uint32_t		version;
+	uint32_t		pad;
+};
+
+/*
+ * Sent by the viewer once it has finished reading the buffer a FRAME named,
+ * which is the only thing that can tell the host the buffer is free again.
+ *
+ * It matters because the guest may present into a single buffer -- vkcube
+ * does -- and then nothing but this acknowledgement stands between the
+ * guest's next frame and the pixels being read.  Without it a guest
+ * rendering faster than the viewer draws overwrites the buffer mid-read and
+ * the result is a blend of several frames, seen as a doubled or torn image.
+ *
+ * Holding the guest's present until this arrives is ordinary flow control:
+ * it is what a real display does, and it paces the guest to what is actually
+ * being consumed rather than to a fixed rate guessed in advance.
+ *
+ * Optional, and detected rather than negotiated: the host holds nothing
+ * until it has seen one of these, so a viewer that never sends them behaves
+ * exactly as before instead of stalling for a timeout on every frame.
+ */
+struct gpu_display_release {
+	struct gpu_display_hdr	hdr;
+	uint32_t		buffer_id;	/* the buffer now free */
 	uint32_t		pad;
 };
 
@@ -146,6 +179,34 @@ struct gpu_display_ptr {
 	uint32_t		pad;
 };
 
+/*
+ * The guest's hardware cursor.
+ *
+ * A guest that uses the cursor plane never draws its pointer into the scanout,
+ * so without this the viewer shows no cursor at all -- the host compositor's
+ * own cursor is drawn over the surface and looks like one, which makes the
+ * absence easy to miss.
+ *
+ * No position is carried.  The viewer maps its pointer onto the guest one to
+ * one, so the host compositor already knows where the cursor is; handing it
+ * the image and letting it draw at the real pointer position is both simpler
+ * and lower latency than compositing at a position the guest reports after
+ * the fact.  MOVE_CURSOR therefore needs no message at all.
+ *
+ * hidden is set when the guest asks for no cursor (resource 0), in which case
+ * no pixels follow.
+ */
+struct gpu_display_cursor {
+	struct gpu_display_hdr	hdr;
+	uint32_t		width;
+	uint32_t		height;
+	uint32_t		hot_x;
+	uint32_t		hot_y;
+	uint32_t		hidden;
+	uint32_t		pad;
+	/* width * height * 4 bytes of ARGB8888 follow, unless hidden */
+};
+
 struct gpu_display;
 
 /*
@@ -155,6 +216,14 @@ struct gpu_display;
  * booting.
  */
 struct gpu_display *gpu_display_init(const char *path);
+
+/*
+ * Publish the guest's hardware cursor.  pixels is width*height ARGB8888, or
+ * NULL to hide the cursor.  The data is copied; the caller keeps ownership.
+ */
+void	gpu_display_cursor(struct gpu_display *gd, uint32_t width,
+	    uint32_t height, uint32_t hot_x, uint32_t hot_y,
+	    const void *pixels);
 
 /*
  * Hand the current scanout buffer to the viewer.  fd is consumed (closed)
@@ -178,6 +247,17 @@ void	gpu_display_scanout(struct gpu_display *gd,
  */
 void	gpu_display_frame(struct gpu_display *gd, uint32_t buffer_id,
 	    int fence_fd, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+
+/*
+ * Register the callback run when the viewer releases a buffer.  It fires on
+ * the mevent thread, not the virtio-gpu worker, so the callee is responsible
+ * for its own locking.  Passing NULL unregisters.
+ */
+void	gpu_display_set_release_cb(struct gpu_display *gd,
+	    void (*cb)(void *arg, uint32_t buffer_id), void *arg);
+
+/* Whether a viewer is currently attached. */
+bool	gpu_display_connected(struct gpu_display *gd);
 
 /* Has this buffer already been exported to the viewer? */
 bool	gpu_display_have_buffer(struct gpu_display *gd, uint32_t buffer_id);

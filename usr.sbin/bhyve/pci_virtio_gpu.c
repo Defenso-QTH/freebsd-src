@@ -68,7 +68,6 @@
  * If it ever disappears the build breaks loudly rather than silently, and the
  * fallback is simply not to fence.
  */
-#define	VIRGL_RENDERER_UNSTABLE_APIS 1
 #include <virglrenderer.h>
 
 /* virgl_protocol.h is not installed by the virglrenderer port; define here. */
@@ -288,6 +287,33 @@ struct vtgpu_fence {
  */
 #define	VTGPU_KQ_BACKSTOP_MS	1
 
+/* A SET_SCANOUT completion held back to pace the guest to a refresh rate. */
+struct vtgpu_paced {
+	TAILQ_ENTRY(vtgpu_paced)	vp_link;
+	struct vqueue_info		*vp_vq;
+	uint16_t			vp_idx;
+	uint32_t			vp_resp_len;
+	struct timespec			vp_due;
+};
+
+/* A frame held back until the host finishes rendering into its buffer. */
+struct vtgpu_pub {
+	TAILQ_ENTRY(vtgpu_pub)	vp_link;
+	uint32_t		vp_fence_id;
+	uint32_t		vp_res_id;
+	uint32_t		vp_x, vp_y, vp_w, vp_h;
+	struct timespec		vp_when;
+};
+
+/*
+ * How long a frame may be held waiting for its fence before it is published
+ * anyway.  A deferral that never completes is indistinguishable from a frozen
+ * display, and a stale frame on screen is a far better failure than no frames
+ * at all -- so the wait has a deadline, and crossing it is reported rather
+ * than hidden.
+ */
+#define	VTGPU_PUB_TIMEOUT_MS	50
+
 struct vtgpu_softc {
 	struct virtio_softc	vsc_vs;
 	struct virtio_gpu_config vsc_cfg;
@@ -361,16 +387,106 @@ struct vtgpu_softc {
 	unsigned		vsc_scanout_seen_total;
 	uint32_t		vsc_own_fence_next;
 	unsigned		vsc_fence_reports;
+	unsigned		vsc_cursor_errs;
+	bool			vsc_cursor_seen;
+	TAILQ_HEAD(, vtgpu_pub)	vsc_pubs;
 	/*
 	 * Context that created each scanout-capable resource.  A fence has to
 	 * be created on the context that did the drawing, and SET_SCANOUT
 	 * arrives on the control queue where ctx_id is not that context.
 	 */
-	struct {
-		uint32_t	res_id;
-		uint32_t	ctx_id;
-	}			vsc_scanout_ctx[8];
-	unsigned		vsc_scanout_ctx_n;
+	/*
+	 * res_id -> the context that created it, indexed directly.  An
+	 * eight-entry table keyed on scanout-bound 3D resources missed the
+	 * case that matters: a page-flipping compositor allocates its
+	 * scanouts as blobs through gbm, so nothing was ever recorded for
+	 * them and every frame went out unfenced.  Linux allocates resource
+	 * ids from a small IDA, so a flat array covers them for the cost of
+	 * a few pages.
+	 */
+	uint32_t		*vsc_res_ctx;
+	uint32_t		vsc_last_submit_ctx;
+	uintmax_t		vsc_pub_late;
+	bool			vsc_defer_frames;
+	/*
+	 * Flip pacing.  Zero (the default) completes SET_SCANOUT immediately,
+	 * which is what a guest sees as "the flip is already done" -- so
+	 * nothing throttles it and it renders as fast as the host GPU allows.
+	 * A guest measured at 1014 frames a second against a 60Hz display
+	 * wastes almost all of that work, and successive displayed frames end
+	 * up far enough apart in a per-frame animation that they read as two
+	 * overlapping images.
+	 */
+	unsigned		vsc_refresh_hz;
+	struct timespec		vsc_next_flip;
+	TAILQ_HEAD(, vtgpu_paced) vsc_paced;
+	uintmax_t		vsc_paced_n;
+	/*
+	 * Release-driven flow control.  The guest's present is held until the
+	 * viewer says it has finished reading the frame, which is the only
+	 * thing that keeps a guest presenting into a single buffer from
+	 * overwriting it while it is being read.
+	 *
+	 * vsc_release_ok stays false until a release actually arrives, so an
+	 * older viewer -- which never sends them -- is never held for.
+	 */
+	TAILQ_HEAD(, vtgpu_paced) vsc_awaits;
+	bool			vsc_release_ok;
+	unsigned		vsc_inflight;	/* published, not yet released */
+	uintmax_t		vsc_await_late;
+	unsigned		vsc_awaits_n;
+	struct timespec		vsc_last_release;
+	struct timespec		vsc_last_drain;
+	/*
+	 * vsc_inflight counts presents since the viewer last finished a draw,
+	 * and a release resets it rather than decrementing it.
+	 *
+	 * Decrementing made it a running balance of frames sent against
+	 * frames acknowledged, which is the wrong quantity: the guest
+	 * presents into a single buffer far faster than the viewer draws, so
+	 * most frames are coalesced away and never drawn.  Acknowledging
+	 * those let the guest go again immediately -- 437 presents a second
+	 * against 60 draws -- and not acknowledging them made the balance run
+	 * away until every present sat out its timeout.  Neither paces
+	 * anything.  What the guest may do is bounded by draws, so count from
+	 * the last one.
+	 */
+	/*
+	 * The resources the guest published into most recently, used to tell
+	 * how many buffers it is actually cycling through right now.
+	 *
+	 * It must be a window, not a lifetime tally: a desktop binds a fresh
+	 * scanout resource whenever the surface being displayed changes, so
+	 * counting every resource ever seen says "four buffers" for a guest
+	 * that is presenting into one, and then permits three frames in
+	 * flight against a single buffer -- which is the race this is
+	 * supposed to close.
+	 */
+#define	VTGPU_RECENT_PUBS	8
+	uint32_t		vsc_recent_res[VTGPU_RECENT_PUBS];
+	unsigned		vsc_recent_n;	/* valid entries, <= the ring */
+	unsigned		vsc_recent_i;	/* write cursor */
+	/*
+	 * Why a present was or was not held, reported once a second.
+	 *
+	 * Two guesses at this have already been wrong, and the counters that
+	 * would have settled either in one run cost nothing to keep: which
+	 * command actually carries the flip, whether the guest fences it, and
+	 * whether holding the response throttles the guest at all.
+	 */
+	uintmax_t		vsc_d_scanout;	/* published from SET_SCANOUT */
+	uintmax_t		vsc_d_flush;	/* published from RESOURCE_FLUSH */
+	uintmax_t		vsc_d_fenced;	/* present carried FLAG_FENCE */
+	uintmax_t		vsc_d_held;	/* held for the viewer */
+	uintmax_t		vsc_d_under;	/* under the in-flight limit */
+	uintmax_t		vsc_d_noview;	/* no viewer attached */
+	uintmax_t		vsc_d_noack;	/* viewer has never released */
+	uintmax_t		vsc_d_rel;	/* releases received */
+	uintmax_t		vsc_d_dump;	/* frames let through on silence */
+	uintmax_t		vsc_d_capped;	/* not held: backlog at the cap */
+	long			vsc_d_relgap;	/* longest gap between releases */
+	struct timespec		vsc_d_when;
+	uint8_t			*vsc_res_reported;
 	uint32_t		vsc_scanout_res;	/* 0 = none bound */
 	uint32_t		vsc_scanout_w;
 	uint32_t		vsc_scanout_h;
@@ -437,6 +553,435 @@ struct vtgpu_softc {
 	uint16_t		vsc_q_enable[VTGPU_MAXQ];
 };
 
+#define	VTGPU_RES_CTX_MAX	4096
+
+static void
+vtgpu_note_res_ctx(struct vtgpu_softc *sc, uint32_t res_id, uint32_t ctx_id)
+{
+
+	if (sc->vsc_res_ctx != NULL && res_id < VTGPU_RES_CTX_MAX)
+		sc->vsc_res_ctx[res_id] = ctx_id;
+}
+
+/*
+ * Report once per resource, not N times overall.  A global cap of three was
+ * consumed by the two buffers the guest firmware presents before the
+ * compositor starts, so the resources actually being flipped -- the only ones
+ * in question -- produced no output at all and their behaviour was
+ * indistinguishable from silence.
+ */
+static void
+vtgpu_report_res(struct vtgpu_softc *sc, uint32_t res_id, const char *what)
+{
+
+	if (sc->vsc_res_reported == NULL || res_id >= VTGPU_RES_CTX_MAX)
+		return;
+	if (sc->vsc_res_reported[res_id])
+		return;
+	sc->vsc_res_reported[res_id] = 1;
+	EPRINTLN("vtgpu: frame res=%u %s", res_id, what);
+}
+
+static uint32_t
+vtgpu_res_ctx(const struct vtgpu_softc *sc, uint32_t res_id)
+{
+
+	if (sc->vsc_res_ctx == NULL || res_id >= VTGPU_RES_CTX_MAX)
+		return (0);
+	return (sc->vsc_res_ctx[res_id]);
+}
+
+/* Defined with the flow-control code below; used from here on. */
+static void vtgpu_note_pub(struct vtgpu_softc *sc, uint32_t res_id);
+
+/*
+ * Publish any frame whose fence has not retired in time.  Called after every
+ * virgl_renderer_poll(): if fences are retiring normally this finds nothing.
+ */
+static void
+vtgpu_pubs_expire(struct vtgpu_softc *sc)
+{
+	struct vtgpu_pub *vp, *tmp;
+	struct timespec now;
+
+	if (TAILQ_EMPTY(&sc->vsc_pubs))
+		return;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	TAILQ_FOREACH_SAFE(vp, &sc->vsc_pubs, vp_link, tmp) {
+		long ms = (now.tv_sec - vp->vp_when.tv_sec) * 1000 +
+		    (now.tv_nsec - vp->vp_when.tv_nsec) / 1000000;
+
+		if (ms < VTGPU_PUB_TIMEOUT_MS)
+			continue;
+		TAILQ_REMOVE(&sc->vsc_pubs, vp, vp_link);
+		if (sc->vsc_display != NULL) {
+			gpu_display_frame(sc->vsc_display, vp->vp_res_id, -1,
+			    vp->vp_x, vp->vp_y, vp->vp_w, vp->vp_h);
+			sc->vsc_inflight++;
+			vtgpu_note_pub(sc, vp->vp_res_id);
+		}
+		if (sc->vsc_pub_late++ % 256 == 0)
+			EPRINTLN("vtgpu: frame res=%u fence %u did not retire "
+			    "in %ldms, published anyway (late=%ju)",
+			    vp->vp_res_id, vp->vp_fence_id, ms,
+			    (uintmax_t)sc->vsc_pub_late);
+		free(vp);
+	}
+}
+
+static bool
+vtgpu_ts_reached(const struct timespec *due, const struct timespec *now)
+{
+
+	return (now->tv_sec > due->tv_sec ||
+	    (now->tv_sec == due->tv_sec && now->tv_nsec >= due->tv_nsec));
+}
+
+/*
+ * Complete any paced flip whose time has come.  Returns milliseconds until
+ * the next one is due, or -1 if none are waiting, so the worker can size its
+ * sleep instead of spinning.
+ */
+static int
+vtgpu_paced_expire(struct vtgpu_softc *sc)
+{
+	struct vtgpu_paced *pp, *tmp;
+	struct vqueue_info *last_vq = NULL;
+	struct timespec now;
+	long ms;
+
+	if (TAILQ_EMPTY(&sc->vsc_paced))
+		return (-1);
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	TAILQ_FOREACH_SAFE(pp, &sc->vsc_paced, vp_link, tmp) {
+		if (!vtgpu_ts_reached(&pp->vp_due, &now))
+			break;		/* queued in due order */
+		TAILQ_REMOVE(&sc->vsc_paced, pp, vp_link);
+		vq_relchain(pp->vp_vq, pp->vp_idx, pp->vp_resp_len);
+		last_vq = pp->vp_vq;
+		free(pp);
+	}
+	if (last_vq != NULL)
+		vq_endchains(last_vq, 0);
+
+	pp = TAILQ_FIRST(&sc->vsc_paced);
+	if (pp == NULL)
+		return (-1);
+	ms = (pp->vp_due.tv_sec - now.tv_sec) * 1000 +
+	    (pp->vp_due.tv_nsec - now.tv_nsec) / 1000000;
+	return (ms < 0 ? 0 : (int)ms);
+}
+
+/*
+ * How long a present may be held waiting for the viewer to release the frame.
+ * A viewer that stops drawing -- minimised, wedged, or gone without closing
+ * the socket -- must not take the guest down with it, so the wait has a
+ * deadline and crossing it is counted rather than hidden.
+ */
+#define	VTGPU_AWAIT_TIMEOUT_MS	250
+
+/*
+ * How often a present is let through while the viewer is not drawing.  Fast
+ * enough that the guest never looks hung, slow enough that it cannot spend
+ * the stall racing ahead into a buffer nobody is reading.
+ */
+#define	VTGPU_DRAIN_MS		33
+
+/*
+ * The most presents held at once.
+ *
+ * Holding is only felt by the guest when the virtqueue fills, because
+ * nothing makes it wait for a completion -- so letting the backlog grow to
+ * the depth of the ring puts the whole path into lockstep: one release, one
+ * completion, one submit, one draw.  The frame rate then becomes one over the
+ * round trip, measured at 12-34 a second, which reads as the picture stopping
+ * and starting.  A shallow cap keeps the guest out of that regime; past it a
+ * present is completed rather than held, which costs some blending on a
+ * single-buffered guest and is much the lesser fault.
+ */
+#define	VTGPU_MAX_HELD		3
+
+/*
+ * How many frames the guest may have outstanding before its present is held.
+ *
+ * One less than the number of distinct buffers it presents into: with two it
+ * may draw into the second while the first is being read, which is what
+ * double buffering is for.  With one -- vkcube -- the answer is zero, and the
+ * guest waits for every frame to be consumed before starting the next.  That
+ * is the whole point: there is nowhere else for it to draw.
+ */
+static unsigned
+vtgpu_max_inflight(const struct vtgpu_softc *sc)
+{
+	unsigned distinct = 0;
+
+	for (unsigned i = 0; i < sc->vsc_recent_n; i++) {
+		bool dup = false;
+
+		for (unsigned j = 0; j < i; j++)
+			if (sc->vsc_recent_res[j] == sc->vsc_recent_res[i]) {
+				dup = true;
+				break;
+			}
+		if (!dup)
+			distinct++;
+	}
+	return (distinct > 1 ? distinct - 1 : 0);
+}
+
+/* Note a published resource in the recency window. */
+static void
+vtgpu_note_pub(struct vtgpu_softc *sc, uint32_t res_id)
+{
+	struct timespec now;
+	long ms;
+
+	sc->vsc_recent_res[sc->vsc_recent_i] = res_id;
+	sc->vsc_recent_i = (sc->vsc_recent_i + 1) % VTGPU_RECENT_PUBS;
+	if (sc->vsc_recent_n < VTGPU_RECENT_PUBS)
+		sc->vsc_recent_n++;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	if (sc->vsc_d_when.tv_sec == 0 && sc->vsc_d_when.tv_nsec == 0) {
+		sc->vsc_d_when = now;
+		return;
+	}
+	ms = (now.tv_sec - sc->vsc_d_when.tv_sec) * 1000 +
+	    (now.tv_nsec - sc->vsc_d_when.tv_nsec) / 1000000;
+	if (ms < 1000)
+		return;
+
+	EPRINTLN("vtgpu: %ldms present: scanout=%ju flush=%ju | declined: "
+	    "fenced=%ju under=%ju capped=%ju noack=%ju noviewer=%ju | held=%ju "
+	    "rel=%ju relgap=%ldms drain=%ju inflight=%u max=%u bufs=%u "
+	    "late=%ju",
+	    ms, sc->vsc_d_scanout, sc->vsc_d_flush,
+	    sc->vsc_d_fenced, sc->vsc_d_under, sc->vsc_d_capped, sc->vsc_d_noack,
+	    sc->vsc_d_noview, sc->vsc_d_held,
+	    sc->vsc_d_rel, sc->vsc_d_relgap, sc->vsc_d_dump,
+	    sc->vsc_inflight, vtgpu_max_inflight(sc) + 1,
+	    sc->vsc_recent_n, (uintmax_t)sc->vsc_await_late);
+
+	sc->vsc_d_scanout = sc->vsc_d_flush = sc->vsc_d_fenced = 0;
+	sc->vsc_d_held = sc->vsc_d_under = sc->vsc_d_noview = 0;
+	sc->vsc_d_noack = sc->vsc_d_rel = sc->vsc_d_dump = 0;
+	sc->vsc_d_relgap = 0;
+	sc->vsc_d_capped = 0;
+	sc->vsc_d_when = now;
+}
+
+/*
+ * Complete a present, or hold it until the viewer has read the frame.
+ * Returns true if it was held (the caller must not complete it).
+ */
+static bool
+vtgpu_await_hold(struct vtgpu_softc *sc, struct vqueue_info *vq,
+    const struct virtio_gpu_ctrl_hdr *hdr, uint16_t chain_idx,
+    struct iovec *wiov, int nwiov)
+{
+	struct virtio_gpu_ctrl_hdr resp = {
+		.type     = VIRTIO_GPU_RESP_OK_NODATA,
+		.fence_id = hdr->fence_id,
+		.ctx_id   = hdr->ctx_id,
+	};
+	struct vtgpu_paced *pp;
+	size_t copy = sizeof(resp), off = 0;
+	struct timespec now;
+
+	/*
+	 * A fenced present already has its own completion signal and
+	 * vtgpu_respond() must keep owning it.
+	 */
+	if ((hdr->flags & VIRTIO_GPU_FLAG_FENCE) != 0) {
+		sc->vsc_d_fenced++;
+		return (false);
+	}
+	if (!sc->vsc_release_ok) {
+		sc->vsc_d_noack++;
+		return (false);
+	}
+	/*
+	 * Nobody left to release it.  Holding for a viewer that has gone would
+	 * put every present through the timeout and cap the guest at 20fps.
+	 */
+	if (!gpu_display_connected(sc->vsc_display)) {
+		sc->vsc_release_ok = false;
+		sc->vsc_inflight = 0;
+		sc->vsc_d_noview++;
+		return (false);
+	}
+	if (sc->vsc_inflight <= vtgpu_max_inflight(sc)) {
+		sc->vsc_d_under++;
+		return (false);
+	}
+	if (sc->vsc_awaits_n >= VTGPU_MAX_HELD) {
+		sc->vsc_d_capped++;
+		return (false);
+	}
+	if ((pp = calloc(1, sizeof(*pp))) == NULL)
+		return (false);
+	sc->vsc_d_held++;
+
+	for (int i = 0; i < nwiov && copy > 0; i++) {
+		size_t n = copy < wiov[i].iov_len ? copy : wiov[i].iov_len;
+
+		memcpy(wiov[i].iov_base, (const char *)&resp + off, n);
+		off += n;
+		copy -= n;
+	}
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	pp->vp_due = now;
+	pp->vp_due.tv_nsec += VTGPU_AWAIT_TIMEOUT_MS * 1000000L;
+	while (pp->vp_due.tv_nsec >= 1000000000L) {
+		pp->vp_due.tv_sec++;
+		pp->vp_due.tv_nsec -= 1000000000L;
+	}
+	pp->vp_vq = vq;
+	pp->vp_idx = chain_idx;
+	pp->vp_resp_len = (uint32_t)sizeof(resp);
+	TAILQ_INSERT_TAIL(&sc->vsc_awaits, pp, vp_link);
+	sc->vsc_awaits_n++;
+	return (true);
+}
+
+/*
+ * Complete held presents.  Caller holds vsc_mtx.
+ *
+ * all=false completes exactly one, which is what a release means: the guest
+ * may have back the single slot the viewer has finished with.  Completing the
+ * whole backlog instead made each release open the gate for everything queued
+ * behind it -- sixty releases a second let through two hundred and ninety
+ * presents, which is no gate at all.
+ */
+static void
+vtgpu_awaits_complete(struct vtgpu_softc *sc, bool all)
+{
+	struct vtgpu_paced *pp, *tmp;
+	struct vqueue_info *last_vq = NULL;
+
+	TAILQ_FOREACH_SAFE(pp, &sc->vsc_awaits, vp_link, tmp) {
+		TAILQ_REMOVE(&sc->vsc_awaits, pp, vp_link);
+		sc->vsc_awaits_n--;
+		vq_relchain(pp->vp_vq, pp->vp_idx, pp->vp_resp_len);
+		last_vq = pp->vp_vq;
+		free(pp);
+		if (!all)
+			break;
+	}
+	if (last_vq != NULL)
+		vq_endchains(last_vq, 0);
+}
+
+/*
+ * The viewer has finished reading a frame.  Runs on the mevent thread.
+ */
+static void
+vtgpu_frame_released(void *arg, uint32_t buffer_id __unused)
+{
+	struct vtgpu_softc *sc = arg;
+
+	pthread_mutex_lock(&sc->vsc_mtx);
+	sc->vsc_release_ok = true;
+	{
+		struct timespec now;
+		long gap;
+
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if (sc->vsc_last_release.tv_sec != 0) {
+			gap = (now.tv_sec - sc->vsc_last_release.tv_sec) * 1000 +
+			    (now.tv_nsec - sc->vsc_last_release.tv_nsec) /
+			    1000000;
+			if (gap > sc->vsc_d_relgap)
+				sc->vsc_d_relgap = gap;
+		}
+		sc->vsc_last_release = now;
+	}
+	sc->vsc_d_rel++;
+	/*
+	 * Count from this draw, do not subtract one.
+	 *
+	 * A running balance of presents against releases cannot work here:
+	 * the viewer coalesces, so most frames are never drawn and never
+	 * acknowledged, and the balance climbs for ever -- 329 before the
+	 * viewer had even connected, 518 by the end.  Once it is permanently
+	 * above the limit every present is held and only the backlog cap is
+	 * doing anything, which is not the pacing that was designed.
+	 *
+	 * What bounds the guest is presents since the viewer last finished a
+	 * draw, so reset.  With the turnstile completing exactly one present
+	 * per release, the guest gets one present per draw and the backlog
+	 * never approaches the depth of the ring.
+	 */
+	sc->vsc_inflight = 0;
+	vtgpu_awaits_complete(sc, false);
+	pthread_mutex_unlock(&sc->vsc_mtx);
+}
+
+/*
+ * Release presents whose viewer acknowledgement never came.  Called from the
+ * same tick as vtgpu_paced_expire(); returns ms until the next deadline, or
+ * -1 when nothing is held.
+ */
+static int
+vtgpu_awaits_expire(struct vtgpu_softc *sc)
+{
+	struct timespec now;
+	long since, drain;
+
+	if (TAILQ_EMPTY(&sc->vsc_awaits))
+		return (-1);
+
+	/*
+	 * The deadline is on the viewer, not on the present.
+	 *
+	 * Ageing out each present individually completed them at the rate
+	 * they were held, which kept the virtqueue drained -- and the queue
+	 * filling is the only thing that actually stops the guest, since
+	 * nothing obliges it to wait for a response before submitting again.
+	 * So long as releases keep arriving the viewer is alive and the
+	 * backlog stays held; only silence means it is gone.
+	 */
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	since = (now.tv_sec - sc->vsc_last_release.tv_sec) * 1000 +
+	    (now.tv_nsec - sc->vsc_last_release.tv_nsec) / 1000000;
+	if (since < VTGPU_AWAIT_TIMEOUT_MS)
+		return ((int)(VTGPU_AWAIT_TIMEOUT_MS - since));
+
+	/*
+	 * The viewer is not drawing.  Let the guest through slowly rather than
+	 * all at once: releasing the whole backlog hands it a burst it
+	 * immediately spends overwriting the buffer, and the stall the viewer
+	 * was already having ends in a jump.  Worse, every tick past the
+	 * deadline released again -- twenty-seven times in one second -- so a
+	 * single stall became a sustained surge.
+	 *
+	 * Nothing is on screen while the viewer is stalled, so there is no
+	 * value in the guest rendering quickly; it only has to keep moving.
+	 */
+	drain = (now.tv_sec - sc->vsc_last_drain.tv_sec) * 1000 +
+	    (now.tv_nsec - sc->vsc_last_drain.tv_nsec) / 1000000;
+	if (drain < VTGPU_DRAIN_MS)
+		return ((int)(VTGPU_DRAIN_MS - drain));
+
+	vtgpu_awaits_complete(sc, false);
+	if (sc->vsc_inflight > 0)
+		sc->vsc_inflight--;
+	sc->vsc_last_drain = now;
+	sc->vsc_d_dump++;
+	if (sc->vsc_await_late++ % 256 == 0)
+		EPRINTLN("vtgpu: viewer silent for %ldms, letting the guest "
+		    "through one frame at a time (late=%ju)", since,
+		    (uintmax_t)sc->vsc_await_late);
+	return (VTGPU_DRAIN_MS);
+}
+
+/* Cursor commands arrive on either queue; both call sites precede it. */
+static void vtgpu_cursor_update(struct vtgpu_softc *sc,
+    const struct virtio_gpu_update_cursor *cmd);
+
 /* ----------------------------------------------------------------------- */
 /* virglrenderer callbacks						   */
 /* ----------------------------------------------------------------------- */
@@ -451,8 +996,30 @@ vtgpu_write_fence(void *cookie, uint32_t fence_id)
 	 * Called from within virgl_renderer_poll(), which we invoke on the
 	 * worker thread — so vsc_mtx is already held by the caller.
 	 */
-	if (fence_id >= VTGPU_OWN_FENCE_BASE)
-		return;		/* ours; nothing is queued against it */
+	if (fence_id >= VTGPU_OWN_FENCE_BASE) {
+		struct vtgpu_pub *vp, *vtmp;
+
+		/*
+		 * Ours: no descriptor is queued against it, it only says the
+		 * host has finished rendering.  Release every frame waiting on
+		 * this fence or an earlier one -- fences retire in order, so an
+		 * older one still on the list has already completed.
+		 */
+		TAILQ_FOREACH_SAFE(vp, &sc->vsc_pubs, vp_link, vtmp) {
+			if (vp->vp_fence_id > fence_id)
+				break;
+			TAILQ_REMOVE(&sc->vsc_pubs, vp, vp_link);
+			if (sc->vsc_display != NULL) {
+				gpu_display_frame(sc->vsc_display,
+				    vp->vp_res_id, -1, vp->vp_x, vp->vp_y,
+				    vp->vp_w, vp->vp_h);
+				sc->vsc_inflight++;
+				vtgpu_note_pub(sc, vp->vp_res_id);
+			}
+			free(vp);
+		}
+		return;
+	}
 	TAILQ_FOREACH_SAFE(vf, &sc->vsc_fences, vf_link, tmp) {
 		if ((uint32_t)vf->vf_id > fence_id)
 			break;
@@ -634,20 +1201,7 @@ vtgpu_cmd_resource_create_3d(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	 * report them unconditionally: whether the guest asks for SCANOUT at
 	 * all decides whether forcing linear can work.
 	 */
-	if ((cmd->bind & VTGPU_BIND_SCANOUT) != 0) {
-		unsigned i;
-
-		for (i = 0; i < sc->vsc_scanout_ctx_n; i++)
-			if (sc->vsc_scanout_ctx[i].res_id == cmd->resource_id)
-				break;
-		if (i == sc->vsc_scanout_ctx_n &&
-		    i < nitems(sc->vsc_scanout_ctx))
-			sc->vsc_scanout_ctx_n++;
-		if (i < nitems(sc->vsc_scanout_ctx)) {
-			sc->vsc_scanout_ctx[i].res_id = cmd->resource_id;
-			sc->vsc_scanout_ctx[i].ctx_id = hdr->ctx_id;
-		}
-	}
+	vtgpu_note_res_ctx(sc, cmd->resource_id, hdr->ctx_id);
 	if ((cmd->bind & VTGPU_BIND_SCANOUT) != 0)
 		EPRINTLN("vtgpu: create_3d id=%u SCANOUT bind=0x%x->0x%x "
 		    "fmt=%u %ux%u ret=%d", cmd->resource_id, cmd->bind, bind,
@@ -715,47 +1269,92 @@ vtgpu_cmd_resource_unref(struct vtgpu_softc *sc, struct vqueue_info *vq,
  * hardware, and writing it before knowing would be guessing.
  */
 /*
- * A sync_file for the guest's rendering into this scanout resource, or -1.
+ * WARNING: disabled by default (frame_fence=on to enable), because it hangs
+ * the guest.
  *
- * The guest does not fence SET_SCANOUT, so there is no completion signal to
- * ride on; make one on the context that created the resource, which is the
- * context that drew into it.  Only vrend and drm contexts register an
- * exportable fd (virgl_fence_set_fd() is called from nowhere in venus), which
- * is fine while the compositor renders through GL -- if it ever moves to the
- * Vulkan renderer this returns -1 and the viewer goes back to not waiting.
+ * The fences created here go on the guest's own contexts, and their ids come
+ * from a private range starting at 0x80000000 to keep them out of the way of
+ * the guest's.  That is precisely what breaks: virglrenderer retires fences
+ * in submission order per context and reports the last retired id, so a guest
+ * fence numbered after one of ours can be taken for already-retired and never
+ * signalled.  A guest fence that never signals is a guest blocked forever --
+ * observed as the entire display freezing, not just the application that was
+ * drawing.
+ *
+ * Fixing it needs a fence that orders against the guest's rendering without
+ * being injected into the guest's own fence sequence, which the current
+ * virglrenderer API does not obviously offer.  Left in place, off, because
+ * the diagnosis it produced is worth keeping: no frame ever exceeded the 50ms
+ * deadline, so these fences do retire promptly, and host-render completion is
+ * therefore not what makes the image double.
+ *
+ * Publish a frame to the viewer once the host has finished rendering it.
+ *
+ * The guest is done when SET_SCANOUT arrives, but virglrenderer executes the
+ * guest's GL commands on the host GPU asynchronously, so the dma_buf may
+ * still be being written when we hand it over.  The viewer then samples a
+ * buffer holding part of the new frame and part of what that buffer held two
+ * frames ago -- which is why a fast renderer showed two images at once and a
+ * slow one looked fine.
+ *
+ * virgl_renderer_create_fence() against the context that drew the resource
+ * retires through write_fence when that work completes, so hold the frame
+ * until then.  This is the stable fence API: no fd is exported and nothing
+ * here needs VIRGL_RENDERER_UNSTABLE_APIS.  If no fence can be created the
+ * frame goes out immediately, which is the old behaviour.
  */
-static int
-vtgpu_scanout_fence(struct vtgpu_softc *sc, uint32_t res_id)
+static void
+vtgpu_publish_fenced(struct vtgpu_softc *sc, uint32_t res_id,
+    uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
-	uint32_t ctx_id = 0, fid;
-	int fd = -1, cret, eret;
+	uint32_t ctx_id, fid;
+	struct vtgpu_pub *vp;
 
-	for (unsigned i = 0; i < sc->vsc_scanout_ctx_n; i++)
-		if (sc->vsc_scanout_ctx[i].res_id == res_id) {
-			ctx_id = sc->vsc_scanout_ctx[i].ctx_id;
-			break;
-		}
+	if (sc->vsc_display == NULL)
+		return;
+
+	/*
+	 * Off unless explicitly asked for: see the warning above.
+	 */
+	if (!sc->vsc_defer_frames)
+		goto publish_now;
+
+	ctx_id = vtgpu_res_ctx(sc, res_id);
+	if (ctx_id == 0)
+		ctx_id = sc->vsc_last_submit_ctx;
+	if (ctx_id == 0) {
+		vtgpu_report_res(sc, res_id, "publishing unfenced: no context");
+		goto publish_now;
+	}
 
 	if (sc->vsc_own_fence_next < VTGPU_OWN_FENCE_BASE)
 		sc->vsc_own_fence_next = VTGPU_OWN_FENCE_BASE;
 	fid = sc->vsc_own_fence_next++;
 
-	cret = ctx_id != 0 ?
-	    virgl_renderer_create_fence((int)fid, ctx_id) : -1;
-	eret = cret == 0 ? virgl_renderer_export_fence(fid, &fd) : -1;
+	if (virgl_renderer_create_fence((int)fid, ctx_id) != 0)
+		goto publish_now;
+	if ((vp = calloc(1, sizeof(*vp))) == NULL)
+		goto publish_now;
 
-	/*
-	 * Report the first few attempts.  Every step here can fail quietly --
-	 * no context recorded for the resource, no fence created, nothing
-	 * exportable -- and each failure looks identical from the outside: the
-	 * viewer simply does not wait, exactly as before the fence existed.
-	 */
-	if (sc->vsc_fence_reports < 3) {
-		sc->vsc_fence_reports++;
-		EPRINTLN("vtgpu: scanout fence res=%u ctx=%u create=%d "
-		    "export=%d fd=%d", res_id, ctx_id, cret, eret, fd);
+
+	vp->vp_fence_id = fid;
+	vp->vp_res_id   = res_id;
+	vp->vp_x = x; vp->vp_y = y; vp->vp_w = w; vp->vp_h = h;
+	clock_gettime(CLOCK_MONOTONIC, &vp->vp_when);
+	TAILQ_INSERT_TAIL(&sc->vsc_pubs, vp, vp_link);
+
+	if (sc->vsc_res_reported != NULL && res_id < VTGPU_RES_CTX_MAX &&
+	    !sc->vsc_res_reported[res_id]) {
+		sc->vsc_res_reported[res_id] = 1;
+		EPRINTLN("vtgpu: frame res=%u deferred until fence on ctx=%u "
+		    "retires", res_id, ctx_id);
 	}
-	return (eret == 0 ? fd : -1);
+	return;
+
+publish_now:
+	sc->vsc_inflight++;
+	vtgpu_note_pub(sc, res_id);
+	gpu_display_frame(sc->vsc_display, res_id, -1, x, y, w, h);
 }
 
 static void
@@ -776,6 +1375,7 @@ vtgpu_scanout_publish(struct vtgpu_softc *sc,
 	 * hand over a fresh dma_buf fd sixty times a second to describe
 	 * memory the viewer already has.
 	 */
+	sc->vsc_d_scanout++;
 	if (gpu_display_have_buffer(sc->vsc_display, cmd->resource_id)) {
 		/*
 		 * Defer to the fence when the guest supplied one: it marks the
@@ -784,9 +1384,8 @@ vtgpu_scanout_publish(struct vtgpu_softc *sc,
 		 * a half-drawn frame, which is what made a fast renderer show
 		 * two frames at once while a slow one looked fine.
 		 */
-		gpu_display_frame(sc->vsc_display, cmd->resource_id,
-		    vtgpu_scanout_fence(sc, cmd->resource_id), cmd->r.x,
-		    cmd->r.y, cmd->r.width, cmd->r.height);
+		vtgpu_publish_fenced(sc, cmd->resource_id, cmd->r.x, cmd->r.y,
+		    cmd->r.width, cmd->r.height);
 		return;
 	}
 
@@ -819,8 +1418,7 @@ vtgpu_scanout_publish(struct vtgpu_softc *sc,
 	    so.drm_fourcc, so.stride, offset, info->planes,
 	    (uintmax_t)info->modifiers);
 	gpu_display_scanout(sc->vsc_display, &so, dfd);	/* consumes dfd */
-	gpu_display_frame(sc->vsc_display, cmd->resource_id,
-	    vtgpu_scanout_fence(sc, cmd->resource_id), cmd->r.x, cmd->r.y,
+	vtgpu_publish_fenced(sc, cmd->resource_id, cmd->r.x, cmd->r.y,
 	    cmd->r.width, cmd->r.height);
 }
 
@@ -917,6 +1515,95 @@ vtgpu_cmd_set_scanout(struct vtgpu_softc *sc, struct vqueue_info *vq,
 			}
 		}
 	}
+	/*
+	 * Pace the completion when asked to.  The guest treats SET_SCANOUT
+	 * finishing as the flip having happened, so completing it immediately
+	 * removes the only thing that would make a compositor wait -- it then
+	 * renders continuously and throws most of the frames away.  Holding
+	 * the completion to a refresh cadence gives it something to wait for.
+	 *
+	 * Only for unfenced flips: a fenced one already has a completion
+	 * signal and vtgpu_respond() must keep owning it.
+	 */
+	if (sc->vsc_refresh_hz != 0 &&
+	    (hdr->flags & VIRTIO_GPU_FLAG_FENCE) == 0) {
+		struct virtio_gpu_ctrl_hdr resp = {
+			.type     = VIRTIO_GPU_RESP_OK_NODATA,
+			.fence_id = hdr->fence_id,
+			.ctx_id   = hdr->ctx_id,
+		};
+		struct vtgpu_paced *pp = calloc(1, sizeof(*pp));
+		size_t copy = sizeof(resp), off = 0;
+		struct timespec now;
+		long period_ns = 1000000000L / (long)sc->vsc_refresh_hz;
+
+		if (pp == NULL) {		/* fall back to immediate */
+			vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
+			    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
+			return;
+		}
+		for (int i = 0; i < nwiov && copy > 0; i++) {
+			size_t n = copy < wiov[i].iov_len ?
+			    copy : wiov[i].iov_len;
+			memcpy(wiov[i].iov_base, (const char *)&resp + off, n);
+			off += n;
+			copy -= n;
+		}
+
+		clock_gettime(CLOCK_MONOTONIC, &now);
+
+		/*
+		 * Due now if the guest has been idle longer than a period --
+		 * an isolated update, a click, a cursor move should not wait
+		 * for a cadence that nothing is pushing against.  Pacing is
+		 * only meant to hold back a guest presenting faster than the
+		 * display can show, not to add latency to everything else.
+		 */
+		if (vtgpu_ts_reached(&sc->vsc_next_flip, &now))
+			pp->vp_due = now;
+		else
+			pp->vp_due = sc->vsc_next_flip;
+
+		/* Next one no sooner than a period after this one. */
+		sc->vsc_next_flip = pp->vp_due;
+		sc->vsc_next_flip.tv_nsec += period_ns;
+		while (sc->vsc_next_flip.tv_nsec >= 1000000000L) {
+			sc->vsc_next_flip.tv_sec++;
+			sc->vsc_next_flip.tv_nsec -= 1000000000L;
+		}
+
+		/*
+		 * Never let the schedule run more than two periods ahead: a
+		 * guest presenting far above the refresh rate would otherwise
+		 * queue completions further and further into the future and
+		 * appear to hang.
+		 */
+		{
+			struct timespec limit = now;
+
+			limit.tv_nsec += 2 * period_ns;
+			while (limit.tv_nsec >= 1000000000L) {
+				limit.tv_sec++;
+				limit.tv_nsec -= 1000000000L;
+			}
+			if (vtgpu_ts_reached(&limit, &sc->vsc_next_flip))
+				sc->vsc_next_flip = limit;
+		}
+		pp->vp_vq = vq;
+		pp->vp_idx = chain_idx;
+		pp->vp_resp_len = (uint32_t)sizeof(resp);
+		TAILQ_INSERT_TAIL(&sc->vsc_paced, pp, vp_link);
+		sc->vsc_paced_n++;
+		return;
+	}
+
+	/*
+	 * Hold the present until the viewer has read the frame, so the guest
+	 * cannot start overwriting a buffer that is still being sampled.
+	 */
+	if (vtgpu_await_hold(sc, vq, hdr, chain_idx, wiov, nwiov))
+		return;
+
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 	    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
 }
@@ -989,10 +1676,19 @@ vtgpu_cmd_resource_flush(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	 * vtgpu_scanout_publish() instead.
 	 */
 	if (sc->vsc_display != NULL && cmd != NULL &&
-	    cmd->resource_id == sc->vsc_scanout_res)
-		gpu_display_frame(sc->vsc_display, cmd->resource_id,
-		    vtgpu_scanout_fence(sc, cmd->resource_id), cmd->r.x,
-		    cmd->r.y, cmd->r.width, cmd->r.height);
+	    cmd->resource_id == sc->vsc_scanout_res) {
+		sc->vsc_d_flush++;
+		vtgpu_publish_fenced(sc, cmd->resource_id, cmd->r.x, cmd->r.y,
+		    cmd->r.width, cmd->r.height);
+	}
+
+	/*
+	 * Hold the present until the viewer has read the frame, so the guest
+	 * cannot start overwriting a buffer that is still being sampled.
+	 */
+	if (vtgpu_await_hold(sc, vq, hdr, chain_idx, wiov, nwiov))
+		return;
+
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 	    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
 }
@@ -1158,6 +1854,14 @@ vtgpu_cmd_resource_create_blob(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	args.num_iovs   = n;
 
 	ret = virgl_renderer_resource_create_blob(&args);
+	/*
+	 * A page-flipping compositor allocates its scanouts here, not through
+	 * RESOURCE_CREATE_3D, so this is where the context that will render
+	 * into them gets recorded.  Without it every published frame goes out
+	 * unfenced.
+	 */
+	if (ret == 0)
+		vtgpu_note_res_ctx(sc, cmd->resource_id, hdr->ctx_id);
 	DPRINTF("create_blob id=%u mem=%u flags=0x%x blob_id=%lu size=%lu "
 	    "nr=%u ctx=%u ret=%d", cmd->resource_id, cmd->blob_mem,
 	    cmd->blob_flags, (unsigned long)cmd->blob_id,
@@ -1570,6 +2274,15 @@ vtgpu_cmd_submit_3d(struct vtgpu_softc *sc, struct vqueue_info *vq,
 {
 	int ret = virgl_renderer_submit_cmd((void *)(uintptr_t)buf,
 	    (int)hdr->ctx_id, cmd->size / 4);
+	/*
+	 * The context that renders a scanout is not the one that created it:
+	 * RESOURCE_CREATE_3D comes from the guest kernel on ctx 0, while the
+	 * drawing is submitted by the compositor's context.  Remember it, so
+	 * a frame whose resource has no creating context can still be fenced
+	 * against whoever last drew.
+	 */
+	if (ret == 0 && hdr->ctx_id != 0)
+		sc->vsc_last_submit_ctx = hdr->ctx_id;
 	DPRINTF("submit_3d ctx=%u size=%uB (%u dwords) ret=%d",
 	    hdr->ctx_id, cmd->size, cmd->size / 4, ret);
 	uint32_t type = ret ? VIRTIO_GPU_RESP_ERR_UNSPEC
@@ -1794,8 +2507,18 @@ vtgpu_process_controlq(struct vtgpu_softc *sc, int qidx)
 		}
 
 		case VIRTIO_GPU_CMD_UPDATE_CURSOR:
+			/*
+			 * Normally these arrive on the cursor queue; handle
+			 * them here too rather than silently dropping a
+			 * cursor from a guest that uses the control queue.
+			 */
+			if (cmdlen >= sizeof(struct virtio_gpu_update_cursor))
+				vtgpu_cursor_update(sc, (const void *)hdr);
+			vtgpu_resp_nodata(sc, vq, hdr, req.idx,
+			    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
+			break;
 		case VIRTIO_GPU_CMD_MOVE_CURSOR:
-			/* Software cursor; ignore. */
+			/* Position only; the viewer tracks the pointer. */
 			vtgpu_resp_nodata(sc, vq, hdr, req.idx,
 			    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
 			break;
@@ -1811,7 +2534,87 @@ vtgpu_process_controlq(struct vtgpu_softc *sc, int qidx)
 
 		/* Drain any fences that have completed. */
 		virgl_renderer_poll();
+		vtgpu_pubs_expire(sc);
 	}
+}
+
+/*
+ * Publish the guest's hardware cursor to the viewer.
+ *
+ * A guest using the cursor plane never draws its pointer into the scanout, so
+ * a viewer showing only the scanout has no cursor at all.  The host
+ * compositor draws its own over the surface, which looks enough like one that
+ * the absence is easy to miss until you notice it never changes shape.
+ *
+ * MOVE_CURSOR carries only a position and is not forwarded: the viewer maps
+ * its pointer onto the guest's one to one, so the host already knows where
+ * the cursor is and can draw it there with no round trip.
+ */
+static void
+vtgpu_cursor_update(struct vtgpu_softc *sc,
+    const struct virtio_gpu_update_cursor *cmd)
+{
+	struct virgl_renderer_resource_info info;
+	struct virgl_box box;
+	struct iovec iov;
+	void *pixels;
+	size_t bytes;
+	int ret;
+
+	if (sc->vsc_display == NULL)
+		return;
+
+	/* resource 0 means "no cursor". */
+	if (cmd->resource_id == 0) {
+		gpu_display_cursor(sc->vsc_display, 0, 0, 0, 0, NULL);
+		return;
+	}
+
+	memset(&info, 0, sizeof(info));
+	if (virgl_renderer_resource_get_info((int)cmd->resource_id,
+	    &info) != 0) {
+		EPRINTLN("vtgpu: cursor res=%u get_info failed",
+		    cmd->resource_id);
+		return;
+	}
+	if (info.width == 0 || info.height == 0)
+		return;
+
+	bytes = (size_t)info.width * info.height * 4;
+	if ((pixels = malloc(bytes)) == NULL)
+		return;
+
+	memset(&box, 0, sizeof(box));
+	box.w = info.width;
+	box.h = info.height;
+	box.d = 1;
+	iov.iov_base = pixels;
+	iov.iov_len = bytes;
+
+	/*
+	 * Read on context 0: the cursor resource is created by the guest
+	 * kernel, not by a rendering context, and the readback is of host
+	 * memory virglrenderer already owns.
+	 */
+	ret = virgl_renderer_transfer_read_iov((int)cmd->resource_id, 0, 0,
+	    (uint32_t)(info.width * 4), 0, &box, 0, &iov, 1);
+	if (ret != 0) {
+		if (sc->vsc_cursor_errs++ == 0)
+			EPRINTLN("vtgpu: cursor res=%u readback failed ret=%d "
+			    "(no cursor will be shown)", cmd->resource_id, ret);
+		free(pixels);
+		return;
+	}
+
+	if (!sc->vsc_cursor_seen) {
+		sc->vsc_cursor_seen = true;
+		EPRINTLN("vtgpu: cursor res=%u %ux%u hot=%u,%u published",
+		    cmd->resource_id, info.width, info.height,
+		    cmd->hot_x, cmd->hot_y);
+	}
+	gpu_display_cursor(sc->vsc_display, info.width, info.height,
+	    cmd->hot_x, cmd->hot_y, pixels);
+	free(pixels);
 }
 
 static void
@@ -1826,7 +2629,16 @@ vtgpu_process_cursorq(struct vtgpu_softc *sc)
 		n = vq_getchain(vq, iov, VTGPU_MAXIOV, &req);
 		if (n < 0)
 			errx(1, "vtgpu: cursorq vq_getchain error");
-		/* Just consume and acknowledge. */
+
+		if (n > 0 && iov[0].iov_len >=
+		    sizeof(struct virtio_gpu_update_cursor)) {
+			const struct virtio_gpu_update_cursor *cc =
+			    iov[0].iov_base;
+
+			if (cc->hdr.type == VIRTIO_GPU_CMD_UPDATE_CURSOR)
+				vtgpu_cursor_update(sc, cc);
+			/* MOVE_CURSOR carries only a position; nothing to do. */
+		}
 		vq_relchain(vq, req.idx, 0);
 		vq_endchains(vq, 0);
 	}
@@ -1877,6 +2689,13 @@ vtgpu_kq_setup(struct vtgpu_softc *sc)
 		sc->vsc_kq = -1;
 		return;
 	}
+	if (sc->vsc_refresh_hz != 0)
+		EPRINTLN("vtgpu: flip pacing active (%u Hz)",
+		    sc->vsc_refresh_hz);
+	if (sc->vsc_defer_frames)
+		EPRINTLN("vtgpu: frame deferral ENABLED (timeout %dms) -- "
+		    "known to hang the guest, see pci_virtio_gpu.c",
+		    VTGPU_PUB_TIMEOUT_MS);
 	EPRINTLN("vtgpu: event-driven wait active (fence fd=%d%s)",
 	    sc->vsc_poll_fd,
 	    sc->vsc_poll_fd < 0 ? ", queue kicks only" : "");
@@ -1909,7 +2728,61 @@ vtgpu_worker(void *arg)
 		while (sc->vsc_running &&
 		    !vq_has_descs(&sc->vsc_queues[VTGPU_CONTROLQ]) &&
 		    !vq_has_descs(&sc->vsc_queues[VTGPU_CURSORQ])) {
-			if (!TAILQ_EMPTY(&sc->vsc_fences)) {
+			if (!TAILQ_EMPTY(&sc->vsc_paced)) {
+				/*
+				 * A flip completion is due shortly; sleep
+				 * only that long.  The guest is waiting on
+				 * it, so overshooting shows up directly as a
+				 * lower frame rate.
+				 */
+				int due_ms = vtgpu_paced_expire(sc);
+
+				if (due_ms >= 0) {
+					struct timespec ts = {
+						.tv_sec = 0,
+						.tv_nsec = (due_ms ? due_ms :
+						    1) * 1000000L
+					};
+
+					pthread_mutex_unlock(&sc->vsc_mtx);
+					nanosleep(&ts, NULL);
+					pthread_mutex_lock(&sc->vsc_mtx);
+					vtgpu_paced_expire(sc);
+					continue;
+				}
+			}
+			if (!TAILQ_EMPTY(&sc->vsc_awaits)) {
+				/*
+				 * Presents are held for the viewer.  The
+				 * release completes a chain from the mevent
+				 * thread, so all the worker owes here is the
+				 * silence deadline -- and while the viewer is
+				 * drawing, the backlog stays held on purpose,
+				 * so sleeping the millisecond backstop would
+				 * spin at a thousand wakeups a second for as
+				 * long as the guest is throttled.  Sleep
+				 * towards the deadline instead, capped so a
+				 * queue kick is still noticed promptly.
+				 */
+				int due_ms = vtgpu_awaits_expire(sc);
+
+				if (due_ms >= 0) {
+					long ms = due_ms > 10 ? 10 :
+					    (due_ms ? due_ms :
+					    VTGPU_KQ_BACKSTOP_MS);
+					struct timespec ts = {
+						.tv_sec = 0,
+						.tv_nsec = ms * 1000000L
+					};
+
+					pthread_mutex_unlock(&sc->vsc_mtx);
+					nanosleep(&ts, NULL);
+					pthread_mutex_lock(&sc->vsc_mtx);
+					continue;
+				}
+			}
+			if (!TAILQ_EMPTY(&sc->vsc_fences) ||
+			    !TAILQ_EMPTY(&sc->vsc_pubs)) {
 				/*
 				 * Fenced commands are awaiting GPU completion.
 				 * The guest may be blocked on one of those
@@ -1919,6 +2792,14 @@ vtgpu_worker(void *arg)
 				 * releases each chain as its fence fires).
 				 * Without this the guest hangs forever on the
 				 * first fenced submit/transfer.
+				 *
+				 * The same applies to frames held for their
+				 * rendering to complete: those fences also
+				 * only retire inside virgl_renderer_poll(),
+				 * and nothing obliges the guest to send more
+				 * work afterwards.  Waiting for a kick that
+				 * may never come left the display frozen
+				 * until the guest happened to draw again.
 				 */
 				sc->vsc_fwait++;
 				if (sc->vsc_kq >= 0) {
@@ -1958,6 +2839,7 @@ vtgpu_worker(void *arg)
 					sc->vsc_fwait_late++;
 				}
 				virgl_renderer_poll();
+				vtgpu_pubs_expire(sc);
 
 				/*
 				 * Periodic, and rare enough to be free: tells
@@ -2597,6 +3479,12 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 	sc->vsc_kq = -1;
 	sc->vsc_poll_fd = -1;
 	TAILQ_INIT(&sc->vsc_fences);
+	TAILQ_INIT(&sc->vsc_pubs);
+	TAILQ_INIT(&sc->vsc_paced);
+	TAILQ_INIT(&sc->vsc_awaits);
+	sc->vsc_res_ctx = calloc(VTGPU_RES_CTX_MAX, sizeof(*sc->vsc_res_ctx));
+	sc->vsc_res_reported = calloc(VTGPU_RES_CTX_MAX,
+	    sizeof(*sc->vsc_res_reported));
 
 	render_node     = NULL;
 	wayland_display = NULL;
@@ -2615,6 +3503,21 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 		    "scanout_probe", false);
 		sc->vsc_scanout_linear = get_config_bool_node_default(nvl,
 		    "scanout_linear", false);
+		sc->vsc_defer_frames = get_config_bool_node_default(nvl,
+		    "frame_fence", false);
+		{
+			const char *r = get_config_value_node(nvl, "refresh");
+
+			if (r != NULL) {
+				int hz = atoi(r);
+
+				if (hz > 0 && hz <= 1000)
+					sc->vsc_refresh_hz = (unsigned)hz;
+				else
+					EPRINTLN("vtgpu: refresh=%s ignored, "
+					    "expected 1..1000", r);
+			}
+		}
 		{
 			const char *disp = get_config_value_node(nvl, "display");
 
@@ -2625,6 +3528,9 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 			 */
 			if (disp != NULL && strncmp(disp, "unix:", 5) == 0) {
 				sc->vsc_display = gpu_display_init(disp + 5);
+				if (sc->vsc_display != NULL)
+					gpu_display_set_release_cb(sc->vsc_display,
+					    vtgpu_frame_released, sc);
 				/*
 				 * The USB tablet drops every event unless a
 				 * graphics context exists: umouse_event()
