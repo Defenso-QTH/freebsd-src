@@ -1164,19 +1164,32 @@ vtgpu_cmd_set_scanout(struct vtgpu_softc *sc, struct vqueue_info *vq,
 		}
 
 		clock_gettime(CLOCK_MONOTONIC, &now);
-		if (!vtgpu_ts_reached(&sc->vsc_next_flip, &now))
-			sc->vsc_next_flip = now;
+
+		/*
+		 * Due now if the guest has been idle longer than a period --
+		 * an isolated update, a click, a cursor move should not wait
+		 * for a cadence that nothing is pushing against.  Pacing is
+		 * only meant to hold back a guest presenting faster than the
+		 * display can show, not to add latency to everything else.
+		 */
+		if (vtgpu_ts_reached(&sc->vsc_next_flip, &now))
+			pp->vp_due = now;
+		else
+			pp->vp_due = sc->vsc_next_flip;
+
+		/* Next one no sooner than a period after this one. */
+		sc->vsc_next_flip = pp->vp_due;
 		sc->vsc_next_flip.tv_nsec += period_ns;
 		while (sc->vsc_next_flip.tv_nsec >= 1000000000L) {
 			sc->vsc_next_flip.tv_sec++;
 			sc->vsc_next_flip.tv_nsec -= 1000000000L;
 		}
+
 		/*
 		 * Never let the schedule run more than two periods ahead: a
-		 * guest presenting far faster than the refresh rate would
-		 * otherwise queue completions minutes into the future and
-		 * appear to hang.  Clamping costs pacing accuracy under
-		 * overload, which is exactly when accuracy does not matter.
+		 * guest presenting far above the refresh rate would otherwise
+		 * queue completions further and further into the future and
+		 * appear to hang.
 		 */
 		{
 			struct timespec limit = now;
@@ -1186,10 +1199,9 @@ vtgpu_cmd_set_scanout(struct vtgpu_softc *sc, struct vqueue_info *vq,
 				limit.tv_sec++;
 				limit.tv_nsec -= 1000000000L;
 			}
-			if (!vtgpu_ts_reached(&limit, &sc->vsc_next_flip))
+			if (vtgpu_ts_reached(&limit, &sc->vsc_next_flip))
 				sc->vsc_next_flip = limit;
 		}
-		pp->vp_due = sc->vsc_next_flip;
 		pp->vp_vq = vq;
 		pp->vp_idx = chain_idx;
 		pp->vp_resp_len = (uint32_t)sizeof(resp);
