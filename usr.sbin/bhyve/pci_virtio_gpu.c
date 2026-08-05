@@ -749,7 +749,6 @@ vtgpu_scanout_fence(struct vtgpu_softc *sc, uint32_t res_id)
 
 static void
 vtgpu_scanout_publish(struct vtgpu_softc *sc,
-    const struct virtio_gpu_ctrl_hdr *hdr,
     const struct virtio_gpu_set_scanout *cmd,
     const struct virgl_renderer_resource_info_ext *info)
 {
@@ -893,7 +892,7 @@ vtgpu_cmd_set_scanout(struct vtgpu_softc *sc, struct vqueue_info *vq,
 				EPRINTLN("vtgpu: scanout res=%u get_info_ext "
 				    "failed ret=%d", cmd->resource_id, iret);
 			} else {
-				vtgpu_scanout_publish(sc, hdr, cmd, &info);
+				vtgpu_scanout_publish(sc, cmd, &info);
 				EPRINTLN("vtgpu: scanout res=%u dmabuf_export=%s "
 				    "fourcc=0x%08x stride=%u planes=%d "
 				    "modifier=0x%016jx fmt=%u %ux%u",
