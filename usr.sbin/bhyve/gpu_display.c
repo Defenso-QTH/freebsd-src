@@ -407,18 +407,22 @@ gpu_display_scanout(struct gpu_display *gd, const struct gpu_display_scanout *in
 }
 
 void
-gpu_display_frame(struct gpu_display *gd, uint32_t buffer_id, uint32_t x,
-    uint32_t y, uint32_t w, uint32_t h)
+gpu_display_frame(struct gpu_display *gd, uint32_t buffer_id, int fence_fd,
+    uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
 	struct gpu_display_frame msg;
 
-	if (gd == NULL)
+	if (gd == NULL) {
+		if (fence_fd >= 0)
+			close(fence_fd);
 		return;
+	}
 
 	memset(&msg, 0, sizeof(msg));
 	msg.hdr.type = GPU_DISPLAY_MSG_FRAME;
 	msg.hdr.len = sizeof(msg);
 	msg.buffer_id = buffer_id;
+	msg.has_fence = fence_fd >= 0;
 	msg.x = x;
 	msg.y = y;
 	msg.w = w;
@@ -427,6 +431,8 @@ gpu_display_frame(struct gpu_display *gd, uint32_t buffer_id, uint32_t x,
 	pthread_mutex_lock(&gd->mtx);
 	if (gd->cfd < 0) {
 		pthread_mutex_unlock(&gd->mtx);
+		if (fence_fd >= 0)
+			close(fence_fd);
 		return;
 	}
 	/*
@@ -434,13 +440,15 @@ gpu_display_frame(struct gpu_display *gd, uint32_t buffer_id, uint32_t x,
 	 * must not become the guest's problem, so a frame that will not fit
 	 * in the socket buffer is dropped and counted, not retried.
 	 */
-	if (gd_send(gd, &msg, sizeof(msg), -1))
+	if (gd_send(gd, &msg, sizeof(msg), fence_fd))
 		gd->frames_sent++;
 	else if (errno == EAGAIN || errno == EWOULDBLOCK)
 		gd->frames_dropped++;
 	else
 		gd_drop_client(gd);
 	pthread_mutex_unlock(&gd->mtx);
+	if (fence_fd >= 0)
+		close(fence_fd);
 }
 
 void
