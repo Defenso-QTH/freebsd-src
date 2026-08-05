@@ -60,6 +60,15 @@
 #include <machine/vmm.h>
 #include <vmmapi.h>		/* vm_create_devmem / vm_mmap_memseg */
 
+/*
+ * virgl_renderer_export_fence() -- the only way to obtain a sync_file for the
+ * guest's rendering -- sits behind this in virglrenderer.h, which says the APIs
+ * it guards are "for development/testing purposes only, not in production".
+ * Taken deliberately: without a fence the viewer samples buffers mid-render.
+ * If it ever disappears the build breaks loudly rather than silently, and the
+ * fallback is simply not to fence.
+ */
+#define	VIRGL_RENDERER_UNSTABLE_APIS 1
 #include <virglrenderer.h>
 
 /* virgl_protocol.h is not installed by the virglrenderer port; define here. */
@@ -72,6 +81,7 @@ struct virgl_box {
 #include "config.h"
 #include "debug.h"
 #include "pci_emul.h"
+#include "console.h"
 #include "gpu_display.h"
 #include "virtio.h"
 
@@ -252,6 +262,15 @@ struct vtgpu_fence {
 	TAILQ_ENTRY(vtgpu_fence) vf_link;
 };
 
+/*
+ * Fence ids we create ourselves start here.  vtgpu_write_fence() retires every
+ * queued fence with an id <= the one that signalled, which assumes a single
+ * monotonic space; injecting ours into it would retire the guest's fences early
+ * and release their descriptors before their work had finished.  Keeping ours
+ * in the top half lets write_fence recognise and ignore them.
+ */
+#define	VTGPU_OWN_FENCE_BASE	0x80000000u
+
 /* kqueue ident for the queue-kick user event. */
 #define	VTGPU_KQ_NOTIFY		1
 
@@ -338,6 +357,20 @@ struct vtgpu_softc {
 	 */
 	uint32_t		vsc_seen_scanout[8];
 	unsigned		vsc_seen_n;
+	/* Set by SET_SCANOUT, consumed by the response path. */
+	unsigned		vsc_scanout_seen_total;
+	uint32_t		vsc_own_fence_next;
+	unsigned		vsc_fence_reports;
+	/*
+	 * Context that created each scanout-capable resource.  A fence has to
+	 * be created on the context that did the drawing, and SET_SCANOUT
+	 * arrives on the control queue where ctx_id is not that context.
+	 */
+	struct {
+		uint32_t	res_id;
+		uint32_t	ctx_id;
+	}			vsc_scanout_ctx[8];
+	unsigned		vsc_scanout_ctx_n;
 	uint32_t		vsc_scanout_res;	/* 0 = none bound */
 	uint32_t		vsc_scanout_w;
 	uint32_t		vsc_scanout_h;
@@ -418,6 +451,8 @@ vtgpu_write_fence(void *cookie, uint32_t fence_id)
 	 * Called from within virgl_renderer_poll(), which we invoke on the
 	 * worker thread — so vsc_mtx is already held by the caller.
 	 */
+	if (fence_id >= VTGPU_OWN_FENCE_BASE)
+		return;		/* ours; nothing is queued against it */
 	TAILQ_FOREACH_SAFE(vf, &sc->vsc_fences, vf_link, tmp) {
 		if ((uint32_t)vf->vf_id > fence_id)
 			break;
@@ -599,6 +634,20 @@ vtgpu_cmd_resource_create_3d(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	 * report them unconditionally: whether the guest asks for SCANOUT at
 	 * all decides whether forcing linear can work.
 	 */
+	if ((cmd->bind & VTGPU_BIND_SCANOUT) != 0) {
+		unsigned i;
+
+		for (i = 0; i < sc->vsc_scanout_ctx_n; i++)
+			if (sc->vsc_scanout_ctx[i].res_id == cmd->resource_id)
+				break;
+		if (i == sc->vsc_scanout_ctx_n &&
+		    i < nitems(sc->vsc_scanout_ctx))
+			sc->vsc_scanout_ctx_n++;
+		if (i < nitems(sc->vsc_scanout_ctx)) {
+			sc->vsc_scanout_ctx[i].res_id = cmd->resource_id;
+			sc->vsc_scanout_ctx[i].ctx_id = hdr->ctx_id;
+		}
+	}
 	if ((cmd->bind & VTGPU_BIND_SCANOUT) != 0)
 		EPRINTLN("vtgpu: create_3d id=%u SCANOUT bind=0x%x->0x%x "
 		    "fmt=%u %ux%u ret=%d", cmd->resource_id, cmd->bind, bind,
@@ -665,6 +714,50 @@ vtgpu_cmd_resource_unref(struct vtgpu_softc *sc, struct vqueue_info *vq,
  * it is needed depends on what has_dmabuf_export actually reports on this
  * hardware, and writing it before knowing would be guessing.
  */
+/*
+ * A sync_file for the guest's rendering into this scanout resource, or -1.
+ *
+ * The guest does not fence SET_SCANOUT, so there is no completion signal to
+ * ride on; make one on the context that created the resource, which is the
+ * context that drew into it.  Only vrend and drm contexts register an
+ * exportable fd (virgl_fence_set_fd() is called from nowhere in venus), which
+ * is fine while the compositor renders through GL -- if it ever moves to the
+ * Vulkan renderer this returns -1 and the viewer goes back to not waiting.
+ */
+static int
+vtgpu_scanout_fence(struct vtgpu_softc *sc, uint32_t res_id)
+{
+	uint32_t ctx_id = 0, fid;
+	int fd = -1, cret, eret;
+
+	for (unsigned i = 0; i < sc->vsc_scanout_ctx_n; i++)
+		if (sc->vsc_scanout_ctx[i].res_id == res_id) {
+			ctx_id = sc->vsc_scanout_ctx[i].ctx_id;
+			break;
+		}
+
+	if (sc->vsc_own_fence_next < VTGPU_OWN_FENCE_BASE)
+		sc->vsc_own_fence_next = VTGPU_OWN_FENCE_BASE;
+	fid = sc->vsc_own_fence_next++;
+
+	cret = ctx_id != 0 ?
+	    virgl_renderer_create_fence((int)fid, ctx_id) : -1;
+	eret = cret == 0 ? virgl_renderer_export_fence(fid, &fd) : -1;
+
+	/*
+	 * Report the first few attempts.  Every step here can fail quietly --
+	 * no context recorded for the resource, no fence created, nothing
+	 * exportable -- and each failure looks identical from the outside: the
+	 * viewer simply does not wait, exactly as before the fence existed.
+	 */
+	if (sc->vsc_fence_reports < 3) {
+		sc->vsc_fence_reports++;
+		EPRINTLN("vtgpu: scanout fence res=%u ctx=%u create=%d "
+		    "export=%d fd=%d", res_id, ctx_id, cret, eret, fd);
+	}
+	return (eret == 0 ? fd : -1);
+}
+
 static void
 vtgpu_scanout_publish(struct vtgpu_softc *sc,
     const struct virtio_gpu_set_scanout *cmd,
@@ -684,7 +777,15 @@ vtgpu_scanout_publish(struct vtgpu_softc *sc,
 	 * memory the viewer already has.
 	 */
 	if (gpu_display_have_buffer(sc->vsc_display, cmd->resource_id)) {
-		gpu_display_frame(sc->vsc_display, cmd->resource_id, cmd->r.x,
+		/*
+		 * Defer to the fence when the guest supplied one: it marks the
+		 * point at which rendering into this buffer is complete.
+		 * Publishing on command arrival instead lets the viewer sample
+		 * a half-drawn frame, which is what made a fast renderer show
+		 * two frames at once while a slow one looked fine.
+		 */
+		gpu_display_frame(sc->vsc_display, cmd->resource_id,
+		    vtgpu_scanout_fence(sc, cmd->resource_id), cmd->r.x,
 		    cmd->r.y, cmd->r.width, cmd->r.height);
 		return;
 	}
@@ -718,8 +819,9 @@ vtgpu_scanout_publish(struct vtgpu_softc *sc,
 	    so.drm_fourcc, so.stride, offset, info->planes,
 	    (uintmax_t)info->modifiers);
 	gpu_display_scanout(sc->vsc_display, &so, dfd);	/* consumes dfd */
-	gpu_display_frame(sc->vsc_display, cmd->resource_id, cmd->r.x,
-	    cmd->r.y, cmd->r.width, cmd->r.height);
+	gpu_display_frame(sc->vsc_display, cmd->resource_id,
+	    vtgpu_scanout_fence(sc, cmd->resource_id), cmd->r.x, cmd->r.y,
+	    cmd->r.width, cmd->r.height);
 }
 
 static void
@@ -738,6 +840,20 @@ vtgpu_cmd_set_scanout(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	 */
 	if ((sc->vsc_scanout_probe || sc->vsc_display != NULL) && cmd != NULL) {
 		bool seen = false;
+
+		/*
+		 * Whether the guest fences these decides whether the publish
+		 * can be deferred to completion at all.  Report the first few
+		 * with their flags: if FENCE is never set, deferring is a
+		 * no-op and the ordering has to come from somewhere else.
+		 */
+		if (sc->vsc_scanout_seen_total++ < 3)
+			EPRINTLN("vtgpu: set_scanout #%u res=%u flags=0x%x "
+			    "fenced=%s fence_id=%ju",
+			    sc->vsc_scanout_seen_total, cmd->resource_id,
+			    hdr->flags,
+			    (hdr->flags & VIRTIO_GPU_FLAG_FENCE) ? "YES" : "no",
+			    (uintmax_t)hdr->fence_id);
 
 		for (unsigned i = 0; i < sc->vsc_seen_n; i++)
 			if (sc->vsc_seen_scanout[i] == cmd->resource_id) {
@@ -874,7 +990,8 @@ vtgpu_cmd_resource_flush(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	 */
 	if (sc->vsc_display != NULL && cmd != NULL &&
 	    cmd->resource_id == sc->vsc_scanout_res)
-		gpu_display_frame(sc->vsc_display, cmd->resource_id, cmd->r.x,
+		gpu_display_frame(sc->vsc_display, cmd->resource_id,
+		    vtgpu_scanout_fence(sc, cmd->resource_id), cmd->r.x,
 		    cmd->r.y, cmd->r.width, cmd->r.height);
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 	    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
@@ -2508,6 +2625,27 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 			 */
 			if (disp != NULL && strncmp(disp, "unix:", 5) == 0) {
 				sc->vsc_display = gpu_display_init(disp + 5);
+				/*
+				 * The USB tablet drops every event unless a
+				 * graphics context exists: umouse_event()
+				 * returns early when console_get_image() is
+				 * NULL, and scales the absolute coordinates it
+				 * reports against the image's dimensions.  The
+				 * fbuf device is what normally creates one, so
+				 * without graphics=yes the pointer is dead
+				 * while the PS/2 keyboard keeps working.
+				 *
+				 * Create one ourselves if nothing has, sized
+				 * to the scanout so the scaling comes out
+				 * right.  Only when the viewer is configured,
+				 * and only if fbuf has not already done it, so
+				 * that setups not using this option are
+				 * untouched.
+				 */
+				if (sc->vsc_display != NULL &&
+				    console_get_image() == NULL)
+					console_init((int)sc->vsc_width,
+					    (int)sc->vsc_height, NULL);
 			} else if (disp != NULL) {
 				EPRINTLN("vtgpu: display=%s not understood, "
 				    "expected unix:/path", disp);

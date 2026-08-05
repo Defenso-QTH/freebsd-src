@@ -98,9 +98,21 @@ struct gpu_display_scanout {
  * of them.  Re-exporting a dma_buf per frame would pass a new fd sixty times
  * a second for no reason.
  */
+/*
+ * has_fence means an fd rides with this message via SCM_RIGHTS: a sync_file
+ * for the guest's rendering into this buffer.  The viewer must wait on it
+ * before sampling.
+ *
+ * Without it the viewer can read a buffer the guest is still drawing into and
+ * show parts of two frames at once -- visible as a doubled image on anything
+ * rendering fast enough to lose the race.  The guest does not fence
+ * SET_SCANOUT itself, so the fence is created here, on the context that owns
+ * the resource.
+ */
 struct gpu_display_frame {
 	struct gpu_display_hdr	hdr;
 	uint32_t		buffer_id;	/* which buffer is now scanned out */
+	uint32_t		has_fence;	/* an fd accompanies this message */
 	uint32_t		x;
 	uint32_t		y;
 	uint32_t		w;
@@ -160,8 +172,12 @@ void	gpu_display_scanout(struct gpu_display *gd,
  * never blocks -- a viewer that is not keeping up loses frames rather than
  * stalling the guest.
  */
+/*
+ * fence_fd, if >= 0, is a sync_file the viewer must wait on before sampling
+ * the buffer; it is consumed (closed) either way.
+ */
 void	gpu_display_frame(struct gpu_display *gd, uint32_t buffer_id,
-	    uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+	    int fence_fd, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 
 /* Has this buffer already been exported to the viewer? */
 bool	gpu_display_have_buffer(struct gpu_display *gd, uint32_t buffer_id);
