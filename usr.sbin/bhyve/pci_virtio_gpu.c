@@ -287,6 +287,15 @@ struct vtgpu_fence {
  */
 #define	VTGPU_KQ_BACKSTOP_MS	1
 
+/* A SET_SCANOUT completion held back to pace the guest to a refresh rate. */
+struct vtgpu_paced {
+	TAILQ_ENTRY(vtgpu_paced)	vp_link;
+	struct vqueue_info		*vp_vq;
+	uint16_t			vp_idx;
+	uint32_t			vp_resp_len;
+	struct timespec			vp_due;
+};
+
 /* A frame held back until the host finishes rendering into its buffer. */
 struct vtgpu_pub {
 	TAILQ_ENTRY(vtgpu_pub)	vp_link;
@@ -397,6 +406,19 @@ struct vtgpu_softc {
 	uint32_t		vsc_last_submit_ctx;
 	uintmax_t		vsc_pub_late;
 	bool			vsc_defer_frames;
+	/*
+	 * Flip pacing.  Zero (the default) completes SET_SCANOUT immediately,
+	 * which is what a guest sees as "the flip is already done" -- so
+	 * nothing throttles it and it renders as fast as the host GPU allows.
+	 * A guest measured at 1014 frames a second against a 60Hz display
+	 * wastes almost all of that work, and successive displayed frames end
+	 * up far enough apart in a per-frame animation that they read as two
+	 * overlapping images.
+	 */
+	unsigned		vsc_refresh_hz;
+	struct timespec		vsc_next_flip;
+	TAILQ_HEAD(, vtgpu_paced) vsc_paced;
+	uintmax_t		vsc_paced_n;
 	uint8_t			*vsc_res_reported;
 	uint32_t		vsc_scanout_res;	/* 0 = none bound */
 	uint32_t		vsc_scanout_w;
@@ -533,6 +555,50 @@ vtgpu_pubs_expire(struct vtgpu_softc *sc)
 			    (uintmax_t)sc->vsc_pub_late);
 		free(vp);
 	}
+}
+
+static bool
+vtgpu_ts_reached(const struct timespec *due, const struct timespec *now)
+{
+
+	return (now->tv_sec > due->tv_sec ||
+	    (now->tv_sec == due->tv_sec && now->tv_nsec >= due->tv_nsec));
+}
+
+/*
+ * Complete any paced flip whose time has come.  Returns milliseconds until
+ * the next one is due, or -1 if none are waiting, so the worker can size its
+ * sleep instead of spinning.
+ */
+static int
+vtgpu_paced_expire(struct vtgpu_softc *sc)
+{
+	struct vtgpu_paced *pp, *tmp;
+	struct vqueue_info *last_vq = NULL;
+	struct timespec now;
+	long ms;
+
+	if (TAILQ_EMPTY(&sc->vsc_paced))
+		return (-1);
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	TAILQ_FOREACH_SAFE(pp, &sc->vsc_paced, vp_link, tmp) {
+		if (!vtgpu_ts_reached(&pp->vp_due, &now))
+			break;		/* queued in due order */
+		TAILQ_REMOVE(&sc->vsc_paced, pp, vp_link);
+		vq_relchain(pp->vp_vq, pp->vp_idx, pp->vp_resp_len);
+		last_vq = pp->vp_vq;
+		free(pp);
+	}
+	if (last_vq != NULL)
+		vq_endchains(last_vq, 0);
+
+	pp = TAILQ_FIRST(&sc->vsc_paced);
+	if (pp == NULL)
+		return (-1);
+	ms = (pp->vp_due.tv_sec - now.tv_sec) * 1000 +
+	    (pp->vp_due.tv_nsec - now.tv_nsec) / 1000000;
+	return (ms < 0 ? 0 : (int)ms);
 }
 
 /* ----------------------------------------------------------------------- */
@@ -1062,6 +1128,76 @@ vtgpu_cmd_set_scanout(struct vtgpu_softc *sc, struct vqueue_info *vq,
 			}
 		}
 	}
+	/*
+	 * Pace the completion when asked to.  The guest treats SET_SCANOUT
+	 * finishing as the flip having happened, so completing it immediately
+	 * removes the only thing that would make a compositor wait -- it then
+	 * renders continuously and throws most of the frames away.  Holding
+	 * the completion to a refresh cadence gives it something to wait for.
+	 *
+	 * Only for unfenced flips: a fenced one already has a completion
+	 * signal and vtgpu_respond() must keep owning it.
+	 */
+	if (sc->vsc_refresh_hz != 0 &&
+	    (hdr->flags & VIRTIO_GPU_FLAG_FENCE) == 0) {
+		struct virtio_gpu_ctrl_hdr resp = {
+			.type     = VIRTIO_GPU_RESP_OK_NODATA,
+			.fence_id = hdr->fence_id,
+			.ctx_id   = hdr->ctx_id,
+		};
+		struct vtgpu_paced *pp = calloc(1, sizeof(*pp));
+		size_t copy = sizeof(resp), off = 0;
+		struct timespec now;
+		long period_ns = 1000000000L / (long)sc->vsc_refresh_hz;
+
+		if (pp == NULL) {		/* fall back to immediate */
+			vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
+			    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
+			return;
+		}
+		for (int i = 0; i < nwiov && copy > 0; i++) {
+			size_t n = copy < wiov[i].iov_len ?
+			    copy : wiov[i].iov_len;
+			memcpy(wiov[i].iov_base, (const char *)&resp + off, n);
+			off += n;
+			copy -= n;
+		}
+
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if (!vtgpu_ts_reached(&sc->vsc_next_flip, &now))
+			sc->vsc_next_flip = now;
+		sc->vsc_next_flip.tv_nsec += period_ns;
+		while (sc->vsc_next_flip.tv_nsec >= 1000000000L) {
+			sc->vsc_next_flip.tv_sec++;
+			sc->vsc_next_flip.tv_nsec -= 1000000000L;
+		}
+		/*
+		 * Never let the schedule run more than two periods ahead: a
+		 * guest presenting far faster than the refresh rate would
+		 * otherwise queue completions minutes into the future and
+		 * appear to hang.  Clamping costs pacing accuracy under
+		 * overload, which is exactly when accuracy does not matter.
+		 */
+		{
+			struct timespec limit = now;
+
+			limit.tv_nsec += 2 * period_ns;
+			while (limit.tv_nsec >= 1000000000L) {
+				limit.tv_sec++;
+				limit.tv_nsec -= 1000000000L;
+			}
+			if (!vtgpu_ts_reached(&limit, &sc->vsc_next_flip))
+				sc->vsc_next_flip = limit;
+		}
+		pp->vp_due = sc->vsc_next_flip;
+		pp->vp_vq = vq;
+		pp->vp_idx = chain_idx;
+		pp->vp_resp_len = (uint32_t)sizeof(resp);
+		TAILQ_INSERT_TAIL(&sc->vsc_paced, pp, vp_link);
+		sc->vsc_paced_n++;
+		return;
+	}
+
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 	    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
 }
@@ -2039,6 +2175,9 @@ vtgpu_kq_setup(struct vtgpu_softc *sc)
 		sc->vsc_kq = -1;
 		return;
 	}
+	if (sc->vsc_refresh_hz != 0)
+		EPRINTLN("vtgpu: flip pacing active (%u Hz)",
+		    sc->vsc_refresh_hz);
 	if (sc->vsc_defer_frames)
 		EPRINTLN("vtgpu: frame deferral ENABLED (timeout %dms) -- "
 		    "known to hang the guest, see pci_virtio_gpu.c",
@@ -2075,6 +2214,29 @@ vtgpu_worker(void *arg)
 		while (sc->vsc_running &&
 		    !vq_has_descs(&sc->vsc_queues[VTGPU_CONTROLQ]) &&
 		    !vq_has_descs(&sc->vsc_queues[VTGPU_CURSORQ])) {
+			if (!TAILQ_EMPTY(&sc->vsc_paced)) {
+				/*
+				 * A flip completion is due shortly; sleep
+				 * only that long.  The guest is waiting on
+				 * it, so overshooting shows up directly as a
+				 * lower frame rate.
+				 */
+				int due_ms = vtgpu_paced_expire(sc);
+
+				if (due_ms >= 0) {
+					struct timespec ts = {
+						.tv_sec = 0,
+						.tv_nsec = (due_ms ? due_ms :
+						    1) * 1000000L
+					};
+
+					pthread_mutex_unlock(&sc->vsc_mtx);
+					nanosleep(&ts, NULL);
+					pthread_mutex_lock(&sc->vsc_mtx);
+					vtgpu_paced_expire(sc);
+					continue;
+				}
+			}
 			if (!TAILQ_EMPTY(&sc->vsc_fences) ||
 			    !TAILQ_EMPTY(&sc->vsc_pubs)) {
 				/*
@@ -2774,6 +2936,7 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 	sc->vsc_poll_fd = -1;
 	TAILQ_INIT(&sc->vsc_fences);
 	TAILQ_INIT(&sc->vsc_pubs);
+	TAILQ_INIT(&sc->vsc_paced);
 	sc->vsc_res_ctx = calloc(VTGPU_RES_CTX_MAX, sizeof(*sc->vsc_res_ctx));
 	sc->vsc_res_reported = calloc(VTGPU_RES_CTX_MAX,
 	    sizeof(*sc->vsc_res_reported));
@@ -2797,6 +2960,19 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 		    "scanout_linear", false);
 		sc->vsc_defer_frames = get_config_bool_node_default(nvl,
 		    "frame_fence", false);
+		{
+			const char *r = get_config_value_node(nvl, "refresh");
+
+			if (r != NULL) {
+				int hz = atoi(r);
+
+				if (hz > 0 && hz <= 1000)
+					sc->vsc_refresh_hz = (unsigned)hz;
+				else
+					EPRINTLN("vtgpu: refresh=%s ignored, "
+					    "expected 1..1000", r);
+			}
+		}
 		{
 			const char *disp = get_config_value_node(nvl, "display");
 
