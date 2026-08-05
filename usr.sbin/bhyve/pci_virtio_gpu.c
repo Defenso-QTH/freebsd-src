@@ -359,6 +359,7 @@ struct vtgpu_softc {
 	/* Set by SET_SCANOUT, consumed by the response path. */
 	unsigned		vsc_scanout_seen_total;
 	uint32_t		vsc_own_fence_next;
+	unsigned		vsc_fence_reports;
 	/*
 	 * Context that created each scanout-capable resource.  A fence has to
 	 * be created on the context that did the drawing, and SET_SCANOUT
@@ -726,25 +727,34 @@ static int
 vtgpu_scanout_fence(struct vtgpu_softc *sc, uint32_t res_id)
 {
 	uint32_t ctx_id = 0, fid;
-	int fd = -1;
+	int fd = -1, cret, eret;
 
 	for (unsigned i = 0; i < sc->vsc_scanout_ctx_n; i++)
 		if (sc->vsc_scanout_ctx[i].res_id == res_id) {
 			ctx_id = sc->vsc_scanout_ctx[i].ctx_id;
 			break;
 		}
-	if (ctx_id == 0)
-		return (-1);
 
 	if (sc->vsc_own_fence_next < VTGPU_OWN_FENCE_BASE)
 		sc->vsc_own_fence_next = VTGPU_OWN_FENCE_BASE;
 	fid = sc->vsc_own_fence_next++;
 
-	if (virgl_renderer_create_fence((int)fid, ctx_id) != 0)
-		return (-1);
-	if (virgl_renderer_export_fence(fid, &fd) != 0)
-		return (-1);
-	return (fd);
+	cret = ctx_id != 0 ?
+	    virgl_renderer_create_fence((int)fid, ctx_id) : -1;
+	eret = cret == 0 ? virgl_renderer_export_fence(fid, &fd) : -1;
+
+	/*
+	 * Report the first few attempts.  Every step here can fail quietly --
+	 * no context recorded for the resource, no fence created, nothing
+	 * exportable -- and each failure looks identical from the outside: the
+	 * viewer simply does not wait, exactly as before the fence existed.
+	 */
+	if (sc->vsc_fence_reports < 3) {
+		sc->vsc_fence_reports++;
+		EPRINTLN("vtgpu: scanout fence res=%u ctx=%u create=%d "
+		    "export=%d fd=%d", res_id, ctx_id, cret, eret, fd);
+	}
+	return (eret == 0 ? fd : -1);
 }
 
 static void
