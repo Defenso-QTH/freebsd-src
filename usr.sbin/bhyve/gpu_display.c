@@ -58,10 +58,26 @@ struct gpu_display {
 		int			fd;
 	}		bufs[GPU_DISPLAY_MAX_BUFS];
 
+	/*
+	 * The cursor last set by the guest, kept so a viewer connecting after
+	 * the guest set it is not left with no pointer until the guest happens
+	 * to change it -- which for a desktop that set its cursor at startup
+	 * may be never.
+	 */
+	struct gpu_display_cursor	cursor;
+	void				*cursor_pixels;
+	size_t				cursor_bytes;
+	bool				cursor_valid;
+
 	uint64_t	frames_sent;
 	uint64_t	frames_dropped;
 	uint64_t	keys_in;
 	uint64_t	ptrs_in;
+	uint64_t	rels_in;
+
+	/* Run when the viewer says it has finished with a buffer. */
+	void		(*release_cb)(void *arg, uint32_t buffer_id);
+	void		*release_arg;
 
 	/* Partial input message accumulator. */
 	uint8_t		inbuf[GPU_DISPLAY_MAX_MSG];
@@ -117,13 +133,32 @@ gd_drop_client(struct gpu_display *gd)
 
 	if (gd->cfd < 0)
 		return;
+	/*
+	 * Let mevent close the descriptor.  mevent_delete() only queues the
+	 * removal, so closing it here leaves the fd registered in the kqueue
+	 * until the mevent thread catches up -- which is where the "kevent
+	 * change: Bad file descriptor" on disconnect came from.
+	 *
+	 * Worse, this runs on the virtio-gpu worker thread whenever a send
+	 * fails, while the guest is exporting dma_bufs as fast as it can
+	 * allocate them.  A number freed here is reused almost immediately,
+	 * and gd_client_readable() only checks that the fd *number* matches,
+	 * so a stale event delivered after a reconnect could be accepted as
+	 * belonging to the new connection.
+	 *
+	 * mevent_delete_close() removes it from the kqueue and closes it on
+	 * the mevent thread, in that order.  Clearing cfd here means any
+	 * event arriving in the meantime is rejected by the number check.
+	 */
 	if (gd->cevp != NULL) {
-		mevent_delete(gd->cevp);
+		mevent_delete_close(gd->cevp);
 		gd->cevp = NULL;
+	} else {
+		close(gd->cfd);
 	}
-	close(gd->cfd);
 	gd->cfd = -1;
 	gd->inlen = 0;
+	gd->rels_in = 0;
 	EPRINTLN("gpu_display: viewer disconnected (frames sent=%ju "
 	    "dropped=%ju)", (uintmax_t)gd->frames_sent,
 	    (uintmax_t)gd->frames_dropped);
@@ -169,10 +204,63 @@ gd_handle_input(struct gpu_display *gd, const struct gpu_display_hdr *hdr,
 		console_ptr_event((uint8_t)p->button, p->x, p->y);
 		break;
 	}
+	case GPU_DISPLAY_MSG_RELEASE: {
+		const struct gpu_display_release *r = (const void *)hdr;
+		void (*cb)(void *, uint32_t);
+		void *arg;
+
+		if (len < sizeof(*r))
+			return;
+		if (gd->rels_in++ == 0)
+			EPRINTLN("gpu_display: viewer releases buffers "
+			    "(buf=%u); guest presents will now be paced by "
+			    "what the viewer has actually drawn",
+			    r->buffer_id);
+		/*
+		 * Drop the lock across the callback: it completes a guest
+		 * descriptor and so takes the device's own mutex, which the
+		 * worker holds while calling into gpu_display_frame().
+		 * Holding both here in the opposite order would deadlock.
+		 */
+		cb = gd->release_cb;
+		arg = gd->release_arg;
+		if (cb != NULL) {
+			pthread_mutex_unlock(&gd->mtx);
+			cb(arg, r->buffer_id);
+			pthread_mutex_lock(&gd->mtx);
+		}
+		break;
+	}
 	default:
 		/* Unknown types are skipped by length, not fatal. */
 		break;
 	}
+}
+
+bool
+gpu_display_connected(struct gpu_display *gd)
+{
+	bool up;
+
+	if (gd == NULL)
+		return (false);
+	pthread_mutex_lock(&gd->mtx);
+	up = gd->cfd >= 0;
+	pthread_mutex_unlock(&gd->mtx);
+	return (up);
+}
+
+void
+gpu_display_set_release_cb(struct gpu_display *gd,
+    void (*cb)(void *arg, uint32_t buffer_id), void *arg)
+{
+
+	if (gd == NULL)
+		return;
+	pthread_mutex_lock(&gd->mtx);
+	gd->release_cb = cb;
+	gd->release_arg = arg;
+	pthread_mutex_unlock(&gd->mtx);
 }
 
 static void
@@ -222,6 +310,8 @@ gd_client_readable(int fd, enum ev_type ev __unused, void *arg)
 	pthread_mutex_unlock(&gd->mtx);
 }
 
+static void gd_send_cursor_locked(struct gpu_display *gd);
+
 static void
 gd_accept(int fd, enum ev_type ev __unused, void *arg)
 {
@@ -260,6 +350,13 @@ gd_accept(int fd, enum ev_type ev __unused, void *arg)
 		pthread_mutex_unlock(&gd->mtx);
 		return;
 	}
+
+	/*
+	 * Same reasoning for the cursor: a desktop sets it once at startup, so
+	 * a viewer attaching later would otherwise have no pointer for the
+	 * rest of the session.
+	 */
+	gd_send_cursor_locked(gd);
 
 	/*
 	 * Replay every known buffer so a viewer connecting mid-session can
@@ -449,6 +546,77 @@ gpu_display_frame(struct gpu_display *gd, uint32_t buffer_id, int fence_fd,
 	pthread_mutex_unlock(&gd->mtx);
 	if (fence_fd >= 0)
 		close(fence_fd);
+}
+
+/* Caller must hold gd->mtx.  Declared above gd_accept. */
+static void
+gd_send_cursor_locked(struct gpu_display *gd)
+{
+	uint8_t buf[GPU_DISPLAY_MAX_MSG];
+	size_t len = sizeof(struct gpu_display_cursor);
+
+	if (!gd->cursor_valid || gd->cfd < 0)
+		return;
+	if (!gd->cursor.hidden)
+		len += gd->cursor_bytes;
+	if (len > sizeof(buf))
+		return;			/* refused at set time; belt and braces */
+
+	memcpy(buf, &gd->cursor, sizeof(gd->cursor));
+	((struct gpu_display_cursor *)buf)->hdr.len = (uint32_t)len;
+	if (!gd->cursor.hidden && gd->cursor_pixels != NULL)
+		memcpy(buf + sizeof(gd->cursor), gd->cursor_pixels,
+		    gd->cursor_bytes);
+
+	if (!gd_send(gd, buf, len, -1) &&
+	    errno != EAGAIN && errno != EWOULDBLOCK)
+		gd_drop_client(gd);
+}
+
+void
+gpu_display_cursor(struct gpu_display *gd, uint32_t width, uint32_t height,
+    uint32_t hot_x, uint32_t hot_y, const void *pixels)
+{
+	size_t bytes;
+
+	if (gd == NULL)
+		return;
+
+	bytes = (size_t)width * height * 4;
+	if (pixels != NULL &&
+	    sizeof(struct gpu_display_cursor) + bytes > GPU_DISPLAY_MAX_MSG) {
+		EPRINTLN("gpu_display: cursor %ux%u too large, ignored",
+		    width, height);
+		return;
+	}
+
+	pthread_mutex_lock(&gd->mtx);
+
+	memset(&gd->cursor, 0, sizeof(gd->cursor));
+	gd->cursor.hdr.type = GPU_DISPLAY_MSG_CURSOR;
+	gd->cursor.width = width;
+	gd->cursor.height = height;
+	gd->cursor.hot_x = hot_x;
+	gd->cursor.hot_y = hot_y;
+	gd->cursor.hidden = pixels == NULL;
+
+	if (pixels != NULL) {
+		if (bytes > gd->cursor_bytes || gd->cursor_pixels == NULL) {
+			void *n = realloc(gd->cursor_pixels, bytes);
+
+			if (n == NULL) {
+				pthread_mutex_unlock(&gd->mtx);
+				return;
+			}
+			gd->cursor_pixels = n;
+		}
+		memcpy(gd->cursor_pixels, pixels, bytes);
+		gd->cursor_bytes = bytes;
+	}
+	gd->cursor_valid = true;
+
+	gd_send_cursor_locked(gd);
+	pthread_mutex_unlock(&gd->mtx);
 }
 
 void
