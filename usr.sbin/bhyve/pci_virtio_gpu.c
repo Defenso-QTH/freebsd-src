@@ -293,7 +293,17 @@ struct vtgpu_pub {
 	uint32_t		vp_fence_id;
 	uint32_t		vp_res_id;
 	uint32_t		vp_x, vp_y, vp_w, vp_h;
+	struct timespec		vp_when;
 };
+
+/*
+ * How long a frame may be held waiting for its fence before it is published
+ * anyway.  A deferral that never completes is indistinguishable from a frozen
+ * display, and a stale frame on screen is a far better failure than no frames
+ * at all -- so the wait has a deadline, and crossing it is reported rather
+ * than hidden.
+ */
+#define	VTGPU_PUB_TIMEOUT_MS	50
 
 struct vtgpu_softc {
 	struct virtio_softc	vsc_vs;
@@ -385,6 +395,7 @@ struct vtgpu_softc {
 	 */
 	uint32_t		*vsc_res_ctx;
 	uint32_t		vsc_last_submit_ctx;
+	uintmax_t		vsc_pub_late;
 	uint8_t			*vsc_res_reported;
 	uint32_t		vsc_scanout_res;	/* 0 = none bound */
 	uint32_t		vsc_scanout_w;
@@ -488,6 +499,39 @@ vtgpu_res_ctx(const struct vtgpu_softc *sc, uint32_t res_id)
 	if (sc->vsc_res_ctx == NULL || res_id >= VTGPU_RES_CTX_MAX)
 		return (0);
 	return (sc->vsc_res_ctx[res_id]);
+}
+
+/*
+ * Publish any frame whose fence has not retired in time.  Called after every
+ * virgl_renderer_poll(): if fences are retiring normally this finds nothing.
+ */
+static void
+vtgpu_pubs_expire(struct vtgpu_softc *sc)
+{
+	struct vtgpu_pub *vp, *tmp;
+	struct timespec now;
+
+	if (TAILQ_EMPTY(&sc->vsc_pubs))
+		return;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	TAILQ_FOREACH_SAFE(vp, &sc->vsc_pubs, vp_link, tmp) {
+		long ms = (now.tv_sec - vp->vp_when.tv_sec) * 1000 +
+		    (now.tv_nsec - vp->vp_when.tv_nsec) / 1000000;
+
+		if (ms < VTGPU_PUB_TIMEOUT_MS)
+			continue;
+		TAILQ_REMOVE(&sc->vsc_pubs, vp, vp_link);
+		if (sc->vsc_display != NULL)
+			gpu_display_frame(sc->vsc_display, vp->vp_res_id, -1,
+			    vp->vp_x, vp->vp_y, vp->vp_w, vp->vp_h);
+		if (sc->vsc_pub_late++ % 256 == 0)
+			EPRINTLN("vtgpu: frame res=%u fence %u did not retire "
+			    "in %ldms, published anyway (late=%ju)",
+			    vp->vp_res_id, vp->vp_fence_id, ms,
+			    (uintmax_t)sc->vsc_pub_late);
+		free(vp);
+	}
 }
 
 /* ----------------------------------------------------------------------- */
@@ -820,6 +864,7 @@ vtgpu_publish_fenced(struct vtgpu_softc *sc, uint32_t res_id,
 	vp->vp_fence_id = fid;
 	vp->vp_res_id   = res_id;
 	vp->vp_x = x; vp->vp_y = y; vp->vp_w = w; vp->vp_h = h;
+	clock_gettime(CLOCK_MONOTONIC, &vp->vp_when);
 	TAILQ_INSERT_TAIL(&sc->vsc_pubs, vp, vp_link);
 
 	if (sc->vsc_res_reported != NULL && res_id < VTGPU_RES_CTX_MAX &&
@@ -1901,6 +1946,7 @@ vtgpu_process_controlq(struct vtgpu_softc *sc, int qidx)
 
 		/* Drain any fences that have completed. */
 		virgl_renderer_poll();
+		vtgpu_pubs_expire(sc);
 	}
 }
 
@@ -1967,6 +2013,8 @@ vtgpu_kq_setup(struct vtgpu_softc *sc)
 		sc->vsc_kq = -1;
 		return;
 	}
+	EPRINTLN("vtgpu: frame deferral active (timeout %dms)",
+	    VTGPU_PUB_TIMEOUT_MS);
 	EPRINTLN("vtgpu: event-driven wait active (fence fd=%d%s)",
 	    sc->vsc_poll_fd,
 	    sc->vsc_poll_fd < 0 ? ", queue kicks only" : "");
@@ -2057,6 +2105,7 @@ vtgpu_worker(void *arg)
 					sc->vsc_fwait_late++;
 				}
 				virgl_renderer_poll();
+				vtgpu_pubs_expire(sc);
 
 				/*
 				 * Periodic, and rare enough to be free: tells
