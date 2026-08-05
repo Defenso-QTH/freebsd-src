@@ -68,7 +68,6 @@
  * If it ever disappears the build breaks loudly rather than silently, and the
  * fallback is simply not to fence.
  */
-#define	VIRGL_RENDERER_UNSTABLE_APIS 1
 #include <virglrenderer.h>
 
 /* virgl_protocol.h is not installed by the virglrenderer port; define here. */
@@ -288,6 +287,14 @@ struct vtgpu_fence {
  */
 #define	VTGPU_KQ_BACKSTOP_MS	1
 
+/* A frame held back until the host finishes rendering into its buffer. */
+struct vtgpu_pub {
+	TAILQ_ENTRY(vtgpu_pub)	vp_link;
+	uint32_t		vp_fence_id;
+	uint32_t		vp_res_id;
+	uint32_t		vp_x, vp_y, vp_w, vp_h;
+};
+
 struct vtgpu_softc {
 	struct virtio_softc	vsc_vs;
 	struct virtio_gpu_config vsc_cfg;
@@ -361,6 +368,7 @@ struct vtgpu_softc {
 	unsigned		vsc_scanout_seen_total;
 	uint32_t		vsc_own_fence_next;
 	unsigned		vsc_fence_reports;
+	TAILQ_HEAD(, vtgpu_pub)	vsc_pubs;
 	/*
 	 * Context that created each scanout-capable resource.  A fence has to
 	 * be created on the context that did the drawing, and SET_SCANOUT
@@ -451,8 +459,27 @@ vtgpu_write_fence(void *cookie, uint32_t fence_id)
 	 * Called from within virgl_renderer_poll(), which we invoke on the
 	 * worker thread — so vsc_mtx is already held by the caller.
 	 */
-	if (fence_id >= VTGPU_OWN_FENCE_BASE)
-		return;		/* ours; nothing is queued against it */
+	if (fence_id >= VTGPU_OWN_FENCE_BASE) {
+		struct vtgpu_pub *vp, *vtmp;
+
+		/*
+		 * Ours: no descriptor is queued against it, it only says the
+		 * host has finished rendering.  Release every frame waiting on
+		 * this fence or an earlier one -- fences retire in order, so an
+		 * older one still on the list has already completed.
+		 */
+		TAILQ_FOREACH_SAFE(vp, &sc->vsc_pubs, vp_link, vtmp) {
+			if (vp->vp_fence_id > fence_id)
+				break;
+			TAILQ_REMOVE(&sc->vsc_pubs, vp, vp_link);
+			if (sc->vsc_display != NULL)
+				gpu_display_frame(sc->vsc_display,
+				    vp->vp_res_id, -1, vp->vp_x, vp->vp_y,
+				    vp->vp_w, vp->vp_h);
+			free(vp);
+		}
+		return;
+	}
 	TAILQ_FOREACH_SAFE(vf, &sc->vsc_fences, vf_link, tmp) {
 		if ((uint32_t)vf->vf_id > fence_id)
 			break;
@@ -715,47 +742,62 @@ vtgpu_cmd_resource_unref(struct vtgpu_softc *sc, struct vqueue_info *vq,
  * hardware, and writing it before knowing would be guessing.
  */
 /*
- * A sync_file for the guest's rendering into this scanout resource, or -1.
+ * Publish a frame to the viewer once the host has finished rendering it.
  *
- * The guest does not fence SET_SCANOUT, so there is no completion signal to
- * ride on; make one on the context that created the resource, which is the
- * context that drew into it.  Only vrend and drm contexts register an
- * exportable fd (virgl_fence_set_fd() is called from nowhere in venus), which
- * is fine while the compositor renders through GL -- if it ever moves to the
- * Vulkan renderer this returns -1 and the viewer goes back to not waiting.
+ * The guest is done when SET_SCANOUT arrives, but virglrenderer executes the
+ * guest's GL commands on the host GPU asynchronously, so the dma_buf may
+ * still be being written when we hand it over.  The viewer then samples a
+ * buffer holding part of the new frame and part of what that buffer held two
+ * frames ago -- which is why a fast renderer showed two images at once and a
+ * slow one looked fine.
+ *
+ * virgl_renderer_create_fence() against the context that drew the resource
+ * retires through write_fence when that work completes, so hold the frame
+ * until then.  This is the stable fence API: no fd is exported and nothing
+ * here needs VIRGL_RENDERER_UNSTABLE_APIS.  If no fence can be created the
+ * frame goes out immediately, which is the old behaviour.
  */
-static int
-vtgpu_scanout_fence(struct vtgpu_softc *sc, uint32_t res_id)
+static void
+vtgpu_publish_fenced(struct vtgpu_softc *sc, uint32_t res_id,
+    uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
 	uint32_t ctx_id = 0, fid;
-	int fd = -1, cret, eret;
+	struct vtgpu_pub *vp;
+
+	if (sc->vsc_display == NULL)
+		return;
 
 	for (unsigned i = 0; i < sc->vsc_scanout_ctx_n; i++)
 		if (sc->vsc_scanout_ctx[i].res_id == res_id) {
 			ctx_id = sc->vsc_scanout_ctx[i].ctx_id;
 			break;
 		}
+	if (ctx_id == 0)
+		goto publish_now;
 
 	if (sc->vsc_own_fence_next < VTGPU_OWN_FENCE_BASE)
 		sc->vsc_own_fence_next = VTGPU_OWN_FENCE_BASE;
 	fid = sc->vsc_own_fence_next++;
 
-	cret = ctx_id != 0 ?
-	    virgl_renderer_create_fence((int)fid, ctx_id) : -1;
-	eret = cret == 0 ? virgl_renderer_export_fence(fid, &fd) : -1;
+	if (virgl_renderer_create_fence((int)fid, ctx_id) != 0)
+		goto publish_now;
+	if ((vp = calloc(1, sizeof(*vp))) == NULL)
+		goto publish_now;
 
-	/*
-	 * Report the first few attempts.  Every step here can fail quietly --
-	 * no context recorded for the resource, no fence created, nothing
-	 * exportable -- and each failure looks identical from the outside: the
-	 * viewer simply does not wait, exactly as before the fence existed.
-	 */
+	vp->vp_fence_id = fid;
+	vp->vp_res_id   = res_id;
+	vp->vp_x = x; vp->vp_y = y; vp->vp_w = w; vp->vp_h = h;
+	TAILQ_INSERT_TAIL(&sc->vsc_pubs, vp, vp_link);
+
 	if (sc->vsc_fence_reports < 3) {
 		sc->vsc_fence_reports++;
-		EPRINTLN("vtgpu: scanout fence res=%u ctx=%u create=%d "
-		    "export=%d fd=%d", res_id, ctx_id, cret, eret, fd);
+		EPRINTLN("vtgpu: deferring frame res=%u until fence %u on "
+		    "ctx=%u retires", res_id, fid, ctx_id);
 	}
-	return (eret == 0 ? fd : -1);
+	return;
+
+publish_now:
+	gpu_display_frame(sc->vsc_display, res_id, -1, x, y, w, h);
 }
 
 static void
@@ -784,9 +826,8 @@ vtgpu_scanout_publish(struct vtgpu_softc *sc,
 		 * a half-drawn frame, which is what made a fast renderer show
 		 * two frames at once while a slow one looked fine.
 		 */
-		gpu_display_frame(sc->vsc_display, cmd->resource_id,
-		    vtgpu_scanout_fence(sc, cmd->resource_id), cmd->r.x,
-		    cmd->r.y, cmd->r.width, cmd->r.height);
+		vtgpu_publish_fenced(sc, cmd->resource_id, cmd->r.x, cmd->r.y,
+		    cmd->r.width, cmd->r.height);
 		return;
 	}
 
@@ -819,8 +860,7 @@ vtgpu_scanout_publish(struct vtgpu_softc *sc,
 	    so.drm_fourcc, so.stride, offset, info->planes,
 	    (uintmax_t)info->modifiers);
 	gpu_display_scanout(sc->vsc_display, &so, dfd);	/* consumes dfd */
-	gpu_display_frame(sc->vsc_display, cmd->resource_id,
-	    vtgpu_scanout_fence(sc, cmd->resource_id), cmd->r.x, cmd->r.y,
+	vtgpu_publish_fenced(sc, cmd->resource_id, cmd->r.x, cmd->r.y,
 	    cmd->r.width, cmd->r.height);
 }
 
@@ -990,9 +1030,8 @@ vtgpu_cmd_resource_flush(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	 */
 	if (sc->vsc_display != NULL && cmd != NULL &&
 	    cmd->resource_id == sc->vsc_scanout_res)
-		gpu_display_frame(sc->vsc_display, cmd->resource_id,
-		    vtgpu_scanout_fence(sc, cmd->resource_id), cmd->r.x,
-		    cmd->r.y, cmd->r.width, cmd->r.height);
+		vtgpu_publish_fenced(sc, cmd->resource_id, cmd->r.x, cmd->r.y,
+		    cmd->r.width, cmd->r.height);
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 	    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
 }
@@ -2597,6 +2636,7 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 	sc->vsc_kq = -1;
 	sc->vsc_poll_fd = -1;
 	TAILQ_INIT(&sc->vsc_fences);
+	TAILQ_INIT(&sc->vsc_pubs);
 
 	render_node     = NULL;
 	wayland_display = NULL;
