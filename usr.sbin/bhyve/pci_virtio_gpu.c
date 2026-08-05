@@ -728,12 +728,15 @@ vtgpu_cmd_set_scanout(struct vtgpu_softc *sc, struct vqueue_info *vq,
     const struct virtio_gpu_set_scanout *cmd, struct iovec *wiov, int nwiov)
 {
 	/*
-	 * Headless: accept the scanout binding but don't present anywhere.
-	 * Under scanout_probe we still record what the guest bound, so
-	 * RESOURCE_FLUSH knows which resource is the display and how big it
-	 * is.  resource_id 0 unbinds.
+	 * Record what the guest bound so the rest of the device knows which
+	 * resource is the display and how big it is.  Needed whenever a viewer
+	 * is attached or the readback probe is running; resource_id 0 unbinds.
+	 *
+	 * A page-flipping compositor comes through here every frame, so the
+	 * expensive part -- the virglrenderer query, the log line, sizing the
+	 * readback buffer -- is done once per distinct buffer, not per flip.
 	 */
-	if (sc->vsc_scanout_probe && cmd != NULL) {
+	if ((sc->vsc_scanout_probe || sc->vsc_display != NULL) && cmd != NULL) {
 		bool seen = false;
 
 		for (unsigned i = 0; i < sc->vsc_seen_n; i++)
@@ -752,7 +755,8 @@ vtgpu_cmd_set_scanout(struct vtgpu_softc *sc, struct vqueue_info *vq,
 		if (cmd->resource_id != 0 && !seen) {
 			size_t need = (size_t)cmd->r.width * cmd->r.height * 4;
 
-			if (need > sc->vsc_scanout_bufsz) {
+			if (sc->vsc_scanout_probe &&
+			    need > sc->vsc_scanout_bufsz) {
 				free(sc->vsc_scanout_buf);
 				sc->vsc_scanout_buf = malloc(need);
 				sc->vsc_scanout_bufsz =
@@ -2504,7 +2508,6 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 			 */
 			if (disp != NULL && strncmp(disp, "unix:", 5) == 0) {
 				sc->vsc_display = gpu_display_init(disp + 5);
-				sc->vsc_scanout_probe = true;
 			} else if (disp != NULL) {
 				EPRINTLN("vtgpu: display=%s not understood, "
 				    "expected unix:/path", disp);
