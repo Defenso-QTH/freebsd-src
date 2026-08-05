@@ -249,6 +249,13 @@ struct vtgpu_fence {
 	struct vqueue_info	*vf_vq;
 	uint16_t		 vf_idx;
 	uint32_t		 vf_resp_len;
+	/*
+	 * Scanout buffer to publish to the viewer once this fence fires, or 0.
+	 * A fenced SET_SCANOUT means "this buffer is the display once the work
+	 * behind it completes"; publishing when the command arrives instead
+	 * hands the viewer a buffer the guest may still be rendering into.
+	 */
+	uint32_t		 vf_publish;
 	TAILQ_ENTRY(vtgpu_fence) vf_link;
 };
 
@@ -338,6 +345,8 @@ struct vtgpu_softc {
 	 */
 	uint32_t		vsc_seen_scanout[8];
 	unsigned		vsc_seen_n;
+	/* Set by SET_SCANOUT, consumed by the response path. */
+	uint32_t		vsc_pending_publish;
 	uint32_t		vsc_scanout_res;	/* 0 = none bound */
 	uint32_t		vsc_scanout_w;
 	uint32_t		vsc_scanout_h;
@@ -422,6 +431,9 @@ vtgpu_write_fence(void *cookie, uint32_t fence_id)
 		if ((uint32_t)vf->vf_id > fence_id)
 			break;
 		TAILQ_REMOVE(&sc->vsc_fences, vf, vf_link);
+		if (vf->vf_publish != 0)
+			gpu_display_frame(sc->vsc_display, vf->vf_publish, 0, 0,
+			    sc->vsc_scanout_w, sc->vsc_scanout_h);
 		vq_relchain(vf->vf_vq, vf->vf_idx, vf->vf_resp_len);
 		vq_endchains(vf->vf_vq, 0);
 		free(vf);
@@ -484,6 +496,13 @@ vtgpu_respond(struct vtgpu_softc *sc, struct vqueue_info *vq,
 		vf->vf_vq       = vq;
 		vf->vf_idx      = chain_idx;
 		vf->vf_resp_len = (uint32_t)resp_len;
+		/*
+		 * Carry any pending scanout publish onto the fence so the
+		 * viewer is told about the buffer only once the guest's work
+		 * on it has completed.
+		 */
+		vf->vf_publish = sc->vsc_pending_publish;
+		sc->vsc_pending_publish = 0;
 		virgl_renderer_create_fence((int)hdr->fence_id, hdr->ctx_id);
 		TAILQ_INSERT_TAIL(&sc->vsc_fences, vf, vf_link);
 	} else {
@@ -667,6 +686,7 @@ vtgpu_cmd_resource_unref(struct vtgpu_softc *sc, struct vqueue_info *vq,
  */
 static void
 vtgpu_scanout_publish(struct vtgpu_softc *sc,
+    const struct virtio_gpu_ctrl_hdr *hdr,
     const struct virtio_gpu_set_scanout *cmd,
     const struct virgl_renderer_resource_info_ext *info)
 {
@@ -684,8 +704,18 @@ vtgpu_scanout_publish(struct vtgpu_softc *sc,
 	 * memory the viewer already has.
 	 */
 	if (gpu_display_have_buffer(sc->vsc_display, cmd->resource_id)) {
-		gpu_display_frame(sc->vsc_display, cmd->resource_id, cmd->r.x,
-		    cmd->r.y, cmd->r.width, cmd->r.height);
+		/*
+		 * Defer to the fence when the guest supplied one: it marks the
+		 * point at which rendering into this buffer is complete.
+		 * Publishing on command arrival instead lets the viewer sample
+		 * a half-drawn frame, which is what made a fast renderer show
+		 * two frames at once while a slow one looked fine.
+		 */
+		if ((hdr->flags & VIRTIO_GPU_FLAG_FENCE) != 0)
+			sc->vsc_pending_publish = cmd->resource_id;
+		else
+			gpu_display_frame(sc->vsc_display, cmd->resource_id,
+			    cmd->r.x, cmd->r.y, cmd->r.width, cmd->r.height);
 		return;
 	}
 
@@ -718,8 +748,11 @@ vtgpu_scanout_publish(struct vtgpu_softc *sc,
 	    so.drm_fourcc, so.stride, offset, info->planes,
 	    (uintmax_t)info->modifiers);
 	gpu_display_scanout(sc->vsc_display, &so, dfd);	/* consumes dfd */
-	gpu_display_frame(sc->vsc_display, cmd->resource_id, cmd->r.x,
-	    cmd->r.y, cmd->r.width, cmd->r.height);
+	if ((hdr->flags & VIRTIO_GPU_FLAG_FENCE) != 0)
+		sc->vsc_pending_publish = cmd->resource_id;
+	else
+		gpu_display_frame(sc->vsc_display, cmd->resource_id, cmd->r.x,
+		    cmd->r.y, cmd->r.width, cmd->r.height);
 }
 
 static void
@@ -787,7 +820,7 @@ vtgpu_cmd_set_scanout(struct vtgpu_softc *sc, struct vqueue_info *vq,
 				EPRINTLN("vtgpu: scanout res=%u get_info_ext "
 				    "failed ret=%d", cmd->resource_id, iret);
 			} else {
-				vtgpu_scanout_publish(sc, cmd, &info);
+				vtgpu_scanout_publish(sc, hdr, cmd, &info);
 				EPRINTLN("vtgpu: scanout res=%u dmabuf_export=%s "
 				    "fourcc=0x%08x stride=%u planes=%d "
 				    "modifier=0x%016jx fmt=%u %ux%u",
