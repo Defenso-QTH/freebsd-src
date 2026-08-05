@@ -60,6 +60,8 @@ struct gpu_display {
 
 	uint64_t	frames_sent;
 	uint64_t	frames_dropped;
+	uint64_t	keys_in;
+	uint64_t	ptrs_in;
 
 	/* Partial input message accumulator. */
 	uint8_t		inbuf[GPU_DISPLAY_MAX_MSG];
@@ -133,7 +135,8 @@ gd_drop_client(struct gpu_display *gd)
  * guest was configured with and nothing in console.c changes.
  */
 static void
-gd_handle_input(const struct gpu_display_hdr *hdr, size_t len)
+gd_handle_input(struct gpu_display *gd, const struct gpu_display_hdr *hdr,
+    size_t len)
 {
 
 	switch (hdr->type) {
@@ -142,6 +145,16 @@ gd_handle_input(const struct gpu_display_hdr *hdr, size_t len)
 
 		if (len < sizeof(*k))
 			return;
+		/*
+		 * Report the first of each kind, then rarely.  Whether events
+		 * arrive here at all is the question that splits "the viewer
+		 * is not sending" from "the guest is not receiving", and the
+		 * two need opposite fixes.
+		 */
+		if (gd->keys_in++ == 0 || (gd->keys_in & 0xff) == 0)
+			EPRINTLN("gpu_display: key #%ju code=0x%x sym=0x%x %s",
+			    (uintmax_t)gd->keys_in, k->keycode, k->keysym,
+			    k->down ? "down" : "up");
 		console_key_event((int)k->down, k->keysym, k->keycode);
 		break;
 	}
@@ -150,6 +163,9 @@ gd_handle_input(const struct gpu_display_hdr *hdr, size_t len)
 
 		if (len < sizeof(*p))
 			return;
+		if (gd->ptrs_in++ == 0 || (gd->ptrs_in & 0x3ff) == 0)
+			EPRINTLN("gpu_display: ptr #%ju buttons=0x%x %d,%d",
+			    (uintmax_t)gd->ptrs_in, p->button, p->x, p->y);
 		console_ptr_event((uint8_t)p->button, p->x, p->y);
 		break;
 	}
@@ -198,7 +214,7 @@ gd_client_readable(int fd, enum ev_type ev __unused, void *arg)
 		}
 		if (gd->inlen < hdr.len)
 			break;
-		gd_handle_input((const struct gpu_display_hdr *)gd->inbuf,
+		gd_handle_input(gd, (const struct gpu_display_hdr *)gd->inbuf,
 		    hdr.len);
 		memmove(gd->inbuf, gd->inbuf + hdr.len, gd->inlen - hdr.len);
 		gd->inlen -= hdr.len;
