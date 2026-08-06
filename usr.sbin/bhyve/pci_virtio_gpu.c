@@ -387,6 +387,8 @@ struct vtgpu_softc {
 	unsigned		vsc_scanout_seen_total;
 	uint32_t		vsc_own_fence_next;
 	unsigned		vsc_fence_reports;
+	unsigned		vsc_cursor_errs;
+	bool			vsc_cursor_seen;
 	TAILQ_HEAD(, vtgpu_pub)	vsc_pubs;
 	/*
 	 * Context that created each scanout-capable resource.  A fence has to
@@ -600,6 +602,10 @@ vtgpu_paced_expire(struct vtgpu_softc *sc)
 	    (pp->vp_due.tv_nsec - now.tv_nsec) / 1000000;
 	return (ms < 0 ? 0 : (int)ms);
 }
+
+/* Cursor commands arrive on either queue; both call sites precede it. */
+static void vtgpu_cursor_update(struct vtgpu_softc *sc,
+    const struct virtio_gpu_update_cursor *cmd);
 
 /* ----------------------------------------------------------------------- */
 /* virglrenderer callbacks						   */
@@ -2103,8 +2109,18 @@ vtgpu_process_controlq(struct vtgpu_softc *sc, int qidx)
 		}
 
 		case VIRTIO_GPU_CMD_UPDATE_CURSOR:
+			/*
+			 * Normally these arrive on the cursor queue; handle
+			 * them here too rather than silently dropping a
+			 * cursor from a guest that uses the control queue.
+			 */
+			if (cmdlen >= sizeof(struct virtio_gpu_update_cursor))
+				vtgpu_cursor_update(sc, (const void *)hdr);
+			vtgpu_resp_nodata(sc, vq, hdr, req.idx,
+			    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
+			break;
 		case VIRTIO_GPU_CMD_MOVE_CURSOR:
-			/* Software cursor; ignore. */
+			/* Position only; the viewer tracks the pointer. */
 			vtgpu_resp_nodata(sc, vq, hdr, req.idx,
 			    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
 			break;
@@ -2124,6 +2140,85 @@ vtgpu_process_controlq(struct vtgpu_softc *sc, int qidx)
 	}
 }
 
+/*
+ * Publish the guest's hardware cursor to the viewer.
+ *
+ * A guest using the cursor plane never draws its pointer into the scanout, so
+ * a viewer showing only the scanout has no cursor at all.  The host
+ * compositor draws its own over the surface, which looks enough like one that
+ * the absence is easy to miss until you notice it never changes shape.
+ *
+ * MOVE_CURSOR carries only a position and is not forwarded: the viewer maps
+ * its pointer onto the guest's one to one, so the host already knows where
+ * the cursor is and can draw it there with no round trip.
+ */
+static void
+vtgpu_cursor_update(struct vtgpu_softc *sc,
+    const struct virtio_gpu_update_cursor *cmd)
+{
+	struct virgl_renderer_resource_info info;
+	struct virgl_box box;
+	struct iovec iov;
+	void *pixels;
+	size_t bytes;
+	int ret;
+
+	if (sc->vsc_display == NULL)
+		return;
+
+	/* resource 0 means "no cursor". */
+	if (cmd->resource_id == 0) {
+		gpu_display_cursor(sc->vsc_display, 0, 0, 0, 0, NULL);
+		return;
+	}
+
+	memset(&info, 0, sizeof(info));
+	if (virgl_renderer_resource_get_info((int)cmd->resource_id,
+	    &info) != 0) {
+		EPRINTLN("vtgpu: cursor res=%u get_info failed",
+		    cmd->resource_id);
+		return;
+	}
+	if (info.width == 0 || info.height == 0)
+		return;
+
+	bytes = (size_t)info.width * info.height * 4;
+	if ((pixels = malloc(bytes)) == NULL)
+		return;
+
+	memset(&box, 0, sizeof(box));
+	box.w = info.width;
+	box.h = info.height;
+	box.d = 1;
+	iov.iov_base = pixels;
+	iov.iov_len = bytes;
+
+	/*
+	 * Read on context 0: the cursor resource is created by the guest
+	 * kernel, not by a rendering context, and the readback is of host
+	 * memory virglrenderer already owns.
+	 */
+	ret = virgl_renderer_transfer_read_iov((int)cmd->resource_id, 0, 0,
+	    (uint32_t)(info.width * 4), 0, &box, 0, &iov, 1);
+	if (ret != 0) {
+		if (sc->vsc_cursor_errs++ == 0)
+			EPRINTLN("vtgpu: cursor res=%u readback failed ret=%d "
+			    "(no cursor will be shown)", cmd->resource_id, ret);
+		free(pixels);
+		return;
+	}
+
+	if (!sc->vsc_cursor_seen) {
+		sc->vsc_cursor_seen = true;
+		EPRINTLN("vtgpu: cursor res=%u %ux%u hot=%u,%u published",
+		    cmd->resource_id, info.width, info.height,
+		    cmd->hot_x, cmd->hot_y);
+	}
+	gpu_display_cursor(sc->vsc_display, info.width, info.height,
+	    cmd->hot_x, cmd->hot_y, pixels);
+	free(pixels);
+}
+
 static void
 vtgpu_process_cursorq(struct vtgpu_softc *sc)
 {
@@ -2136,7 +2231,16 @@ vtgpu_process_cursorq(struct vtgpu_softc *sc)
 		n = vq_getchain(vq, iov, VTGPU_MAXIOV, &req);
 		if (n < 0)
 			errx(1, "vtgpu: cursorq vq_getchain error");
-		/* Just consume and acknowledge. */
+
+		if (n > 0 && iov[0].iov_len >=
+		    sizeof(struct virtio_gpu_update_cursor)) {
+			const struct virtio_gpu_update_cursor *cc =
+			    iov[0].iov_base;
+
+			if (cc->hdr.type == VIRTIO_GPU_CMD_UPDATE_CURSOR)
+				vtgpu_cursor_update(sc, cc);
+			/* MOVE_CURSOR carries only a position; nothing to do. */
+		}
 		vq_relchain(vq, req.idx, 0);
 		vq_endchains(vq, 0);
 	}

@@ -58,6 +58,17 @@ struct gpu_display {
 		int			fd;
 	}		bufs[GPU_DISPLAY_MAX_BUFS];
 
+	/*
+	 * The cursor last set by the guest, kept so a viewer connecting after
+	 * the guest set it is not left with no pointer until the guest happens
+	 * to change it -- which for a desktop that set its cursor at startup
+	 * may be never.
+	 */
+	struct gpu_display_cursor	cursor;
+	void				*cursor_pixels;
+	size_t				cursor_bytes;
+	bool				cursor_valid;
+
 	uint64_t	frames_sent;
 	uint64_t	frames_dropped;
 	uint64_t	keys_in;
@@ -222,6 +233,8 @@ gd_client_readable(int fd, enum ev_type ev __unused, void *arg)
 	pthread_mutex_unlock(&gd->mtx);
 }
 
+static void gd_send_cursor_locked(struct gpu_display *gd);
+
 static void
 gd_accept(int fd, enum ev_type ev __unused, void *arg)
 {
@@ -260,6 +273,13 @@ gd_accept(int fd, enum ev_type ev __unused, void *arg)
 		pthread_mutex_unlock(&gd->mtx);
 		return;
 	}
+
+	/*
+	 * Same reasoning for the cursor: a desktop sets it once at startup, so
+	 * a viewer attaching later would otherwise have no pointer for the
+	 * rest of the session.
+	 */
+	gd_send_cursor_locked(gd);
 
 	/*
 	 * Replay every known buffer so a viewer connecting mid-session can
@@ -449,6 +469,77 @@ gpu_display_frame(struct gpu_display *gd, uint32_t buffer_id, int fence_fd,
 	pthread_mutex_unlock(&gd->mtx);
 	if (fence_fd >= 0)
 		close(fence_fd);
+}
+
+/* Caller must hold gd->mtx.  Declared above gd_accept. */
+static void
+gd_send_cursor_locked(struct gpu_display *gd)
+{
+	uint8_t buf[GPU_DISPLAY_MAX_MSG];
+	size_t len = sizeof(struct gpu_display_cursor);
+
+	if (!gd->cursor_valid || gd->cfd < 0)
+		return;
+	if (!gd->cursor.hidden)
+		len += gd->cursor_bytes;
+	if (len > sizeof(buf))
+		return;			/* refused at set time; belt and braces */
+
+	memcpy(buf, &gd->cursor, sizeof(gd->cursor));
+	((struct gpu_display_cursor *)buf)->hdr.len = (uint32_t)len;
+	if (!gd->cursor.hidden && gd->cursor_pixels != NULL)
+		memcpy(buf + sizeof(gd->cursor), gd->cursor_pixels,
+		    gd->cursor_bytes);
+
+	if (!gd_send(gd, buf, len, -1) &&
+	    errno != EAGAIN && errno != EWOULDBLOCK)
+		gd_drop_client(gd);
+}
+
+void
+gpu_display_cursor(struct gpu_display *gd, uint32_t width, uint32_t height,
+    uint32_t hot_x, uint32_t hot_y, const void *pixels)
+{
+	size_t bytes;
+
+	if (gd == NULL)
+		return;
+
+	bytes = (size_t)width * height * 4;
+	if (pixels != NULL &&
+	    sizeof(struct gpu_display_cursor) + bytes > GPU_DISPLAY_MAX_MSG) {
+		EPRINTLN("gpu_display: cursor %ux%u too large, ignored",
+		    width, height);
+		return;
+	}
+
+	pthread_mutex_lock(&gd->mtx);
+
+	memset(&gd->cursor, 0, sizeof(gd->cursor));
+	gd->cursor.hdr.type = GPU_DISPLAY_MSG_CURSOR;
+	gd->cursor.width = width;
+	gd->cursor.height = height;
+	gd->cursor.hot_x = hot_x;
+	gd->cursor.hot_y = hot_y;
+	gd->cursor.hidden = pixels == NULL;
+
+	if (pixels != NULL) {
+		if (bytes > gd->cursor_bytes || gd->cursor_pixels == NULL) {
+			void *n = realloc(gd->cursor_pixels, bytes);
+
+			if (n == NULL) {
+				pthread_mutex_unlock(&gd->mtx);
+				return;
+			}
+			gd->cursor_pixels = n;
+		}
+		memcpy(gd->cursor_pixels, pixels, bytes);
+		gd->cursor_bytes = bytes;
+	}
+	gd->cursor_valid = true;
+
+	gd_send_cursor_locked(gd);
+	pthread_mutex_unlock(&gd->mtx);
 }
 
 void
