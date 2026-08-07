@@ -321,7 +321,14 @@ tpm_crb_mem_handler(struct vcpu *vcpu __unused, const int dir,
 	crb = arg1;
 
 	off = addr - TPM_CRB_ADDRESS;
-	if (off > TPM_CRB_REGS_SIZE || off + size >= TPM_CRB_REGS_SIZE) {
+	/*
+	 * An access must lie wholly inside the register block.  The upper
+	 * bound was ">=", which rejected the final dword of the command
+	 * buffer: a four byte write at 0xffc ends exactly at the end of the
+	 * block and is legitimate, so a guest sending a maximum length
+	 * command failed on its last word.
+	 */
+	if (off >= TPM_CRB_REGS_SIZE || off + size > TPM_CRB_REGS_SIZE) {
 		return (EINVAL);
 	}
 
