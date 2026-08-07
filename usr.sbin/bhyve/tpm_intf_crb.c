@@ -184,6 +184,7 @@ struct tpm_crb {
 	pthread_cond_t cond;
 	bool closing;
 	bool warned_locality;
+	bool warned_unknown;
 };
 
 
@@ -459,10 +460,20 @@ tpm_crb_mem_handler(struct vcpu *vcpu __unused, const int dir,
 		default:
 			/*
 			 * The other fields are either readonly or we do not
-			 * support writing them.
+			 * support writing them.  Drop the write, as hardware
+			 * does for an unimplemented register: failing the
+			 * access aborts the guest's instruction emulation and
+			 * takes the VM down, which is out of proportion to a
+			 * register we merely do not know about, and leaves the
+			 * guest no way to recover.
 			 */
-			error = EINVAL;
-			goto err_out;
+			if (!crb->warned_unknown) {
+				crb->warned_unknown = true;
+				warnx("%s: ignoring write to unimplemented "
+				    "register @ %16lx [size = %d]", __func__,
+				    addr, size);
+			}
+			break;
 		}
 	}
 
