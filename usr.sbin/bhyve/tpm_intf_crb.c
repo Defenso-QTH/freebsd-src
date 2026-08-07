@@ -183,6 +183,7 @@ struct tpm_crb {
 	pthread_mutex_t mutex;
 	pthread_cond_t cond;
 	bool closing;
+	bool warned_locality;
 };
 
 
@@ -321,6 +322,28 @@ tpm_crb_mem_handler(struct vcpu *vcpu __unused, const int dir,
 	crb = arg1;
 
 	off = addr - TPM_CRB_ADDRESS;
+
+	/*
+	 * Only locality 0 is implemented, but the MMIO range registered
+	 * covers TPM_CRB_LOCALITIES_MAX of them, so accesses to the others
+	 * arrive here.  Returning an error aborts the guest's instruction
+	 * emulation and kills the VM; report the locality as unavailable
+	 * instead, which is something a guest can act on.  Zero leaves
+	 * tpmRegValidSts clear in TPM_LOC_STATE, which tells the driver not
+	 * to use it.
+	 */
+	if (off >= TPM_CRB_REGS_SIZE) {
+		if (!crb->warned_locality) {
+			crb->warned_locality = true;
+			warnx("%s: %s to unimplemented locality %u, reporting "
+			    "it as unavailable", __func__,
+			    (dir == MEM_F_READ) ? "read" : "write",
+			    (unsigned)(off / TPM_CRB_REGS_SIZE));
+		}
+		if (dir == MEM_F_READ)
+			*val = 0;
+		return (0);
+	}
 	/*
 	 * An access must lie wholly inside the register block.  The upper
 	 * bound was ">=", which rejected the final dword of the command
@@ -328,7 +351,7 @@ tpm_crb_mem_handler(struct vcpu *vcpu __unused, const int dir,
 	 * block and is legitimate, so a guest sending a maximum length
 	 * command failed on its last word.
 	 */
-	if (off >= TPM_CRB_REGS_SIZE || off + size > TPM_CRB_REGS_SIZE) {
+	if (off + size > TPM_CRB_REGS_SIZE) {
 		return (EINVAL);
 	}
 
