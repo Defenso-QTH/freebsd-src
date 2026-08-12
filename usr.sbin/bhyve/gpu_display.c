@@ -128,11 +128,29 @@ gd_drop_client(struct gpu_display *gd)
 
 	if (gd->cfd < 0)
 		return;
+	/*
+	 * Let mevent close the descriptor.  mevent_delete() only queues the
+	 * removal, so closing it here leaves the fd registered in the kqueue
+	 * until the mevent thread catches up -- which is where the "kevent
+	 * change: Bad file descriptor" on disconnect came from.
+	 *
+	 * Worse, this runs on the virtio-gpu worker thread whenever a send
+	 * fails, while the guest is exporting dma_bufs as fast as it can
+	 * allocate them.  A number freed here is reused almost immediately,
+	 * and gd_client_readable() only checks that the fd *number* matches,
+	 * so a stale event delivered after a reconnect could be accepted as
+	 * belonging to the new connection.
+	 *
+	 * mevent_delete_close() removes it from the kqueue and closes it on
+	 * the mevent thread, in that order.  Clearing cfd here means any
+	 * event arriving in the meantime is rejected by the number check.
+	 */
 	if (gd->cevp != NULL) {
-		mevent_delete(gd->cevp);
+		mevent_delete_close(gd->cevp);
 		gd->cevp = NULL;
+	} else {
+		close(gd->cfd);
 	}
-	close(gd->cfd);
 	gd->cfd = -1;
 	gd->inlen = 0;
 	EPRINTLN("gpu_display: viewer disconnected (frames sent=%ju "
