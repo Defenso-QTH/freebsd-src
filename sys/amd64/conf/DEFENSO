@@ -1,8 +1,19 @@
 #
-# DEFENSO -- GENERIC with the vt(4) Alt->Esc compatibility hack disabled.
+# DEFENSO -- GENERIC with vt(4) adjusted for a Wayland session on the console.
 #
-# Identical to GENERIC except VT_ALT_TO_ESC_HACK is forced to 0, so a lone
-# Left Alt keypress is not translated into Escape on the system console.
+# VT_ALT_TO_ESC_HACK is forced to 0, so a lone Left Alt keypress is not
+# translated into Escape on the system console.
+#
+# VT_DEBUG compiles in vt(4)'s tracing.  It is quiet by default: DPRINTF only
+# prints when kern.vt.debug exceeds the level of the individual message, and
+# that tunable defaults to 0.  Raise it at runtime (or set kern.vt.debug in
+# loader.conf) when investigating VT switching:
+#
+#	sysctl kern.vt.debug=40
+#
+# Note it also enables two unconditional printfs, in consolectl and sysmouse,
+# reporting ioctls vt(4) does not implement -- useful when a compositor is
+# driving the console, noisy otherwise.
 #
 
 include		GENERIC
@@ -10,3 +21,4 @@ include		GENERIC
 ident		DEFENSO
 
 options		VT_ALT_TO_ESC_HACK=0
+options		VT_DEBUG
