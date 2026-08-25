@@ -435,6 +435,20 @@ struct vtgpu_softc {
 	unsigned		vsc_inflight;	/* published, not yet released */
 	uintmax_t		vsc_await_late;
 	/*
+	 * vsc_inflight counts presents since the viewer last finished a draw,
+	 * and a release resets it rather than decrementing it.
+	 *
+	 * Decrementing made it a running balance of frames sent against
+	 * frames acknowledged, which is the wrong quantity: the guest
+	 * presents into a single buffer far faster than the viewer draws, so
+	 * most frames are coalesced away and never drawn.  Acknowledging
+	 * those let the guest go again immediately -- 437 presents a second
+	 * against 60 draws -- and not acknowledging them made the balance run
+	 * away until every present sat out its timeout.  Neither paces
+	 * anything.  What the guest may do is bounded by draws, so count from
+	 * the last one.
+	 */
+	/*
 	 * The resources the guest published into most recently, used to tell
 	 * how many buffers it is actually cycling through right now.
 	 *
@@ -823,10 +837,8 @@ vtgpu_frame_released(void *arg, uint32_t buffer_id __unused)
 
 	pthread_mutex_lock(&sc->vsc_mtx);
 	sc->vsc_release_ok = true;
-	if (sc->vsc_inflight > 0)
-		sc->vsc_inflight--;
-	if (sc->vsc_inflight <= vtgpu_max_inflight(sc))
-		vtgpu_awaits_flush(sc);
+	sc->vsc_inflight = 0;
+	vtgpu_awaits_flush(sc);
 	pthread_mutex_unlock(&sc->vsc_mtx);
 }
 
@@ -855,12 +867,10 @@ vtgpu_awaits_expire(struct vtgpu_softc *sc)
 		last_vq = pp->vp_vq;
 		free(pp);
 		/*
-		 * The frame it was waiting on is not coming back; forget it,
-		 * or inflight climbs until nothing is ever completed on time
-		 * again.
+		 * The draw it was waiting on is not coming; start counting
+		 * again from here, or the guest stays held for ever.
 		 */
-		if (sc->vsc_inflight > 0)
-			sc->vsc_inflight--;
+		sc->vsc_inflight = 0;
 		if (sc->vsc_await_late++ % 256 == 0)
 			EPRINTLN("vtgpu: viewer did not release a frame in "
 			    "%dms, present completed anyway (late=%ju)",
