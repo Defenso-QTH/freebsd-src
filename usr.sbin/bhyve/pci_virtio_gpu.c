@@ -434,6 +434,21 @@ struct vtgpu_softc {
 	bool			vsc_release_ok;
 	unsigned		vsc_inflight;	/* published, not yet released */
 	uintmax_t		vsc_await_late;
+	/*
+	 * The resources the guest published into most recently, used to tell
+	 * how many buffers it is actually cycling through right now.
+	 *
+	 * It must be a window, not a lifetime tally: a desktop binds a fresh
+	 * scanout resource whenever the surface being displayed changes, so
+	 * counting every resource ever seen says "four buffers" for a guest
+	 * that is presenting into one, and then permits three frames in
+	 * flight against a single buffer -- which is the race this is
+	 * supposed to close.
+	 */
+#define	VTGPU_RECENT_PUBS	8
+	uint32_t		vsc_recent_res[VTGPU_RECENT_PUBS];
+	unsigned		vsc_recent_n;	/* valid entries, <= the ring */
+	unsigned		vsc_recent_i;	/* write cursor */
 	uint8_t			*vsc_res_reported;
 	uint32_t		vsc_scanout_res;	/* 0 = none bound */
 	uint32_t		vsc_scanout_w;
@@ -539,6 +554,9 @@ vtgpu_res_ctx(const struct vtgpu_softc *sc, uint32_t res_id)
 	return (sc->vsc_res_ctx[res_id]);
 }
 
+/* Defined with the flow-control code below; used from here on. */
+static void vtgpu_note_pub(struct vtgpu_softc *sc, uint32_t res_id);
+
 /*
  * Publish any frame whose fence has not retired in time.  Called after every
  * virgl_renderer_poll(): if fences are retiring normally this finds nothing.
@@ -564,6 +582,7 @@ vtgpu_pubs_expire(struct vtgpu_softc *sc)
 			gpu_display_frame(sc->vsc_display, vp->vp_res_id, -1,
 			    vp->vp_x, vp->vp_y, vp->vp_w, vp->vp_h);
 			sc->vsc_inflight++;
+			vtgpu_note_pub(sc, vp->vp_res_id);
 		}
 		if (sc->vsc_pub_late++ % 256 == 0)
 			EPRINTLN("vtgpu: frame res=%u fence %u did not retire "
@@ -638,8 +657,31 @@ vtgpu_paced_expire(struct vtgpu_softc *sc)
 static unsigned
 vtgpu_max_inflight(const struct vtgpu_softc *sc)
 {
+	unsigned distinct = 0;
 
-	return (sc->vsc_seen_n > 1 ? sc->vsc_seen_n - 1 : 0);
+	for (unsigned i = 0; i < sc->vsc_recent_n; i++) {
+		bool dup = false;
+
+		for (unsigned j = 0; j < i; j++)
+			if (sc->vsc_recent_res[j] == sc->vsc_recent_res[i]) {
+				dup = true;
+				break;
+			}
+		if (!dup)
+			distinct++;
+	}
+	return (distinct > 1 ? distinct - 1 : 0);
+}
+
+/* Note a published resource in the recency window. */
+static void
+vtgpu_note_pub(struct vtgpu_softc *sc, uint32_t res_id)
+{
+
+	sc->vsc_recent_res[sc->vsc_recent_i] = res_id;
+	sc->vsc_recent_i = (sc->vsc_recent_i + 1) % VTGPU_RECENT_PUBS;
+	if (sc->vsc_recent_n < VTGPU_RECENT_PUBS)
+		sc->vsc_recent_n++;
 }
 
 /*
@@ -820,6 +862,7 @@ vtgpu_write_fence(void *cookie, uint32_t fence_id)
 				    vp->vp_res_id, -1, vp->vp_x, vp->vp_y,
 				    vp->vp_w, vp->vp_h);
 				sc->vsc_inflight++;
+				vtgpu_note_pub(sc, vp->vp_res_id);
 			}
 			free(vp);
 		}
@@ -1158,6 +1201,7 @@ vtgpu_publish_fenced(struct vtgpu_softc *sc, uint32_t res_id,
 
 publish_now:
 	sc->vsc_inflight++;
+	vtgpu_note_pub(sc, res_id);
 	gpu_display_frame(sc->vsc_display, res_id, -1, x, y, w, h);
 }
 
