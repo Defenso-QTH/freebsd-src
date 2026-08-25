@@ -421,6 +421,19 @@ struct vtgpu_softc {
 	struct timespec		vsc_next_flip;
 	TAILQ_HEAD(, vtgpu_paced) vsc_paced;
 	uintmax_t		vsc_paced_n;
+	/*
+	 * Release-driven flow control.  The guest's present is held until the
+	 * viewer says it has finished reading the frame, which is the only
+	 * thing that keeps a guest presenting into a single buffer from
+	 * overwriting it while it is being read.
+	 *
+	 * vsc_release_ok stays false until a release actually arrives, so an
+	 * older viewer -- which never sends them -- is never held for.
+	 */
+	TAILQ_HEAD(, vtgpu_paced) vsc_awaits;
+	bool			vsc_release_ok;
+	unsigned		vsc_inflight;	/* published, not yet released */
+	uintmax_t		vsc_await_late;
 	uint8_t			*vsc_res_reported;
 	uint32_t		vsc_scanout_res;	/* 0 = none bound */
 	uint32_t		vsc_scanout_w;
@@ -547,9 +560,11 @@ vtgpu_pubs_expire(struct vtgpu_softc *sc)
 		if (ms < VTGPU_PUB_TIMEOUT_MS)
 			continue;
 		TAILQ_REMOVE(&sc->vsc_pubs, vp, vp_link);
-		if (sc->vsc_display != NULL)
+		if (sc->vsc_display != NULL) {
 			gpu_display_frame(sc->vsc_display, vp->vp_res_id, -1,
 			    vp->vp_x, vp->vp_y, vp->vp_w, vp->vp_h);
+			sc->vsc_inflight++;
+		}
 		if (sc->vsc_pub_late++ % 256 == 0)
 			EPRINTLN("vtgpu: frame res=%u fence %u did not retire "
 			    "in %ldms, published anyway (late=%ju)",
@@ -603,6 +618,172 @@ vtgpu_paced_expire(struct vtgpu_softc *sc)
 	return (ms < 0 ? 0 : (int)ms);
 }
 
+/*
+ * How long a present may be held waiting for the viewer to release the frame.
+ * A viewer that stops drawing -- minimised, wedged, or gone without closing
+ * the socket -- must not take the guest down with it, so the wait has a
+ * deadline and crossing it is counted rather than hidden.
+ */
+#define	VTGPU_AWAIT_TIMEOUT_MS	50
+
+/*
+ * How many frames the guest may have outstanding before its present is held.
+ *
+ * One less than the number of distinct buffers it presents into: with two it
+ * may draw into the second while the first is being read, which is what
+ * double buffering is for.  With one -- vkcube -- the answer is zero, and the
+ * guest waits for every frame to be consumed before starting the next.  That
+ * is the whole point: there is nowhere else for it to draw.
+ */
+static unsigned
+vtgpu_max_inflight(const struct vtgpu_softc *sc)
+{
+
+	return (sc->vsc_seen_n > 1 ? sc->vsc_seen_n - 1 : 0);
+}
+
+/*
+ * Complete a present, or hold it until the viewer has read the frame.
+ * Returns true if it was held (the caller must not complete it).
+ */
+static bool
+vtgpu_await_hold(struct vtgpu_softc *sc, struct vqueue_info *vq,
+    const struct virtio_gpu_ctrl_hdr *hdr, uint16_t chain_idx,
+    struct iovec *wiov, int nwiov)
+{
+	struct virtio_gpu_ctrl_hdr resp = {
+		.type     = VIRTIO_GPU_RESP_OK_NODATA,
+		.fence_id = hdr->fence_id,
+		.ctx_id   = hdr->ctx_id,
+	};
+	struct vtgpu_paced *pp;
+	size_t copy = sizeof(resp), off = 0;
+	struct timespec now;
+
+	/*
+	 * A fenced present already has its own completion signal and
+	 * vtgpu_respond() must keep owning it.
+	 */
+	if (!sc->vsc_release_ok || (hdr->flags & VIRTIO_GPU_FLAG_FENCE) != 0)
+		return (false);
+	/*
+	 * Nobody left to release it.  Holding for a viewer that has gone would
+	 * put every present through the timeout and cap the guest at 20fps.
+	 */
+	if (!gpu_display_connected(sc->vsc_display)) {
+		sc->vsc_release_ok = false;
+		sc->vsc_inflight = 0;
+		return (false);
+	}
+	if (sc->vsc_inflight <= vtgpu_max_inflight(sc))
+		return (false);
+	if ((pp = calloc(1, sizeof(*pp))) == NULL)
+		return (false);
+
+	for (int i = 0; i < nwiov && copy > 0; i++) {
+		size_t n = copy < wiov[i].iov_len ? copy : wiov[i].iov_len;
+
+		memcpy(wiov[i].iov_base, (const char *)&resp + off, n);
+		off += n;
+		copy -= n;
+	}
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	pp->vp_due = now;
+	pp->vp_due.tv_nsec += VTGPU_AWAIT_TIMEOUT_MS * 1000000L;
+	while (pp->vp_due.tv_nsec >= 1000000000L) {
+		pp->vp_due.tv_sec++;
+		pp->vp_due.tv_nsec -= 1000000000L;
+	}
+	pp->vp_vq = vq;
+	pp->vp_idx = chain_idx;
+	pp->vp_resp_len = (uint32_t)sizeof(resp);
+	TAILQ_INSERT_TAIL(&sc->vsc_awaits, pp, vp_link);
+	return (true);
+}
+
+/* Complete every held present.  Caller holds vsc_mtx. */
+static void
+vtgpu_awaits_flush(struct vtgpu_softc *sc)
+{
+	struct vtgpu_paced *pp, *tmp;
+	struct vqueue_info *last_vq = NULL;
+
+	TAILQ_FOREACH_SAFE(pp, &sc->vsc_awaits, vp_link, tmp) {
+		TAILQ_REMOVE(&sc->vsc_awaits, pp, vp_link);
+		vq_relchain(pp->vp_vq, pp->vp_idx, pp->vp_resp_len);
+		last_vq = pp->vp_vq;
+		free(pp);
+	}
+	if (last_vq != NULL)
+		vq_endchains(last_vq, 0);
+}
+
+/*
+ * The viewer has finished reading a frame.  Runs on the mevent thread.
+ */
+static void
+vtgpu_frame_released(void *arg, uint32_t buffer_id __unused)
+{
+	struct vtgpu_softc *sc = arg;
+
+	pthread_mutex_lock(&sc->vsc_mtx);
+	sc->vsc_release_ok = true;
+	if (sc->vsc_inflight > 0)
+		sc->vsc_inflight--;
+	if (sc->vsc_inflight <= vtgpu_max_inflight(sc))
+		vtgpu_awaits_flush(sc);
+	pthread_mutex_unlock(&sc->vsc_mtx);
+}
+
+/*
+ * Release presents whose viewer acknowledgement never came.  Called from the
+ * same tick as vtgpu_paced_expire(); returns ms until the next deadline, or
+ * -1 when nothing is held.
+ */
+static int
+vtgpu_awaits_expire(struct vtgpu_softc *sc)
+{
+	struct vtgpu_paced *pp, *tmp;
+	struct vqueue_info *last_vq = NULL;
+	struct timespec now;
+	long ms;
+
+	if (TAILQ_EMPTY(&sc->vsc_awaits))
+		return (-1);
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	TAILQ_FOREACH_SAFE(pp, &sc->vsc_awaits, vp_link, tmp) {
+		if (!vtgpu_ts_reached(&pp->vp_due, &now))
+			break;		/* queued in due order */
+		TAILQ_REMOVE(&sc->vsc_awaits, pp, vp_link);
+		vq_relchain(pp->vp_vq, pp->vp_idx, pp->vp_resp_len);
+		last_vq = pp->vp_vq;
+		free(pp);
+		/*
+		 * The frame it was waiting on is not coming back; forget it,
+		 * or inflight climbs until nothing is ever completed on time
+		 * again.
+		 */
+		if (sc->vsc_inflight > 0)
+			sc->vsc_inflight--;
+		if (sc->vsc_await_late++ % 256 == 0)
+			EPRINTLN("vtgpu: viewer did not release a frame in "
+			    "%dms, present completed anyway (late=%ju)",
+			    VTGPU_AWAIT_TIMEOUT_MS,
+			    (uintmax_t)sc->vsc_await_late);
+	}
+	if (last_vq != NULL)
+		vq_endchains(last_vq, 0);
+
+	pp = TAILQ_FIRST(&sc->vsc_awaits);
+	if (pp == NULL)
+		return (-1);
+	ms = (pp->vp_due.tv_sec - now.tv_sec) * 1000 +
+	    (pp->vp_due.tv_nsec - now.tv_nsec) / 1000000;
+	return (ms < 0 ? 0 : (int)ms);
+}
+
 /* Cursor commands arrive on either queue; both call sites precede it. */
 static void vtgpu_cursor_update(struct vtgpu_softc *sc,
     const struct virtio_gpu_update_cursor *cmd);
@@ -634,10 +815,12 @@ vtgpu_write_fence(void *cookie, uint32_t fence_id)
 			if (vp->vp_fence_id > fence_id)
 				break;
 			TAILQ_REMOVE(&sc->vsc_pubs, vp, vp_link);
-			if (sc->vsc_display != NULL)
+			if (sc->vsc_display != NULL) {
 				gpu_display_frame(sc->vsc_display,
 				    vp->vp_res_id, -1, vp->vp_x, vp->vp_y,
 				    vp->vp_w, vp->vp_h);
+				sc->vsc_inflight++;
+			}
 			free(vp);
 		}
 		return;
@@ -974,6 +1157,7 @@ vtgpu_publish_fenced(struct vtgpu_softc *sc, uint32_t res_id,
 	return;
 
 publish_now:
+	sc->vsc_inflight++;
 	gpu_display_frame(sc->vsc_display, res_id, -1, x, y, w, h);
 }
 
@@ -1216,6 +1400,13 @@ vtgpu_cmd_set_scanout(struct vtgpu_softc *sc, struct vqueue_info *vq,
 		return;
 	}
 
+	/*
+	 * Hold the present until the viewer has read the frame, so the guest
+	 * cannot start overwriting a buffer that is still being sampled.
+	 */
+	if (vtgpu_await_hold(sc, vq, hdr, chain_idx, wiov, nwiov))
+		return;
+
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 	    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
 }
@@ -1291,6 +1482,14 @@ vtgpu_cmd_resource_flush(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	    cmd->resource_id == sc->vsc_scanout_res)
 		vtgpu_publish_fenced(sc, cmd->resource_id, cmd->r.x, cmd->r.y,
 		    cmd->r.width, cmd->r.height);
+
+	/*
+	 * Hold the present until the viewer has read the frame, so the guest
+	 * cannot start overwriting a buffer that is still being sampled.
+	 */
+	if (vtgpu_await_hold(sc, vq, hdr, chain_idx, wiov, nwiov))
+		return;
+
 	vtgpu_resp_nodata(sc, vq, hdr, chain_idx,
 	    VIRTIO_GPU_RESP_OK_NODATA, wiov, nwiov);
 }
@@ -2353,6 +2552,30 @@ vtgpu_worker(void *arg)
 					continue;
 				}
 			}
+			if (!TAILQ_EMPTY(&sc->vsc_awaits)) {
+				/*
+				 * A present is held for the viewer.  The
+				 * release itself completes the chain from the
+				 * mevent thread, so all the worker owes here
+				 * is the timeout -- but it must also notice
+				 * promptly when the released guest submits
+				 * again, so poll rather than sleep out the
+				 * whole deadline.
+				 */
+				if (vtgpu_awaits_expire(sc) >= 0) {
+					struct timespec ts = {
+						.tv_sec = 0,
+						.tv_nsec =
+						    VTGPU_KQ_BACKSTOP_MS *
+						    1000000L
+					};
+
+					pthread_mutex_unlock(&sc->vsc_mtx);
+					nanosleep(&ts, NULL);
+					pthread_mutex_lock(&sc->vsc_mtx);
+					continue;
+				}
+			}
 			if (!TAILQ_EMPTY(&sc->vsc_fences) ||
 			    !TAILQ_EMPTY(&sc->vsc_pubs)) {
 				/*
@@ -3053,6 +3276,7 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 	TAILQ_INIT(&sc->vsc_fences);
 	TAILQ_INIT(&sc->vsc_pubs);
 	TAILQ_INIT(&sc->vsc_paced);
+	TAILQ_INIT(&sc->vsc_awaits);
 	sc->vsc_res_ctx = calloc(VTGPU_RES_CTX_MAX, sizeof(*sc->vsc_res_ctx));
 	sc->vsc_res_reported = calloc(VTGPU_RES_CTX_MAX,
 	    sizeof(*sc->vsc_res_reported));
@@ -3099,6 +3323,9 @@ pci_vtgpu_init(struct pci_devinst *pi, nvlist_t *nvl)
 			 */
 			if (disp != NULL && strncmp(disp, "unix:", 5) == 0) {
 				sc->vsc_display = gpu_display_init(disp + 5);
+				if (sc->vsc_display != NULL)
+					gpu_display_set_release_cb(sc->vsc_display,
+					    vtgpu_frame_released, sc);
 				/*
 				 * The USB tablet drops every event unless a
 				 * graphics context exists: umouse_event()

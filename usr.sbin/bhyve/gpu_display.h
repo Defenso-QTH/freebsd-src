@@ -54,6 +54,7 @@ enum gpu_display_msg_type {
 	/* viewer -> host */
 	GPU_DISPLAY_MSG_KEY	= 128,
 	GPU_DISPLAY_MSG_PTR	= 129,
+	GPU_DISPLAY_MSG_RELEASE	= 130,	/* viewer has finished with a frame */
 };
 
 /*
@@ -82,6 +83,30 @@ struct gpu_display_hdr {
 struct gpu_display_hello {
 	struct gpu_display_hdr	hdr;
 	uint32_t		version;
+	uint32_t		pad;
+};
+
+/*
+ * Sent by the viewer once it has finished reading the buffer a FRAME named,
+ * which is the only thing that can tell the host the buffer is free again.
+ *
+ * It matters because the guest may present into a single buffer -- vkcube
+ * does -- and then nothing but this acknowledgement stands between the
+ * guest's next frame and the pixels being read.  Without it a guest
+ * rendering faster than the viewer draws overwrites the buffer mid-read and
+ * the result is a blend of several frames, seen as a doubled or torn image.
+ *
+ * Holding the guest's present until this arrives is ordinary flow control:
+ * it is what a real display does, and it paces the guest to what is actually
+ * being consumed rather than to a fixed rate guessed in advance.
+ *
+ * Optional, and detected rather than negotiated: the host holds nothing
+ * until it has seen one of these, so a viewer that never sends them behaves
+ * exactly as before instead of stalling for a timeout on every frame.
+ */
+struct gpu_display_release {
+	struct gpu_display_hdr	hdr;
+	uint32_t		buffer_id;	/* the buffer now free */
 	uint32_t		pad;
 };
 
@@ -222,6 +247,17 @@ void	gpu_display_scanout(struct gpu_display *gd,
  */
 void	gpu_display_frame(struct gpu_display *gd, uint32_t buffer_id,
 	    int fence_fd, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+
+/*
+ * Register the callback run when the viewer releases a buffer.  It fires on
+ * the mevent thread, not the virtio-gpu worker, so the callee is responsible
+ * for its own locking.  Passing NULL unregisters.
+ */
+void	gpu_display_set_release_cb(struct gpu_display *gd,
+	    void (*cb)(void *arg, uint32_t buffer_id), void *arg);
+
+/* Whether a viewer is currently attached. */
+bool	gpu_display_connected(struct gpu_display *gd);
 
 /* Has this buffer already been exported to the viewer? */
 bool	gpu_display_have_buffer(struct gpu_display *gd, uint32_t buffer_id);

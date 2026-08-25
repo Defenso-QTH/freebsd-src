@@ -73,6 +73,11 @@ struct gpu_display {
 	uint64_t	frames_dropped;
 	uint64_t	keys_in;
 	uint64_t	ptrs_in;
+	uint64_t	rels_in;
+
+	/* Run when the viewer says it has finished with a buffer. */
+	void		(*release_cb)(void *arg, uint32_t buffer_id);
+	void		*release_arg;
 
 	/* Partial input message accumulator. */
 	uint8_t		inbuf[GPU_DISPLAY_MAX_MSG];
@@ -153,6 +158,7 @@ gd_drop_client(struct gpu_display *gd)
 	}
 	gd->cfd = -1;
 	gd->inlen = 0;
+	gd->rels_in = 0;
 	EPRINTLN("gpu_display: viewer disconnected (frames sent=%ju "
 	    "dropped=%ju)", (uintmax_t)gd->frames_sent,
 	    (uintmax_t)gd->frames_dropped);
@@ -198,10 +204,63 @@ gd_handle_input(struct gpu_display *gd, const struct gpu_display_hdr *hdr,
 		console_ptr_event((uint8_t)p->button, p->x, p->y);
 		break;
 	}
+	case GPU_DISPLAY_MSG_RELEASE: {
+		const struct gpu_display_release *r = (const void *)hdr;
+		void (*cb)(void *, uint32_t);
+		void *arg;
+
+		if (len < sizeof(*r))
+			return;
+		if (gd->rels_in++ == 0)
+			EPRINTLN("gpu_display: viewer releases buffers "
+			    "(buf=%u); guest presents will now be paced by "
+			    "what the viewer has actually drawn",
+			    r->buffer_id);
+		/*
+		 * Drop the lock across the callback: it completes a guest
+		 * descriptor and so takes the device's own mutex, which the
+		 * worker holds while calling into gpu_display_frame().
+		 * Holding both here in the opposite order would deadlock.
+		 */
+		cb = gd->release_cb;
+		arg = gd->release_arg;
+		if (cb != NULL) {
+			pthread_mutex_unlock(&gd->mtx);
+			cb(arg, r->buffer_id);
+			pthread_mutex_lock(&gd->mtx);
+		}
+		break;
+	}
 	default:
 		/* Unknown types are skipped by length, not fatal. */
 		break;
 	}
+}
+
+bool
+gpu_display_connected(struct gpu_display *gd)
+{
+	bool up;
+
+	if (gd == NULL)
+		return (false);
+	pthread_mutex_lock(&gd->mtx);
+	up = gd->cfd >= 0;
+	pthread_mutex_unlock(&gd->mtx);
+	return (up);
+}
+
+void
+gpu_display_set_release_cb(struct gpu_display *gd,
+    void (*cb)(void *arg, uint32_t buffer_id), void *arg)
+{
+
+	if (gd == NULL)
+		return;
+	pthread_mutex_lock(&gd->mtx);
+	gd->release_cb = cb;
+	gd->release_arg = arg;
+	pthread_mutex_unlock(&gd->mtx);
 }
 
 static void
