@@ -449,6 +449,22 @@ struct vtgpu_softc {
 	uint32_t		vsc_recent_res[VTGPU_RECENT_PUBS];
 	unsigned		vsc_recent_n;	/* valid entries, <= the ring */
 	unsigned		vsc_recent_i;	/* write cursor */
+	/*
+	 * Why a present was or was not held, reported once a second.
+	 *
+	 * Two guesses at this have already been wrong, and the counters that
+	 * would have settled either in one run cost nothing to keep: which
+	 * command actually carries the flip, whether the guest fences it, and
+	 * whether holding the response throttles the guest at all.
+	 */
+	uintmax_t		vsc_d_scanout;	/* published from SET_SCANOUT */
+	uintmax_t		vsc_d_flush;	/* published from RESOURCE_FLUSH */
+	uintmax_t		vsc_d_fenced;	/* present carried FLAG_FENCE */
+	uintmax_t		vsc_d_held;	/* held for the viewer */
+	uintmax_t		vsc_d_under;	/* under the in-flight limit */
+	uintmax_t		vsc_d_noview;	/* no viewer attached */
+	uintmax_t		vsc_d_noack;	/* viewer has never released */
+	struct timespec		vsc_d_when;
 	uint8_t			*vsc_res_reported;
 	uint32_t		vsc_scanout_res;	/* 0 = none bound */
 	uint32_t		vsc_scanout_w;
@@ -677,11 +693,37 @@ vtgpu_max_inflight(const struct vtgpu_softc *sc)
 static void
 vtgpu_note_pub(struct vtgpu_softc *sc, uint32_t res_id)
 {
+	struct timespec now;
+	long ms;
 
 	sc->vsc_recent_res[sc->vsc_recent_i] = res_id;
 	sc->vsc_recent_i = (sc->vsc_recent_i + 1) % VTGPU_RECENT_PUBS;
 	if (sc->vsc_recent_n < VTGPU_RECENT_PUBS)
 		sc->vsc_recent_n++;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	if (sc->vsc_d_when.tv_sec == 0 && sc->vsc_d_when.tv_nsec == 0) {
+		sc->vsc_d_when = now;
+		return;
+	}
+	ms = (now.tv_sec - sc->vsc_d_when.tv_sec) * 1000 +
+	    (now.tv_nsec - sc->vsc_d_when.tv_nsec) / 1000000;
+	if (ms < 1000)
+		return;
+
+	EPRINTLN("vtgpu: %ldms present: scanout=%ju flush=%ju | declined: "
+	    "fenced=%ju under=%ju noack=%ju noviewer=%ju | held=%ju "
+	    "inflight=%u max=%u bufs=%u late=%ju",
+	    ms, sc->vsc_d_scanout, sc->vsc_d_flush,
+	    sc->vsc_d_fenced, sc->vsc_d_under, sc->vsc_d_noack,
+	    sc->vsc_d_noview, sc->vsc_d_held,
+	    sc->vsc_inflight, vtgpu_max_inflight(sc) + 1,
+	    sc->vsc_recent_n, (uintmax_t)sc->vsc_await_late);
+
+	sc->vsc_d_scanout = sc->vsc_d_flush = sc->vsc_d_fenced = 0;
+	sc->vsc_d_held = sc->vsc_d_under = sc->vsc_d_noview = 0;
+	sc->vsc_d_noack = 0;
+	sc->vsc_d_when = now;
 }
 
 /*
@@ -706,8 +748,14 @@ vtgpu_await_hold(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	 * A fenced present already has its own completion signal and
 	 * vtgpu_respond() must keep owning it.
 	 */
-	if (!sc->vsc_release_ok || (hdr->flags & VIRTIO_GPU_FLAG_FENCE) != 0)
+	if ((hdr->flags & VIRTIO_GPU_FLAG_FENCE) != 0) {
+		sc->vsc_d_fenced++;
 		return (false);
+	}
+	if (!sc->vsc_release_ok) {
+		sc->vsc_d_noack++;
+		return (false);
+	}
 	/*
 	 * Nobody left to release it.  Holding for a viewer that has gone would
 	 * put every present through the timeout and cap the guest at 20fps.
@@ -715,12 +763,16 @@ vtgpu_await_hold(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	if (!gpu_display_connected(sc->vsc_display)) {
 		sc->vsc_release_ok = false;
 		sc->vsc_inflight = 0;
+		sc->vsc_d_noview++;
 		return (false);
 	}
-	if (sc->vsc_inflight <= vtgpu_max_inflight(sc))
+	if (sc->vsc_inflight <= vtgpu_max_inflight(sc)) {
+		sc->vsc_d_under++;
 		return (false);
+	}
 	if ((pp = calloc(1, sizeof(*pp))) == NULL)
 		return (false);
+	sc->vsc_d_held++;
 
 	for (int i = 0; i < nwiov && copy > 0; i++) {
 		size_t n = copy < wiov[i].iov_len ? copy : wiov[i].iov_len;
@@ -1223,6 +1275,7 @@ vtgpu_scanout_publish(struct vtgpu_softc *sc,
 	 * hand over a fresh dma_buf fd sixty times a second to describe
 	 * memory the viewer already has.
 	 */
+	sc->vsc_d_scanout++;
 	if (gpu_display_have_buffer(sc->vsc_display, cmd->resource_id)) {
 		/*
 		 * Defer to the fence when the guest supplied one: it marks the
@@ -1523,9 +1576,11 @@ vtgpu_cmd_resource_flush(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	 * vtgpu_scanout_publish() instead.
 	 */
 	if (sc->vsc_display != NULL && cmd != NULL &&
-	    cmd->resource_id == sc->vsc_scanout_res)
+	    cmd->resource_id == sc->vsc_scanout_res) {
+		sc->vsc_d_flush++;
 		vtgpu_publish_fenced(sc, cmd->resource_id, cmd->r.x, cmd->r.y,
 		    cmd->r.width, cmd->r.height);
+	}
 
 	/*
 	 * Hold the present until the viewer has read the frame, so the guest
