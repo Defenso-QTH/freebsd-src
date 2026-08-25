@@ -435,6 +435,7 @@ struct vtgpu_softc {
 	unsigned		vsc_inflight;	/* published, not yet released */
 	uintmax_t		vsc_await_late;
 	struct timespec		vsc_last_release;
+	struct timespec		vsc_last_drain;
 	/*
 	 * vsc_inflight counts presents since the viewer last finished a draw,
 	 * and a release resets it rather than decrementing it.
@@ -480,7 +481,8 @@ struct vtgpu_softc {
 	uintmax_t		vsc_d_noview;	/* no viewer attached */
 	uintmax_t		vsc_d_noack;	/* viewer has never released */
 	uintmax_t		vsc_d_rel;	/* releases received */
-	uintmax_t		vsc_d_dump;	/* backlogs dumped on silence */
+	uintmax_t		vsc_d_dump;	/* frames let through on silence */
+	long			vsc_d_relgap;	/* longest gap between releases */
 	struct timespec		vsc_d_when;
 	uint8_t			*vsc_res_reported;
 	uint32_t		vsc_scanout_res;	/* 0 = none bound */
@@ -679,6 +681,13 @@ vtgpu_paced_expire(struct vtgpu_softc *sc)
 #define	VTGPU_AWAIT_TIMEOUT_MS	250
 
 /*
+ * How often a present is let through while the viewer is not drawing.  Fast
+ * enough that the guest never looks hung, slow enough that it cannot spend
+ * the stall racing ahead into a buffer nobody is reading.
+ */
+#define	VTGPU_DRAIN_MS		33
+
+/*
  * How many frames the guest may have outstanding before its present is held.
  *
  * One less than the number of distinct buffers it presents into: with two it
@@ -730,17 +739,19 @@ vtgpu_note_pub(struct vtgpu_softc *sc, uint32_t res_id)
 
 	EPRINTLN("vtgpu: %ldms present: scanout=%ju flush=%ju | declined: "
 	    "fenced=%ju under=%ju noack=%ju noviewer=%ju | held=%ju "
-	    "rel=%ju dump=%ju inflight=%u max=%u bufs=%u late=%ju",
+	    "rel=%ju relgap=%ldms drain=%ju inflight=%u max=%u bufs=%u "
+	    "late=%ju",
 	    ms, sc->vsc_d_scanout, sc->vsc_d_flush,
 	    sc->vsc_d_fenced, sc->vsc_d_under, sc->vsc_d_noack,
 	    sc->vsc_d_noview, sc->vsc_d_held,
-	    sc->vsc_d_rel, sc->vsc_d_dump,
+	    sc->vsc_d_rel, sc->vsc_d_relgap, sc->vsc_d_dump,
 	    sc->vsc_inflight, vtgpu_max_inflight(sc) + 1,
 	    sc->vsc_recent_n, (uintmax_t)sc->vsc_await_late);
 
 	sc->vsc_d_scanout = sc->vsc_d_flush = sc->vsc_d_fenced = 0;
 	sc->vsc_d_held = sc->vsc_d_under = sc->vsc_d_noview = 0;
 	sc->vsc_d_noack = sc->vsc_d_rel = sc->vsc_d_dump = 0;
+	sc->vsc_d_relgap = 0;
 	sc->vsc_d_when = now;
 }
 
@@ -851,7 +862,20 @@ vtgpu_frame_released(void *arg, uint32_t buffer_id __unused)
 
 	pthread_mutex_lock(&sc->vsc_mtx);
 	sc->vsc_release_ok = true;
-	clock_gettime(CLOCK_MONOTONIC, &sc->vsc_last_release);
+	{
+		struct timespec now;
+		long gap;
+
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if (sc->vsc_last_release.tv_sec != 0) {
+			gap = (now.tv_sec - sc->vsc_last_release.tv_sec) * 1000 +
+			    (now.tv_nsec - sc->vsc_last_release.tv_nsec) /
+			    1000000;
+			if (gap > sc->vsc_d_relgap)
+				sc->vsc_d_relgap = gap;
+		}
+		sc->vsc_last_release = now;
+	}
 	sc->vsc_d_rel++;
 	if (sc->vsc_inflight > 0)
 		sc->vsc_inflight--;
@@ -868,7 +892,7 @@ static int
 vtgpu_awaits_expire(struct vtgpu_softc *sc)
 {
 	struct timespec now;
-	long since;
+	long since, drain;
 
 	if (TAILQ_EMPTY(&sc->vsc_awaits))
 		return (-1);
@@ -889,14 +913,32 @@ vtgpu_awaits_expire(struct vtgpu_softc *sc)
 	if (since < VTGPU_AWAIT_TIMEOUT_MS)
 		return ((int)(VTGPU_AWAIT_TIMEOUT_MS - since));
 
-	vtgpu_awaits_complete(sc, true);
-	sc->vsc_inflight = 0;
+	/*
+	 * The viewer is not drawing.  Let the guest through slowly rather than
+	 * all at once: releasing the whole backlog hands it a burst it
+	 * immediately spends overwriting the buffer, and the stall the viewer
+	 * was already having ends in a jump.  Worse, every tick past the
+	 * deadline released again -- twenty-seven times in one second -- so a
+	 * single stall became a sustained surge.
+	 *
+	 * Nothing is on screen while the viewer is stalled, so there is no
+	 * value in the guest rendering quickly; it only has to keep moving.
+	 */
+	drain = (now.tv_sec - sc->vsc_last_drain.tv_sec) * 1000 +
+	    (now.tv_nsec - sc->vsc_last_drain.tv_nsec) / 1000000;
+	if (drain < VTGPU_DRAIN_MS)
+		return ((int)(VTGPU_DRAIN_MS - drain));
+
+	vtgpu_awaits_complete(sc, false);
+	if (sc->vsc_inflight > 0)
+		sc->vsc_inflight--;
+	sc->vsc_last_drain = now;
 	sc->vsc_d_dump++;
 	if (sc->vsc_await_late++ % 256 == 0)
-		EPRINTLN("vtgpu: viewer silent for %ldms, released the held "
-		    "presents (late=%ju)", since,
+		EPRINTLN("vtgpu: viewer silent for %ldms, letting the guest "
+		    "through one frame at a time (late=%ju)", since,
 		    (uintmax_t)sc->vsc_await_late);
-	return (-1);
+	return (VTGPU_DRAIN_MS);
 }
 
 /* Cursor commands arrive on either queue; both call sites precede it. */
