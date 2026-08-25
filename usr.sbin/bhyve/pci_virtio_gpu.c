@@ -434,6 +434,7 @@ struct vtgpu_softc {
 	bool			vsc_release_ok;
 	unsigned		vsc_inflight;	/* published, not yet released */
 	uintmax_t		vsc_await_late;
+	struct timespec		vsc_last_release;
 	/*
 	 * vsc_inflight counts presents since the viewer last finished a draw,
 	 * and a release resets it rather than decrementing it.
@@ -810,9 +811,17 @@ vtgpu_await_hold(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	return (true);
 }
 
-/* Complete every held present.  Caller holds vsc_mtx. */
+/*
+ * Complete held presents.  Caller holds vsc_mtx.
+ *
+ * all=false completes exactly one, which is what a release means: the guest
+ * may have back the single slot the viewer has finished with.  Completing the
+ * whole backlog instead made each release open the gate for everything queued
+ * behind it -- sixty releases a second let through two hundred and ninety
+ * presents, which is no gate at all.
+ */
 static void
-vtgpu_awaits_flush(struct vtgpu_softc *sc)
+vtgpu_awaits_complete(struct vtgpu_softc *sc, bool all)
 {
 	struct vtgpu_paced *pp, *tmp;
 	struct vqueue_info *last_vq = NULL;
@@ -822,6 +831,8 @@ vtgpu_awaits_flush(struct vtgpu_softc *sc)
 		vq_relchain(pp->vp_vq, pp->vp_idx, pp->vp_resp_len);
 		last_vq = pp->vp_vq;
 		free(pp);
+		if (!all)
+			break;
 	}
 	if (last_vq != NULL)
 		vq_endchains(last_vq, 0);
@@ -837,8 +848,10 @@ vtgpu_frame_released(void *arg, uint32_t buffer_id __unused)
 
 	pthread_mutex_lock(&sc->vsc_mtx);
 	sc->vsc_release_ok = true;
-	sc->vsc_inflight = 0;
-	vtgpu_awaits_flush(sc);
+	clock_gettime(CLOCK_MONOTONIC, &sc->vsc_last_release);
+	if (sc->vsc_inflight > 0)
+		sc->vsc_inflight--;
+	vtgpu_awaits_complete(sc, false);
 	pthread_mutex_unlock(&sc->vsc_mtx);
 }
 
@@ -850,42 +863,35 @@ vtgpu_frame_released(void *arg, uint32_t buffer_id __unused)
 static int
 vtgpu_awaits_expire(struct vtgpu_softc *sc)
 {
-	struct vtgpu_paced *pp, *tmp;
-	struct vqueue_info *last_vq = NULL;
 	struct timespec now;
-	long ms;
+	long since;
 
 	if (TAILQ_EMPTY(&sc->vsc_awaits))
 		return (-1);
 
+	/*
+	 * The deadline is on the viewer, not on the present.
+	 *
+	 * Ageing out each present individually completed them at the rate
+	 * they were held, which kept the virtqueue drained -- and the queue
+	 * filling is the only thing that actually stops the guest, since
+	 * nothing obliges it to wait for a response before submitting again.
+	 * So long as releases keep arriving the viewer is alive and the
+	 * backlog stays held; only silence means it is gone.
+	 */
 	clock_gettime(CLOCK_MONOTONIC, &now);
-	TAILQ_FOREACH_SAFE(pp, &sc->vsc_awaits, vp_link, tmp) {
-		if (!vtgpu_ts_reached(&pp->vp_due, &now))
-			break;		/* queued in due order */
-		TAILQ_REMOVE(&sc->vsc_awaits, pp, vp_link);
-		vq_relchain(pp->vp_vq, pp->vp_idx, pp->vp_resp_len);
-		last_vq = pp->vp_vq;
-		free(pp);
-		/*
-		 * The draw it was waiting on is not coming; start counting
-		 * again from here, or the guest stays held for ever.
-		 */
-		sc->vsc_inflight = 0;
-		if (sc->vsc_await_late++ % 256 == 0)
-			EPRINTLN("vtgpu: viewer did not release a frame in "
-			    "%dms, present completed anyway (late=%ju)",
-			    VTGPU_AWAIT_TIMEOUT_MS,
-			    (uintmax_t)sc->vsc_await_late);
-	}
-	if (last_vq != NULL)
-		vq_endchains(last_vq, 0);
+	since = (now.tv_sec - sc->vsc_last_release.tv_sec) * 1000 +
+	    (now.tv_nsec - sc->vsc_last_release.tv_nsec) / 1000000;
+	if (since < VTGPU_AWAIT_TIMEOUT_MS)
+		return ((int)(VTGPU_AWAIT_TIMEOUT_MS - since));
 
-	pp = TAILQ_FIRST(&sc->vsc_awaits);
-	if (pp == NULL)
-		return (-1);
-	ms = (pp->vp_due.tv_sec - now.tv_sec) * 1000 +
-	    (pp->vp_due.tv_nsec - now.tv_nsec) / 1000000;
-	return (ms < 0 ? 0 : (int)ms);
+	vtgpu_awaits_complete(sc, true);
+	sc->vsc_inflight = 0;
+	if (sc->vsc_await_late++ % 256 == 0)
+		EPRINTLN("vtgpu: viewer silent for %ldms, released the held "
+		    "presents (late=%ju)", since,
+		    (uintmax_t)sc->vsc_await_late);
+	return (-1);
 }
 
 /* Cursor commands arrive on either queue; both call sites precede it. */
@@ -2663,20 +2669,26 @@ vtgpu_worker(void *arg)
 			}
 			if (!TAILQ_EMPTY(&sc->vsc_awaits)) {
 				/*
-				 * A present is held for the viewer.  The
-				 * release itself completes the chain from the
-				 * mevent thread, so all the worker owes here
-				 * is the timeout -- but it must also notice
-				 * promptly when the released guest submits
-				 * again, so poll rather than sleep out the
-				 * whole deadline.
+				 * Presents are held for the viewer.  The
+				 * release completes a chain from the mevent
+				 * thread, so all the worker owes here is the
+				 * silence deadline -- and while the viewer is
+				 * drawing, the backlog stays held on purpose,
+				 * so sleeping the millisecond backstop would
+				 * spin at a thousand wakeups a second for as
+				 * long as the guest is throttled.  Sleep
+				 * towards the deadline instead, capped so a
+				 * queue kick is still noticed promptly.
 				 */
-				if (vtgpu_awaits_expire(sc) >= 0) {
+				int due_ms = vtgpu_awaits_expire(sc);
+
+				if (due_ms >= 0) {
+					long ms = due_ms > 10 ? 10 :
+					    (due_ms ? due_ms :
+					    VTGPU_KQ_BACKSTOP_MS);
 					struct timespec ts = {
 						.tv_sec = 0,
-						.tv_nsec =
-						    VTGPU_KQ_BACKSTOP_MS *
-						    1000000L
+						.tv_nsec = ms * 1000000L
 					};
 
 					pthread_mutex_unlock(&sc->vsc_mtx);
