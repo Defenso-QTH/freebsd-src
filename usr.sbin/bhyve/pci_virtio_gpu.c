@@ -434,6 +434,7 @@ struct vtgpu_softc {
 	bool			vsc_release_ok;
 	unsigned		vsc_inflight;	/* published, not yet released */
 	uintmax_t		vsc_await_late;
+	unsigned		vsc_awaits_n;
 	struct timespec		vsc_last_release;
 	struct timespec		vsc_last_drain;
 	/*
@@ -482,6 +483,7 @@ struct vtgpu_softc {
 	uintmax_t		vsc_d_noack;	/* viewer has never released */
 	uintmax_t		vsc_d_rel;	/* releases received */
 	uintmax_t		vsc_d_dump;	/* frames let through on silence */
+	uintmax_t		vsc_d_capped;	/* not held: backlog at the cap */
 	long			vsc_d_relgap;	/* longest gap between releases */
 	struct timespec		vsc_d_when;
 	uint8_t			*vsc_res_reported;
@@ -688,6 +690,20 @@ vtgpu_paced_expire(struct vtgpu_softc *sc)
 #define	VTGPU_DRAIN_MS		33
 
 /*
+ * The most presents held at once.
+ *
+ * Holding is only felt by the guest when the virtqueue fills, because
+ * nothing makes it wait for a completion -- so letting the backlog grow to
+ * the depth of the ring puts the whole path into lockstep: one release, one
+ * completion, one submit, one draw.  The frame rate then becomes one over the
+ * round trip, measured at 12-34 a second, which reads as the picture stopping
+ * and starting.  A shallow cap keeps the guest out of that regime; past it a
+ * present is completed rather than held, which costs some blending on a
+ * single-buffered guest and is much the lesser fault.
+ */
+#define	VTGPU_MAX_HELD		3
+
+/*
  * How many frames the guest may have outstanding before its present is held.
  *
  * One less than the number of distinct buffers it presents into: with two it
@@ -738,11 +754,11 @@ vtgpu_note_pub(struct vtgpu_softc *sc, uint32_t res_id)
 		return;
 
 	EPRINTLN("vtgpu: %ldms present: scanout=%ju flush=%ju | declined: "
-	    "fenced=%ju under=%ju noack=%ju noviewer=%ju | held=%ju "
+	    "fenced=%ju under=%ju capped=%ju noack=%ju noviewer=%ju | held=%ju "
 	    "rel=%ju relgap=%ldms drain=%ju inflight=%u max=%u bufs=%u "
 	    "late=%ju",
 	    ms, sc->vsc_d_scanout, sc->vsc_d_flush,
-	    sc->vsc_d_fenced, sc->vsc_d_under, sc->vsc_d_noack,
+	    sc->vsc_d_fenced, sc->vsc_d_under, sc->vsc_d_capped, sc->vsc_d_noack,
 	    sc->vsc_d_noview, sc->vsc_d_held,
 	    sc->vsc_d_rel, sc->vsc_d_relgap, sc->vsc_d_dump,
 	    sc->vsc_inflight, vtgpu_max_inflight(sc) + 1,
@@ -752,6 +768,7 @@ vtgpu_note_pub(struct vtgpu_softc *sc, uint32_t res_id)
 	sc->vsc_d_held = sc->vsc_d_under = sc->vsc_d_noview = 0;
 	sc->vsc_d_noack = sc->vsc_d_rel = sc->vsc_d_dump = 0;
 	sc->vsc_d_relgap = 0;
+	sc->vsc_d_capped = 0;
 	sc->vsc_d_when = now;
 }
 
@@ -799,6 +816,10 @@ vtgpu_await_hold(struct vtgpu_softc *sc, struct vqueue_info *vq,
 		sc->vsc_d_under++;
 		return (false);
 	}
+	if (sc->vsc_awaits_n >= VTGPU_MAX_HELD) {
+		sc->vsc_d_capped++;
+		return (false);
+	}
 	if ((pp = calloc(1, sizeof(*pp))) == NULL)
 		return (false);
 	sc->vsc_d_held++;
@@ -822,6 +843,7 @@ vtgpu_await_hold(struct vtgpu_softc *sc, struct vqueue_info *vq,
 	pp->vp_idx = chain_idx;
 	pp->vp_resp_len = (uint32_t)sizeof(resp);
 	TAILQ_INSERT_TAIL(&sc->vsc_awaits, pp, vp_link);
+	sc->vsc_awaits_n++;
 	return (true);
 }
 
@@ -842,6 +864,7 @@ vtgpu_awaits_complete(struct vtgpu_softc *sc, bool all)
 
 	TAILQ_FOREACH_SAFE(pp, &sc->vsc_awaits, vp_link, tmp) {
 		TAILQ_REMOVE(&sc->vsc_awaits, pp, vp_link);
+		sc->vsc_awaits_n--;
 		vq_relchain(pp->vp_vq, pp->vp_idx, pp->vp_resp_len);
 		last_vq = pp->vp_vq;
 		free(pp);
