@@ -900,8 +900,22 @@ vtgpu_frame_released(void *arg, uint32_t buffer_id __unused)
 		sc->vsc_last_release = now;
 	}
 	sc->vsc_d_rel++;
-	if (sc->vsc_inflight > 0)
-		sc->vsc_inflight--;
+	/*
+	 * Count from this draw, do not subtract one.
+	 *
+	 * A running balance of presents against releases cannot work here:
+	 * the viewer coalesces, so most frames are never drawn and never
+	 * acknowledged, and the balance climbs for ever -- 329 before the
+	 * viewer had even connected, 518 by the end.  Once it is permanently
+	 * above the limit every present is held and only the backlog cap is
+	 * doing anything, which is not the pacing that was designed.
+	 *
+	 * What bounds the guest is presents since the viewer last finished a
+	 * draw, so reset.  With the turnstile completing exactly one present
+	 * per release, the guest gets one present per draw and the backlog
+	 * never approaches the depth of the ring.
+	 */
+	sc->vsc_inflight = 0;
 	vtgpu_awaits_complete(sc, false);
 	pthread_mutex_unlock(&sc->vsc_mtx);
 }
