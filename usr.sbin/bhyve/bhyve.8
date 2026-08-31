@@ -747,6 +747,39 @@ Version of the TPM device according to the TCG specification.
 Defaults to
 .Cm 2.0 ,
 which is the only version currently supported.
+.It Cm ctrl_path= Ns Ar path
+Path of the UNIX domain socket that
+.Cm swtpm
+was given as its control channel, via
+.Cm --ctrl Cm type=unixio,path= Ns Ar path .
+Only meaningful for the
+.Cm swtpm
+backend.
+.Pp
+When this is given,
+.Nm
+tells
+.Cm swtpm
+to reinitialise the TPM as the virtual machine starts, which resets the
+platform configuration registers just as a cold boot of a physical machine
+would.
+.Pp
+Because
+.Nm
+exits when the guest reboots and is then started afresh against the same
+long-running
+.Cm swtpm
+process, a TPM that is never reinitialised still holds the previous boot's
+register values, and firmware measurements are extended on top of them.
+A guest that has sealed a secret against those registers, such as Windows
+using BitLocker together with secure boot, cannot unseal it and asks for a
+recovery key after every reboot.
+.Pp
+The registers are only cleared if
+.Cm swtpm
+itself was started with
+.Cm --flags Cm startup-clear .
+If this option is not given, the TPM is used exactly as it is found.
 .El
 .Ss Boot ROM device backends
 .Sm off
