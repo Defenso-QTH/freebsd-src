@@ -160,8 +160,8 @@ jobs:
           # We create the package manually and re-index the repo here.
           kdbg=$(find "$MAKEOBJDIRPREFIX" -name "kernel.debug" -path "*/DEFENSO/*" | head -1 || true)
           if [ -z "$kdbg" ]; then
-            echo "WARNING: kernel.debug not found; skipping FreeBSD-kernel-defenso-dbg"
-            exit 0
+            echo "::error::kernel.debug not found; refusing to ship an empty -dbg package"
+            exit 1
           fi
           echo "kernel.debug: $kdbg ($(du -sh "$kdbg" | cut -f1))"
 
@@ -169,11 +169,55 @@ jobs:
           install -d "$stage/usr/lib/debug/boot/kernel"
           install -m 0644 "$kdbg" "$stage/usr/lib/debug/boot/kernel/kernel.debug"
 
+          # Module symbols matter more than the kernel's here: a passthrough or
+          # virtio-gpu panic lands in vmm.ko, and without vmm.ko.debug those
+          # frames stay unresolved however well the kernel itself matches.
+          kdir=$(dirname "$kdbg")
+          nmod=0
+          for m in $(find "$kdir" -name "*.ko.debug" 2>/dev/null); do
+            install -m 0644 "$m" "$stage/usr/lib/debug/boot/kernel/$(basename "$m")"
+            nmod=$((nmod + 1))
+          done
+          echo "module debug files: $nmod"
+
+          # Assert the debug info actually belongs to the kernel we ship.
+          # objcopy --only-keep-debug preserves the GNU build ID, so the two
+          # must be identical; a mismatch means the -dbg package pairs with a
+          # different build and kgdb will reject it.
+          kpkg=$(find "$RUNNER_TEMP/repo" -name "FreeBSD-kernel-defenso-[0-9]*.pkg" | head -1)
+          tar --zstd -xOf "$kpkg" ./boot/kernel/kernel > /tmp/kernel.shipped 2>/dev/null ||
+            tar --zstd -xOf "$kpkg" /boot/kernel/kernel > /tmp/kernel.shipped 2>/dev/null || true
+          bid_pkg=$(readelf -n /tmp/kernel.shipped 2>/dev/null | awk '/Build ID/{print $NF}')
+          bid_dbg=$(readelf -n "$kdbg" 2>/dev/null | awk '/Build ID/{print $NF}')
+          echo "build id shipped kernel: ${bid_pkg:-<none>}"
+          echo "build id kernel.debug  : ${bid_dbg:-<none>}"
+          if [ -z "$bid_dbg" ]; then
+            echo "::error::kernel.debug carries no GNU build ID"
+            exit 1
+          fi
+          if [ -n "$bid_pkg" ] && [ "$bid_pkg" != "$bid_dbg" ]; then
+            echo "::error::build ID mismatch: the -dbg package does not match"
+            echo "::error::the kernel in FreeBSD-kernel-defenso.  kgdb would"
+            echo "::error::reject it."
+            exit 1
+          fi
+
           # Derive version from a sibling package already in the repo so this
           # package stays in sync with the rest of the pkgbase set.
-          kpkg=$(find "$RUNNER_TEMP/repo" -name "FreeBSD-kernel-defenso-[0-9]*.pkg" | head -1)
           pkgver=$(basename "$kpkg" .pkg | sed 's/^FreeBSD-kernel-defenso-//')
           echo "kernel-defenso version: $pkgver"
+
+          # pkg create needs an explicit file list.  Without -p (or a files
+          # section in the manifest) it writes a package containing nothing but
+          # metadata, which installs cleanly and silently provides no symbols
+          # at all -- which is what shipped until now.
+          ( cd "$stage" && find . -type f | sed 's/^\.//' ) | sort > /tmp/dbg.plist
+          nfiles=$(wc -l < /tmp/dbg.plist)
+          echo "staged files: $nfiles"
+          if [ "$nfiles" -lt 1 ]; then
+            echo "::error::no debug files staged"
+            exit 1
+          fi
 
           flatsize=$(find "$stage" -type f -exec stat -c '%s' {} + | awk '{s+=$1}END{print s+0}')
           { echo 'name = "FreeBSD-kernel-defenso-dbg";'
@@ -181,22 +225,26 @@ jobs:
             echo 'abi = "FreeBSD:15:amd64";'
             echo "flatsize = $flatsize;"
             echo 'comment = "Debug symbols for the DEFENSO FreeBSD kernel";'
-            echo 'desc = "Debug symbols for the DEFENSO FreeBSD kernel. Install alongside FreeBSD-kernel-defenso, then use crashinfo(8) or kgdb(1) after a panic.";'
+            echo 'desc = "Debug symbols for the DEFENSO FreeBSD kernel and its modules. Install alongside FreeBSD-kernel-defenso, then use crashinfo(8) or kgdb(1) after a panic.";'
             echo 'www = "https://www.freebsd.org";'
             echo 'maintainer = "quentin.thebault@defenso.fr";'
             echo 'prefix = "/";'
             echo 'origin = "sys/FreeBSD-kernel-defenso-dbg";'
           } > /tmp/dbg.ucl
 
-          # pkgbase places packages directly in the version dir (no All/ subdir).
-          # Locate it via an existing package file.
-          pkgdir=$(find "$RUNNER_TEMP/repo" -name "FreeBSD-kernel-defenso-*.pkg" | head -1 | xargs -r dirname)
-          if [ -z "$pkgdir" ]; then
-            echo "ERROR: could not locate repo package directory"
+          pkgdir=$(dirname "$kpkg")
+          echo "repo dir: $pkgdir"
+          /usr/local/sbin/pkg -o ABI="FreeBSD:15:amd64" create \
+            -M /tmp/dbg.ucl -p /tmp/dbg.plist -r "$stage" -o "$pkgdir"
+
+          # Prove the result is not empty before publishing it.
+          dbgpkg=$(find "$pkgdir" -name "FreeBSD-kernel-defenso-dbg-*.pkg" | head -1)
+          got=$(tar --zstd -tf "$dbgpkg" 2>/dev/null | grep -c "kernel.debug" || true)
+          echo "kernel.debug present in package: $got"
+          if [ "${got:-0}" -lt 1 ]; then
+            echo "::error::the -dbg package does not contain kernel.debug"
             exit 1
           fi
-          echo "repo dir: $pkgdir"
-          /usr/local/sbin/pkg -o ABI="FreeBSD:15:amd64" create -M /tmp/dbg.ucl -r "$stage" -o "$pkgdir"
           /usr/local/sbin/pkg repo "$pkgdir"
 
       - name: stage pkg repo for Pages
