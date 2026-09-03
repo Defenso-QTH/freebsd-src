@@ -119,6 +119,22 @@ SYSCTL_DECL(_hw_vmm);
 SYSCTL_NODE(_hw_vmm, OID_AUTO, ppt, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
     "bhyve passthru devices");
 
+/*
+ * Trace which MSI-X table entries the guest programs on a passthrough device.
+ *
+ * bhyve gives a host vector only to an entry the guest writes and unmasks,
+ * and the remaining hardware entries are left as found rather than masked.
+ * A device that fires an entry which was never programmed therefore sends
+ * whatever the hardware table holds, and the passthrough path performs no
+ * interrupt remapping, so it lands on a vector nobody allocated.  Comparing
+ * this against the guest's own view of how many vectors it has is the point.
+ *
+ * Off by default; hw.vmm.ppt.msix_trace=1 to enable.
+ */
+static int ppt_msix_trace;
+SYSCTL_INT(_hw_vmm_ppt, OID_AUTO, msix_trace, CTLFLAG_RWTUN, &ppt_msix_trace,
+    0, "Log MSI-X table entries programmed on passthrough devices");
+
 static int num_pptdevs;
 SYSCTL_INT(_hw_vmm_ppt, OID_AUTO, devices, CTLFLAG_RD, &num_pptdevs, 0,
     "number of pci passthru devices");
@@ -937,6 +953,10 @@ ppt_setup_msix(struct vm *vm, int bus, int slot, int func,
 				       INTR_TYPE_NET | INTR_MPSAFE,
 				       pptintr, NULL, &ppt->msix.arg[idx],
 				       &ppt->msix.cookie[idx]);
+		if (ppt_msix_trace && error == 0)
+			device_printf(ppt->dev,
+			    "ppt: msix idx=%d of %d given host irq rid=%d\n",
+			    idx, ppt->msix.num_msgs, rid);
 		if (error != 0) {
 			bus_release_resource(ppt->dev, SYS_RES_IRQ, rid, ppt->msix.res[idx]);
 			ppt->msix.cookie[idx] = NULL;

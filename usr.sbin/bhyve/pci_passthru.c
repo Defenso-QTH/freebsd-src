@@ -495,6 +495,54 @@ msix_table_read(struct passthru_softc *sc, uint64_t offset, int size)
 	return (data);
 }
 
+/*
+ * Optional trace of which MSI-X table entries the guest actually programs.
+ *
+ * bhyve allocates a host vector only for an entry the guest writes through
+ * this path and leaves unmasked; nothing masks the remaining hardware
+ * entries.  A device that fires an entry which was never programmed sends
+ * whatever address and data the hardware table happens to hold, and with no
+ * interrupt remapping in the passthrough path -- struct iommu_ops has no such
+ * member -- that reaches the CPU as an interrupt on a vector nobody
+ * allocated, which panics the host with "reserved (unknown) fault".
+ *
+ * MHI devices (ath11k and friends) select their vector from an event-ring
+ * context in guest memory rather than from the table, so the count the guest
+ * believes it has and the count bhyve has programmed can differ.  Comparing
+ * the two is the point of this trace.
+ *
+ * Enable with -o passthru.msix_trace=1; off by default and free when off.
+ */
+static int passthru_msix_trace;
+static uint64_t passthru_msix_seen;	/* bitmap of programmed indices */
+
+static void
+passthru_msix_note(struct passthru_softc *sc, int index, uint64_t addr,
+    uint32_t msg_data, uint32_t vector_control)
+{
+	struct pci_devinst *pi = sc->psc_pi;
+	bool first;
+
+	first = index < 64 && (passthru_msix_seen & (1ULL << index)) == 0;
+	if (index < 64)
+		passthru_msix_seen |= 1ULL << index;
+
+	EPRINTLN("passthru %d/%d/%d: msix idx=%d/%d addr=%#lx data=%#x "
+	    "vctrl=%#x%s", sc->psc_sel.pc_bus, sc->psc_sel.pc_dev,
+	    sc->psc_sel.pc_func, index, pi->pi_msix.table_count, addr,
+	    msg_data, vector_control, first ? " (first)" : "");
+
+	if (first) {
+		int n = 0;
+		for (int i = 0; i < 64; i++)
+			if (passthru_msix_seen & (1ULL << i))
+				n++;
+		EPRINTLN("passthru %d/%d/%d: %d of %d msix entries programmed "
+		    "so far", sc->psc_sel.pc_bus, sc->psc_sel.pc_dev,
+		    sc->psc_sel.pc_func, n, pi->pi_msix.table_count);
+	}
+}
+
 static void
 msix_table_write(struct passthru_softc *sc, uint64_t offset, int size,
     uint64_t data)
@@ -559,6 +607,9 @@ msix_table_write(struct passthru_softc *sc, uint64_t offset, int size,
 			    sc->psc_sel.pc_bus, sc->psc_sel.pc_dev,
 			    sc->psc_sel.pc_func, index, entry->addr,
 			    entry->msg_data, entry->vector_control);
+			if (passthru_msix_trace)
+				passthru_msix_note(sc, index, entry->addr,
+				    entry->msg_data, entry->vector_control);
 		}
 	}
 }
@@ -1024,6 +1075,18 @@ passthru_init(struct pci_devinst *pi, nvlist_t *nvl)
 	}								\
 	var = atoi(value);						\
 } while (0)
+
+	/*
+	 * Per-device switch for the MSI-X programming trace above; also
+	 * accepted globally as -o passthru.msix_trace=1 so it can be turned on
+	 * without editing every passthru entry.
+	 */
+	if (get_config_value_node(nvl, "msix_trace") != NULL)
+		passthru_msix_trace = atoi(get_config_value_node(nvl,
+		    "msix_trace"));
+	else
+		passthru_msix_trace = get_config_bool_default(
+		    "passthru.msix_trace", false);
 
 	value = get_config_value_node(nvl, "pptdev");
 	if (value != NULL) {
