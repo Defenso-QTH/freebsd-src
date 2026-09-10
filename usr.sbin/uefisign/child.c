@@ -40,6 +40,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sysexits.h>
 #include <unistd.h>
 
 #include <openssl/evp.h>
@@ -60,19 +61,19 @@ load(struct executable *x)
 
 	error = fstat(fd, &sb);
 	if (error != 0)
-		err(1, "%s: fstat", x->x_path);
+		err(EX_OSERR, "%s: fstat", x->x_path);
 
 	len = sb.st_size;
 	if (len <= 0)
-		errx(1, "%s: file is empty", x->x_path);
+		errx(EXIT_MALFORMED, "%s: file is empty", x->x_path);
 
 	buf = malloc(len);
 	if (buf == NULL)
-		err(1, "%s: cannot malloc %zd bytes", x->x_path, len);
+		err(EX_OSERR, "%s: cannot malloc %zd bytes", x->x_path, len);
 
 	nread = fread(buf, len, 1, x->x_fp);
 	if (nread != 1)
-		err(1, "%s: fread", x->x_path);
+		err(EX_IOERR, "%s: fread", x->x_path);
 
 	x->x_buf = buf;
 	x->x_len = len;
@@ -88,7 +89,7 @@ digest_range(struct executable *x, EVP_MD_CTX *mdctx, off_t off, size_t len)
 	ok = EVP_DigestUpdate(mdctx, x->x_buf + off, len);
 	if (ok == 0) {
 		ERR_print_errors_fp(stderr);
-		errx(1, "EVP_DigestUpdate(3) failed");
+		errx(EX_SOFTWARE, "EVP_DigestUpdate(3) failed");
 	}
 }
 
@@ -108,19 +109,20 @@ digest(struct executable *x)
 	md = EVP_get_digestbyname(DIGEST);
 	if (md == NULL) {
 		ERR_print_errors_fp(stderr);
-		errx(1, "EVP_get_digestbyname(\"%s\") failed", DIGEST);
+		errx(EX_UNAVAILABLE, "EVP_get_digestbyname(\"%s\") failed",
+		    DIGEST);
 	}
 
 	mdctx = EVP_MD_CTX_create();
 	if (mdctx == NULL) {
 		ERR_print_errors_fp(stderr);
-		errx(1, "EVP_MD_CTX_create(3) failed");
+		errx(EX_SOFTWARE, "EVP_MD_CTX_create(3) failed");
 	}
 
 	ok = EVP_DigestInit_ex(mdctx, md, NULL);
 	if (ok == 0) {
 		ERR_print_errors_fp(stderr);
-		errx(1, "EVP_DigestInit_ex(3) failed");
+		errx(EX_SOFTWARE, "EVP_DigestInit_ex(3) failed");
 	}
 
 	/*
@@ -164,7 +166,8 @@ digest(struct executable *x)
 	 * I believe this can happen with overlapping sections.
 	 */
 	if (sum_of_bytes_hashed > x->x_len)
-		errx(1, "number of bytes hashed is larger than file size");
+		errx(EXIT_MALFORMED,
+		    "number of bytes hashed is larger than file size");
 
 	/*
 	 * I can't really explain this one; just do what the spec says.
@@ -177,7 +180,7 @@ digest(struct executable *x)
 	ok = EVP_DigestFinal_ex(mdctx, x->x_digest, &x->x_digest_len);
 	if (ok == 0) {
 		ERR_print_errors_fp(stderr);
-		errx(1, "EVP_DigestFinal_ex(3) failed");
+		errx(EX_SOFTWARE, "EVP_DigestFinal_ex(3) failed");
 	}
 
 	EVP_MD_CTX_destroy(mdctx);
@@ -218,7 +221,7 @@ save(struct executable *x, FILE *fp, const char *path)
 
 	nwritten = fwrite(x->x_buf, x->x_len, 1, fp);
 	if (nwritten != 1)
-		err(1, "%s: fwrite", path);
+		err(EX_IOERR, "%s: fwrite", path);
 }
 
 int
@@ -228,16 +231,16 @@ child(const char *inpath, const char *outpath, int pipefd,
 	FILE *outfp = NULL, *infp = NULL;
 	struct executable *x;
 
-	infp = checked_fopen(inpath, "r");
+	infp = checked_fopen(inpath, "r", EX_NOINPUT);
 	if (outpath != NULL)
-		outfp = checked_fopen(outpath, "w");
+		outfp = checked_fopen(outpath, "w", EX_CANTCREAT);
 
 	if (caph_enter() < 0)
-		err(1, "cap_enter");
+		err(EX_OSERR, "cap_enter");
 
 	x = calloc(1, sizeof(*x));
 	if (x == NULL)
-		err(1, "calloc");
+		err(EX_OSERR, "calloc");
 	x->x_path = inpath;
 	x->x_fp = infp;
 
@@ -245,7 +248,7 @@ child(const char *inpath, const char *outpath, int pipefd,
 	parse(x);
 	if (Vflag) {
 		if (signature_size(x) == 0)
-			errx(1, "file not signed");
+			errx(EXIT_SIGNATURE, "file not signed");
 
 		printf("file contains signature\n");
 		if (vflag) {
@@ -255,7 +258,7 @@ child(const char *inpath, const char *outpath, int pipefd,
 		}
 	} else {
 		if (signature_size(x) != 0)
-			errx(1, "file already signed");
+			errx(EXIT_SIGNATURE, "file already signed");
 
 		digest(x);
 		if (vflag)
@@ -266,5 +269,5 @@ child(const char *inpath, const char *outpath, int pipefd,
 		save(x, outfp, outpath);
 	}
 
-	return (0);
+	return (EX_OK);
 }

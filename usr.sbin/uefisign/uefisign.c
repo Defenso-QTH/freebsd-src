@@ -34,8 +34,10 @@
 #include <assert.h>
 #include <err.h>
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sysexits.h>
 #include <unistd.h>
 
 #include <openssl/conf.h>
@@ -53,7 +55,7 @@ usage(void)
 
 	fprintf(stderr, "usage: uefisign -c cert -k key -o outfile [-v] file\n"
 			"       uefisign -V [-c cert] [-v] file\n");
-	exit(1);
+	exit(EX_USAGE);
 }
 
 static char *
@@ -63,12 +65,12 @@ checked_strdup(const char *s)
 
 	c = strdup(s);
 	if (c == NULL)
-		err(1, "strdup");
+		err(EX_OSERR, "strdup");
 	return (c);
 }
 
 FILE *
-checked_fopen(const char *path, const char *mode)
+checked_fopen(const char *path, const char *mode, int eval)
 {
 	FILE *fp;
 
@@ -76,8 +78,26 @@ checked_fopen(const char *path, const char *mode)
 
 	fp = fopen(path, mode);
 	if (fp == NULL)
-		err(1, "%s", path);
+		err(eval, "%s", path);
 	return (fp);
+}
+
+static pid_t child_pid = -1;
+
+static int	wait_for_child(pid_t pid);
+
+static void
+peer_exited(void)
+{
+	int status;
+
+	if (child_pid == -1)
+		exit(EX_IOERR);
+
+	status = wait_for_child(child_pid);
+	if (status == EX_OK)
+		errx(EX_SOFTWARE, "child exited without sending its result");
+	exit(status);
 }
 
 void
@@ -86,11 +106,15 @@ send_chunk(const void *buf, size_t len, int pipefd)
 	ssize_t ret;
 
 	ret = write(pipefd, &len, sizeof(len));
+	if (ret == -1 && errno == EPIPE)
+		peer_exited();
 	if (ret != sizeof(len))
-		err(1, "write");
+		err(EX_IOERR, "write");
 	ret = write(pipefd, buf, len);
+	if (ret == -1 && errno == EPIPE)
+		peer_exited();
 	if (ret != (ssize_t)len)
-		err(1, "write");
+		err(EX_IOERR, "write");
 }
 
 void
@@ -101,16 +125,20 @@ receive_chunk(void **bufp, size_t *lenp, int pipefd)
 	void *buf;
 
 	ret = read(pipefd, &len, sizeof(len));
+	if (ret == 0)
+		peer_exited();
 	if (ret != sizeof(len))
-		err(1, "read");
+		err(EX_IOERR, "read");
 
 	buf = calloc(1, len);
 	if (buf == NULL)
-		err(1, "calloc");
+		err(EX_OSERR, "calloc");
 
 	ret = read(pipefd, buf, len);
+	if (ret == 0)
+		peer_exited();
 	if (ret != (ssize_t)len)
-		err(1, "read");
+		err(EX_IOERR, "read");
 
 	*bufp = buf;
 	*lenp = len;
@@ -126,7 +154,7 @@ bin2hex(const char *bin, size_t bin_len)
 	hex_len = bin_len * 2 + 1; /* +1 for '\0'. */
 	hex = malloc(hex_len);
 	if (hex == NULL)
-		err(1, "malloc");
+		err(EX_OSERR, "malloc");
 
 	tmp = hex;
 	for (i = 0; i < bin_len; i++) {
@@ -167,36 +195,36 @@ magic(PKCS7 *pkcs7, const char *digest, size_t digest_len)
 
 	asprintf(&magic_conf, magic_fmt, digest_hex);
 	if (magic_conf == NULL)
-		err(1, "asprintf");
+		err(EX_OSERR, "asprintf");
 
 	bio = BIO_new_mem_buf((void *)magic_conf, -1);
 	if (bio == NULL) {
 		ERR_print_errors_fp(stderr);
-		errx(1, "BIO_new_mem_buf(3) failed");
+		errx(EX_SOFTWARE, "BIO_new_mem_buf(3) failed");
 	}
 
 	cnf = NCONF_new(NULL);
 	if (cnf == NULL) {
 		ERR_print_errors_fp(stderr);
-		errx(1, "NCONF_new(3) failed");
+		errx(EX_SOFTWARE, "NCONF_new(3) failed");
 	}
 
 	ok = NCONF_load_bio(cnf, bio, NULL);
 	if (ok == 0) {
 		ERR_print_errors_fp(stderr);
-		errx(1, "NCONF_load_bio(3) failed");
+		errx(EX_SOFTWARE, "NCONF_load_bio(3) failed");
 	}
 
 	str = NCONF_get_string(cnf, "default", "asn1");
 	if (str == NULL) {
 		ERR_print_errors_fp(stderr);
-		errx(1, "NCONF_get_string(3) failed");
+		errx(EX_SOFTWARE, "NCONF_get_string(3) failed");
 	}
 
 	t = ASN1_generate_nconf(str, cnf);
 	if (t == NULL) {
 		ERR_print_errors_fp(stderr);
-		errx(1, "ASN1_generate_nconf(3) failed");
+		errx(EX_SOFTWARE, "ASN1_generate_nconf(3) failed");
 	}
 
 	/*
@@ -206,7 +234,7 @@ magic(PKCS7 *pkcs7, const char *digest, size_t digest_len)
 	len = i2d_ASN1_TYPE(t, NULL);
 	tmp = buf = calloc(1, len);
 	if (tmp == NULL)
-		err(1, "calloc");
+		err(EX_OSERR, "calloc");
 	i2d_ASN1_TYPE(t, &tmp);
 
 	/*
@@ -218,7 +246,7 @@ magic(PKCS7 *pkcs7, const char *digest, size_t digest_len)
 	t_bio = PKCS7_dataInit(pkcs7, NULL);
 	if (t_bio == NULL) {
 		ERR_print_errors_fp(stderr);
-		errx(1, "PKCS7_dataInit(3) failed");
+		errx(EX_SOFTWARE, "PKCS7_dataInit(3) failed");
 	}
 
 	BIO_write(t_bio, buf + 2, len - 2);
@@ -226,7 +254,7 @@ magic(PKCS7 *pkcs7, const char *digest, size_t digest_len)
 	ok = PKCS7_dataFinal(pkcs7, t_bio);
 	if (ok == 0) {
 		ERR_print_errors_fp(stderr);
-		errx(1, "PKCS7_dataFinal(3) failed");
+		errx(EX_SOFTWARE, "PKCS7_dataFinal(3) failed");
 	}
 
 	t = ASN1_TYPE_new();
@@ -256,25 +284,26 @@ sign(X509 *cert, EVP_PKEY *key, int pipefd)
 	bio = BIO_new_mem_buf(digest, digest_len);
 	if (bio == NULL) {
 		ERR_print_errors_fp(stderr);
-		errx(1, "BIO_new_mem_buf(3) failed");
+		errx(EX_SOFTWARE, "BIO_new_mem_buf(3) failed");
 	}
 
 	pkcs7 = PKCS7_sign(NULL, NULL, NULL, bio, PKCS7_BINARY | PKCS7_PARTIAL);
 	if (pkcs7 == NULL) {
 		ERR_print_errors_fp(stderr);
-		errx(1, "PKCS7_sign(3) failed");
+		errx(EX_SOFTWARE, "PKCS7_sign(3) failed");
 	}
 
 	md = EVP_get_digestbyname(DIGEST);
 	if (md == NULL) {
 		ERR_print_errors_fp(stderr);
-		errx(1, "EVP_get_digestbyname(\"%s\") failed", DIGEST);
+		errx(EX_UNAVAILABLE, "EVP_get_digestbyname(\"%s\") failed",
+		    DIGEST);
 	}
 
 	info = PKCS7_sign_add_signer(pkcs7, cert, key, md, 0);
 	if (info == NULL) {
 		ERR_print_errors_fp(stderr);
-		errx(1, "PKCS7_sign_add_signer(3) failed");
+		errx(EX_SOFTWARE, "PKCS7_sign_add_signer(3) failed");
 	}
 
 	/*
@@ -297,19 +326,19 @@ sign(X509 *cert, EVP_PKEY *key, int pipefd)
 	out = BIO_new(BIO_s_mem());
 	if (out == NULL) {
 		ERR_print_errors_fp(stderr);
-		errx(1, "BIO_new(3) failed");
+		errx(EX_SOFTWARE, "BIO_new(3) failed");
 	}
 
 	ok = i2d_PKCS7_bio(out, pkcs7);
 	if (ok == 0) {
 		ERR_print_errors_fp(stderr);
-		errx(1, "i2d_PKCS7_bio(3) failed");
+		errx(EX_SOFTWARE, "i2d_PKCS7_bio(3) failed");
 	}
 
 	signature_len = BIO_get_mem_data(out, &signature);
 	if (signature_len <= 0) {
 		ERR_print_errors_fp(stderr);
-		errx(1, "BIO_get_mem_data(3) failed");
+		errx(EX_SOFTWARE, "BIO_get_mem_data(3) failed");
 	}
 
 	(void)BIO_set_close(out, BIO_NOCLOSE);
@@ -325,7 +354,16 @@ wait_for_child(pid_t pid)
 
 	pid = waitpid(pid, &status, 0);
 	if (pid == -1)
-		err(1, "waitpid");
+		err(EX_OSERR, "waitpid");
+
+	/*
+	 * WEXITSTATUS() of a process killed by a signal is 0.
+	 */
+	if (WIFSIGNALED(status)) {
+		warnx("child process terminated by signal %d",
+		    WTERMSIG(status));
+		return (128 + WTERMSIG(status));
+	}
 
 	return (WEXITSTATUS(status));
 }
@@ -351,19 +389,22 @@ main(int argc, char **argv)
 			if (certpath == NULL)
 				certpath = checked_strdup(optarg);
 			else
-				err(1, "-c can only be specified once");
+				errx(EX_USAGE,
+				    "-c can only be specified once");
 			break;
 		case 'k':
 			if (keypath == NULL)
 				keypath = checked_strdup(optarg);
 			else
-				err(1, "-k can only be specified once");
+				errx(EX_USAGE,
+				    "-k can only be specified once");
 			break;
 		case 'o':
 			if (outpath == NULL)
 				outpath = checked_strdup(optarg);
 			else
-				err(1, "-o can only be specified once");
+				errx(EX_USAGE,
+				    "-o can only be specified once");
 			break;
 		case 'v':
 			vflag = true;
@@ -380,18 +421,18 @@ main(int argc, char **argv)
 
 	if (Vflag) {
 		if (certpath != NULL)
-			errx(1, "-V and -c are mutually exclusive");
+			errx(EX_USAGE, "-V and -c are mutually exclusive");
 		if (keypath != NULL)
-			errx(1, "-V and -k are mutually exclusive");
+			errx(EX_USAGE, "-V and -k are mutually exclusive");
 		if (outpath != NULL)
-			errx(1, "-V and -o are mutually exclusive");
+			errx(EX_USAGE, "-V and -o are mutually exclusive");
 	} else {
 		if (certpath == NULL)
-			errx(1, "-c option is mandatory");
+			errx(EX_USAGE, "-c option is mandatory");
 		if (keypath == NULL)
-			errx(1, "-k option is mandatory");
+			errx(EX_USAGE, "-k option is mandatory");
 		if (outpath == NULL)
-			errx(1, "-o option is mandatory");
+			errx(EX_USAGE, "-o option is mandatory");
 	}
 
 	inpath = argv[0];
@@ -402,32 +443,38 @@ main(int argc, char **argv)
 
 	error = pipe(pipefds);
 	if (error != 0)
-		err(1, "pipe");
+		err(EX_OSERR, "pipe");
+
+	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR)
+		err(EX_OSERR, "signal");
 
 	pid = fork();
 	if (pid < 0)
-		err(1, "fork");
+		err(EX_OSERR, "fork");
 
 	if (pid == 0) {
 		close(pipefds[0]);
 		exit(child(inpath, outpath, pipefds[1], Vflag, vflag));
 	}
 
+	child_pid = pid;
 	close(pipefds[1]);
 
 	if (!Vflag) {
-		certfp = checked_fopen(certpath, "r");
+		certfp = checked_fopen(certpath, "r", EX_NOINPUT);
 		cert = PEM_read_X509(certfp, NULL, NULL, NULL);
 		if (cert == NULL) {
 			ERR_print_errors_fp(stderr);
-			errx(1, "failed to load certificate from %s", certpath);
+			errx(EX_DATAERR, "failed to load certificate from %s",
+			    certpath);
 		}
 
-		keyfp = checked_fopen(keypath, "r");
+		keyfp = checked_fopen(keypath, "r", EX_NOINPUT);
 		key = PEM_read_PrivateKey(keyfp, NULL, NULL, NULL);
 		if (key == NULL) {
 			ERR_print_errors_fp(stderr);
-			errx(1, "failed to load private key from %s", keypath);
+			errx(EX_DATAERR, "failed to load private key from %s",
+			    keypath);
 		}
 
 		sign(cert, key, pipefds[0]);

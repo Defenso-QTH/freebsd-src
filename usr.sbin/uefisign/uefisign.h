@@ -37,6 +37,14 @@
 #define	DIGEST		"SHA256"
 #define	MAX_SECTIONS	128
 
+/*
+ * Exit status.  A small value is a statement about the file that was
+ * examined; a failure of uefisign itself is reported with a value from
+ * <sysexits.h>.
+ */
+#define	EXIT_SIGNATURE	1	/* wrong signature state for the operation */
+#define	EXIT_MALFORMED	2	/* not a conforming UEFI PE image */
+
 struct executable {
 	const char	*x_path;
 	FILE		*x_fp;
@@ -73,7 +81,7 @@ struct executable {
 };
 
 
-FILE	*checked_fopen(const char *path, const char *mode);
+FILE	*checked_fopen(const char *path, const char *mode, int eval);
 void	send_chunk(const void *buf, size_t len, int pipefd);
 void	receive_chunk(void **bufp, size_t *lenp, int pipefd);
 

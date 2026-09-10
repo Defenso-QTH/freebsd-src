@@ -24,7 +24,7 @@
 .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.Dd July 11, 2015
+.Dd September 10, 2026
 .Dt UEFISIGN 8
 .Os
 .Sh NAME
@@ -63,9 +63,61 @@ Name of file to write the signed binary to.
 Be verbose.
 .El
 .Sh EXIT STATUS
-The
+An exit status of 0 means that the requested operation succeeded:
+the file was signed, or, with
+.Fl V ,
+the file was found to contain a signature.
+.Pp
+A small exit status is a statement about the file that was examined.
+The utility ran correctly; the file is not in the state the requested
+operation needs:
+.Bl -tag -width indent
+.It 1
+The signature state of the file is wrong for the requested operation.
+With
+.Fl V ,
+the file is not signed.
+When signing, the file is already signed.
+.It 2
+The file is not a conforming UEFI PE image.
+This covers a missing MZ or PE signature, an unrecognised Optional Header
+magic, a subsystem that is not an EFI one, a Data Directory or section table
+that does not lie within the headers, an offset or length that falls outside
+the file, and a malformed certificate chunk.
+.El
+.Pp
+An exit status of 64 or above means that
 .Nm
-utility exits 0 on success, and >0 if an error occurs.
+itself failed and reached no conclusion about the file.
+These values are taken from
+.Xr sysexits 3 :
+.Bl -tag -width ".Dv EX_UNAVAILABLE"
+.It Dv EX_USAGE Pq 64
+The command line was wrong.
+.It Dv EX_DATAERR Pq 65
+The certificate or the private key could not be parsed.
+.It Dv EX_NOINPUT Pq 66
+The file to be examined, the certificate or the key could not be opened.
+.It Dv EX_UNAVAILABLE Pq 69
+The cryptographic library does not provide the required digest algorithm.
+.It Dv EX_SOFTWARE Pq 70
+A cryptographic library call failed.
+.It Dv EX_OSERR Pq 71
+A system call failed, or memory could not be allocated.
+.It Dv EX_CANTCREAT Pq 73
+The output file could not be created.
+.It Dv EX_IOERR Pq 74
+Reading the input, writing the output, or communicating with the child
+process failed.
+.El
+.Pp
+The file is read and parsed by a separate, capability mode process.
+If that process is terminated by a signal,
+.Nm
+exits with 128 plus the number of that signal.
+An exit status of 0 therefore never means that
+.Nm
+crashed, failed an assertion or ran into a resource limit.
 .Sh EXAMPLES
 Generate self-signed certificate and use it to sign a binary:
 .Dl /usr/share/examples/uefisign/uefikeys testcert
@@ -75,6 +127,7 @@ View signature:
 .Dl uefisign -Vv binary
 .Sh SEE ALSO
 .Xr openssl 1 ,
+.Xr sysexits 3 ,
 .Xr loader 8 ,
 .Xr uefi 8
 .Sh HISTORY
@@ -82,6 +135,11 @@ The
 .Nm
 command appeared in
 .Fx 10.2 .
+.Pp
+Before
+.Fx 16.0
+every failure was reported with an exit status of 1, and a signal that killed
+the process parsing the file was reported as an exit status of 0.
 .Sh AUTHORS
 The
 .Nm
