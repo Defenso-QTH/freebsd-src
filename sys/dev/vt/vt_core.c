@@ -2133,6 +2133,8 @@ vtterm_opened(struct terminal *tm, int opened)
 {
 	struct vt_window *vw = tm->tm_softc;
 	struct vt_device *vd = vw->vw_device;
+	keyboard_t *kbd;
+	bool reclaim = false;
 
 	VT_LOCK(vd);
 	vd->vd_flags &= ~VDF_SPLASH;
@@ -2140,9 +2142,44 @@ vtterm_opened(struct terminal *tm, int opened)
 		vw->vw_flags |= VWF_OPENED;
 	else {
 		vw->vw_flags &= ~VWF_OPENED;
-		/* TODO: finish ACQ/REL */
+		/*
+		 * The last consumer of this terminal is gone.  If it left the
+		 * window owning the display in process-switching mode -- an X
+		 * server or Wayland compositor that exited or was killed
+		 * without releasing the VT -- reclaim it: drop back to VT_AUTO
+		 * switching and restore the keyboard to K_XLATE.  Otherwise the
+		 * console can be left in the graphical owner's raw keyboard
+		 * mode, in which the kernel does not process the VT-switch keys,
+		 * leaving no way back to a text console.
+		 *
+		 * A client that released the VT cleanly has already reset both,
+		 * so this is a no-op in the normal case and only acts after an
+		 * unclean exit.
+		 */
+		if (vw->vw_smode.mode == VT_PROCESS) {
+			vw->vw_smode.mode = VT_AUTO;
+			vw->vw_proc = NULL;
+			vw->vw_pid = 0;
+		}
+		if (vw->vw_kbdmode != K_XLATE) {
+			vw->vw_kbdmode = K_XLATE;
+			reclaim = (vw == vd->vd_curwindow);
+		}
 	}
 	VT_UNLOCK(vd);
+
+	/*
+	 * Apply the restored keyboard mode to the hardware outside the device
+	 * lock, the same way vt_window_switch() does.
+	 */
+	if (reclaim) {
+		mtx_lock(&Giant);
+		if ((kbd = vd->vd_keyboard) != NULL) {
+			vt_update_kbd_mode(vw, kbd);
+			vt_update_kbd_state(vw, kbd);
+		}
+		mtx_unlock(&Giant);
+	}
 }
 
 static int
@@ -2233,6 +2270,8 @@ vt_proc_alive(struct vt_window *vw)
 			return (TRUE);
 		vw->vw_proc = NULL;
 		vw->vw_smode.mode = VT_AUTO;
+		/* Reclaim the keyboard too; see vtterm_opened(). */
+		vw->vw_kbdmode = K_XLATE;
 		DPRINTF(1, "vt controlling process %d died\n", vw->vw_pid);
 		vw->vw_pid = 0;
 	}
