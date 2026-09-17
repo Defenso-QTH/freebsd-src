@@ -1495,7 +1495,15 @@ vt_flush(struct vt_device *vd)
 	if (vw == NULL)
 		return (0);
 
-	if (vw->vw_flags & VWF_BUSY)
+	/*
+	 * Do not paint the console text buffer while an X server or Wayland
+	 * compositor owns the display (KDSETMODE KD_GRAPHICS).  Otherwise a VT
+	 * switch to such a window briefly draws its stale console text -- for
+	 * example the menu the compositor was launched from -- before the
+	 * client repaints.  The mouse-cursor renderer already bails out on
+	 * VWF_GRAPHICS for the same reason.
+	 */
+	if (vw->vw_flags & (VWF_BUSY | VWF_GRAPHICS))
 		return (0);
 
 	vf = vw->vw_font;
