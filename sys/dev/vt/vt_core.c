@@ -190,6 +190,7 @@ static int finish_vt_rel(struct vt_window *, int, int *);
 static int finish_vt_acq(struct vt_window *);
 static int vt_window_switch(struct vt_window *);
 static int vt_late_window_switch(struct vt_window *);
+static int vt_flush(struct vt_device *);
 static int vt_proc_alive(struct vt_window *);
 static void vt_resize(struct vt_device *);
 static void vt_update_static(void *);
@@ -622,6 +623,16 @@ vt_window_switch(struct vt_window *vw)
 	vd->vd_flags |= VDF_INVALID;
 	cv_broadcast(&vd->vd_winswitch);
 	VT_UNLOCK(vd);
+
+	/*
+	 * Paint the new window into the framebuffer before postswitch makes it
+	 * the live scanout, so a backend that reprograms the display (e.g.
+	 * drmfb) does not momentarily show stale contents -- such as a
+	 * graphical client's leftover console text.  Switching to a window in
+	 * graphics mode is a no-op here (vt_flush() bails on VWF_GRAPHICS) and
+	 * leaves the client to paint.
+	 */
+	vt_flush(vd);
 
 	if (vd->vd_driver->vd_postswitch)
 		vd->vd_driver->vd_postswitch(vd);
