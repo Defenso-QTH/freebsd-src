@@ -165,7 +165,7 @@ vt_fini_logos(void *dummy __unused, int pending __unused)
 
 	vd = &vt_consdev;
 	VT_LOCK(vd);
-	if ((vd->vd_flags & (VDF_DEAD | VDF_TEXTMODE)) != 0) {
+	if ((atomic_load_int(&vd->vd_flags) & (VDF_DEAD | VDF_TEXTMODE)) != 0) {
 		VT_UNLOCK(vd);
 		return;
 	}
@@ -195,7 +195,7 @@ vt_fini_logos(void *dummy __unused, int pending __unused)
 		vt_compute_drawable_area(vw);
 
 		if (vd->vd_curwindow == vw) {
-			vd->vd_flags |= VDF_INVALID;
+			atomic_set_int(&vd->vd_flags, VDF_INVALID);
 			vt_resume_flush_timer(vw, 0);
 		}
 		VT_UNLOCK(vd);
@@ -231,9 +231,9 @@ vt_init_logos(void *dummy)
 		return;
 
 	VT_LOCK(vd);
-	if ((vd->vd_flags & VDF_INITIALIZED) == 0)
+	if ((atomic_load_int(&vd->vd_flags) & VDF_INITIALIZED) == 0)
 		goto out;
-	if ((vd->vd_flags & (VDF_DEAD | VDF_TEXTMODE)) != 0)
+	if ((atomic_load_int(&vd->vd_flags) & (VDF_DEAD | VDF_TEXTMODE)) != 0)
 		goto out;
 	if (vd->vd_height <= vt_logo_sprite_height)
 		goto out;
@@ -255,7 +255,7 @@ vt_init_logos(void *dummy)
 	vt_compute_drawable_area(vw);
 
 	if (vd->vd_curwindow == vw) {
-		vd->vd_flags |= VDF_INVALID;
+		atomic_set_int(&vd->vd_flags, VDF_INVALID);
 		vt_resume_flush_timer(vw, 0);
 	}
 

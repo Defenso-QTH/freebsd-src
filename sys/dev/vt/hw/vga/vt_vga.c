@@ -363,7 +363,7 @@ static void
 vga_setpixel(struct vt_device *vd, int x, int y, term_color_t color)
 {
 
-	if (vd->vd_flags & VDF_TEXTMODE)
+	if (atomic_load_int(&vd->vd_flags) & VDF_TEXTMODE)
 		return;
 
 	vga_bitblt_put(vd, (y * VT_VGA_WIDTH / 8) + (x / 8), color,
@@ -376,7 +376,7 @@ vga_drawrect(struct vt_device *vd, int x1, int y1, int x2, int y2, int fill,
 {
 	int x, y;
 
-	if (vd->vd_flags & VDF_TEXTMODE)
+	if (atomic_load_int(&vd->vd_flags) & VDF_TEXTMODE)
 		return;
 
 	for (y = y1; y <= y2; y++) {
@@ -926,7 +926,7 @@ vga_bitblt_text(struct vt_device *vd, const struct vt_window *vw,
     const term_rect_t *area)
 {
 
-	if (!(vd->vd_flags & VDF_TEXTMODE)) {
+	if (!(atomic_load_int(&vd->vd_flags) & VDF_TEXTMODE)) {
 		vga_bitblt_text_gfxmode(vd, vw, area);
 	} else {
 		vga_bitblt_text_txtmode(vd, vw, area);
@@ -1301,7 +1301,7 @@ vga_init(struct vt_device *vd)
 		vd->vd_softc = (void *)&vga_conssoftc;
 	sc = vd->vd_softc;
 
-	if (vd->vd_flags & VDF_DOWNGRADE && vd->vd_video_dev != NULL)
+	if (atomic_load_int(&vd->vd_flags) & VDF_DOWNGRADE && vd->vd_video_dev != NULL)
 		vga_pci_repost(vd->vd_video_dev);
 
 #if defined(__amd64__) || defined(__i386__)
@@ -1323,7 +1323,7 @@ vga_init(struct vt_device *vd)
 	textmode = vm_guest != VM_GUEST_NO;
 	TUNABLE_INT_FETCH("hw.vga.textmode", &textmode);
 	if (textmode) {
-		vd->vd_flags |= VDF_TEXTMODE;
+		atomic_set_int(&vd->vd_flags, VDF_TEXTMODE);
 		vd->vd_width = 80;
 		vd->vd_height = 25;
 		bus_space_map(sc->vga_fb_tag, VGA_TXT_BASE, VGA_TXT_SIZE, 0,
@@ -1346,9 +1346,9 @@ vga_postswitch(struct vt_device *vd)
 {
 
 	/* Reinit VGA mode, to restore view after app which change mode. */
-	vga_initialize(vd, (vd->vd_flags & VDF_TEXTMODE));
+	vga_initialize(vd, (atomic_load_int(&vd->vd_flags) & VDF_TEXTMODE));
 	/* Ask vt(4) to update chars on visible area. */
-	vd->vd_flags |= VDF_INVALID;
+	atomic_set_int(&vd->vd_flags, VDF_INVALID);
 }
 
 /* Dummy NewBus functions to reserve the resources used by the vt_vga driver */

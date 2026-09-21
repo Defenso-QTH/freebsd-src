@@ -289,7 +289,7 @@ vt_update_static(void *dummy)
 		return;
 	if (main_vd->vd_driver != NULL)
 		printf("VT(%s): %s %ux%u\n", main_vd->vd_driver->vd_name,
-		    (main_vd->vd_flags & VDF_TEXTMODE) ? "text" : "resolution",
+		    (atomic_load_int(&main_vd->vd_flags) & VDF_TEXTMODE) ? "text" : "resolution",
 		    main_vd->vd_width, main_vd->vd_height);
 	else
 		printf("VT: init without driver.\n");
@@ -318,7 +318,7 @@ vt_resume_flush_timer(struct vt_window *vw, int ms)
 	if (vd->vd_curwindow != vw)
 		return;
 
-	if (!(vd->vd_flags & VDF_ASYNC) ||
+	if (!(atomic_load_int(&vd->vd_flags) & VDF_ASYNC) ||
 	    !atomic_cmpset_int(&vd->vd_timer_armed, 0, 1))
 		return;
 
@@ -335,7 +335,7 @@ vt_suspend_flush_timer(struct vt_device *vd)
 	 */
 	VT_LOCK_ASSERT(vd, MA_OWNED);
 
-	if (!(vd->vd_flags & VDF_ASYNC) ||
+	if (!(atomic_load_int(&vd->vd_flags) & VDF_ASYNC) ||
 	    !atomic_cmpset_int(&vd->vd_timer_armed, 1, 0))
 		return;
 
@@ -589,7 +589,7 @@ vt_window_switch(struct vt_window *vw)
 		}
 
 		vd->vd_curwindow = vw;
-		vd->vd_flags |= VDF_INVALID;
+		atomic_set_int(&vd->vd_flags, VDF_INVALID);
 		if (vd->vd_driver->vd_postswitch)
 			vd->vd_driver->vd_postswitch(vd);
 		inside_vt_window_switch = false;
@@ -619,7 +619,7 @@ vt_window_switch(struct vt_window *vw)
 	vt_suspend_flush_timer(vd);
 
 	vd->vd_curwindow = vw;
-	vd->vd_flags |= VDF_INVALID;
+	atomic_set_int(&vd->vd_flags, VDF_INVALID);
 	cv_broadcast(&vd->vd_winswitch);
 	VT_UNLOCK(vd);
 
@@ -751,7 +751,7 @@ vt_scroll(struct vt_window *vw, int offset, int whence)
 
 	diff = vthistory_seek(&vw->vw_buf, offset, whence);
 	if (diff)
-		vw->vw_device->vd_flags |= VDF_INVALID;
+		atomic_set_int(&vw->vw_device->vd_flags, VDF_INVALID);
 	vt_resume_flush_timer(vw, 0);
 }
 
@@ -1128,13 +1128,13 @@ vtterm_bell(struct terminal *tm)
 	struct vt_window *vw = tm->tm_softc;
 	struct vt_device *vd = vw->vw_device;
 
-	vtterm_devctl(vt_enable_bell, vd->vd_flags & VDF_QUIET_BELL,
+	vtterm_devctl(vt_enable_bell, atomic_load_int(&vd->vd_flags) & VDF_QUIET_BELL,
 	    vw->vw_bell_pitch, vw->vw_bell_duration);
 
 	if (!vt_enable_bell)
 		return;
 
-	if (vd->vd_flags & VDF_QUIET_BELL)
+	if (atomic_load_int(&vd->vd_flags) & VDF_QUIET_BELL)
 		return;
 
 	if (vw->vw_bell_pitch == 0 ||
@@ -1168,7 +1168,7 @@ vtterm_beep(struct terminal *tm, u_int param)
 	period = ((param >> 16) & 0xffff) * SBT_1MS;
 	freq = 1193182 / (param & 0xffff);
 
-	vtterm_devctl(vt_enable_bell, vd->vd_flags & VDF_QUIET_BELL,
+	vtterm_devctl(vt_enable_bell, atomic_load_int(&vd->vd_flags) & VDF_QUIET_BELL,
 	    freq, period);
 
 	if (!vt_enable_bell)
@@ -1501,11 +1501,11 @@ vt_flush(struct vt_device *vd)
 	if (vw == NULL)
 		return (0);
 
-	if (vd->vd_flags & VDF_SPLASH || vw->vw_flags & VWF_BUSY)
+	if (atomic_load_int(&vd->vd_flags) & VDF_SPLASH || vw->vw_flags & VWF_BUSY)
 		return (0);
 
 	vf = vw->vw_font;
-	if (((vd->vd_flags & VDF_TEXTMODE) == 0) && (vf == NULL))
+	if (((atomic_load_int(&vd->vd_flags) & VDF_TEXTMODE) == 0) && (vf == NULL))
 		return (0);
 
 	VT_FLUSH_LOCK(vd);
@@ -1519,7 +1519,7 @@ vt_flush(struct vt_device *vd)
 	    vd->vd_my != vd->vd_my_drawn);
 
 	/* Check if the cursor should be displayed or not. */
-	if ((vd->vd_flags & VDF_MOUSECURSOR) && /* Mouse support enabled. */
+	if ((atomic_load_int(&vd->vd_flags) & VDF_MOUSECURSOR) && /* Mouse support enabled. */
 	    !(vw->vw_flags & VWF_MOUSE_HIDE) && /* Cursor displayed.      */
 	    !kdb_active && !KERNEL_PANICKED()) {  /* DDB inactive.          */
 		vd->vd_mshown = 1;
@@ -1555,9 +1555,9 @@ vt_flush(struct vt_device *vd)
 
 	/* Force a full redraw when the screen contents might be invalid. */
 	needs_refresh = false;
-	if (vd->vd_flags & (VDF_INVALID | VDF_SUSPENDED)) {
+	if (atomic_load_int(&vd->vd_flags) & (VDF_INVALID | VDF_SUSPENDED)) {
 		needs_refresh = true;
-		vd->vd_flags &= ~VDF_INVALID;
+		atomic_clear_int(&vd->vd_flags, VDF_INVALID);
 
 		vt_termrect(vd, vf, &tarea);
 		if (vd->vd_driver->vd_invalidate_text)
@@ -1664,11 +1664,11 @@ vtterm_done(struct terminal *tm)
 		/* Switch to the debugger. */
 		if (vd->vd_curwindow != vw) {
 			vd->vd_curwindow = vw;
-			vd->vd_flags |= VDF_INVALID;
+			atomic_set_int(&vd->vd_flags, VDF_INVALID);
 			if (vd->vd_driver->vd_postswitch)
 				vd->vd_driver->vd_postswitch(vd);
 		}
-		vd->vd_flags &= ~VDF_SPLASH;
+		atomic_clear_int(&vd->vd_flags, VDF_SPLASH);
 		vt_flush(vd);
 	} else if (vt_slow_down > 0) {
 		int i, j;
@@ -1676,7 +1676,7 @@ vtterm_done(struct terminal *tm)
 			for (j = 0; j < 1000; j++)
 				vt_flush(vd);
 		}
-	} else if (!(vd->vd_flags & VDF_ASYNC)) {
+	} else if (!(atomic_load_int(&vd->vd_flags) & VDF_ASYNC)) {
 		vt_flush(vd);
 	}
 }
@@ -1692,7 +1692,7 @@ vtterm_splash(struct vt_device *vd)
 	if (KERNEL_PANICKED())
 		return;
 
-	if ((vd->vd_flags & VDF_TEXTMODE) != 0 || (boothowto & RB_MUTE) == 0)
+	if ((atomic_load_int(&vd->vd_flags) & VDF_TEXTMODE) != 0 || (boothowto & RB_MUTE) == 0)
 		return;
 
 	si = MD_FETCH(preload_kmdp, rebooting == 1 ? MODINFOMD_SHTDWNSPLASH :
@@ -1726,7 +1726,7 @@ vtterm_splash(struct vt_device *vd)
 		    (unsigned char *)image, si->si_width, si->si_height,
 		    left, top);
 	}
-	vd->vd_flags |= VDF_SPLASH;
+	atomic_set_int(&vd->vd_flags, VDF_SPLASH);
 }
 #endif
 
@@ -1875,7 +1875,7 @@ vtterm_cnprobe(struct terminal *tm, struct consdev *cp)
 	if (!vty_enabled(VTY_VT))
 		return;
 
-	if (vd->vd_flags & VDF_INITIALIZED)
+	if (atomic_load_int(&vd->vd_flags) & VDF_INITIALIZED)
 		/* Initialization already done. */
 		return;
 
@@ -1891,7 +1891,7 @@ vtterm_cnprobe(struct terminal *tm, struct consdev *cp)
 	}
 	if (vtdbest == NULL) {
 		cp->cn_pri = CN_DEAD;
-		vd->vd_flags |= VDF_DEAD;
+		atomic_set_int(&vd->vd_flags, VDF_DEAD);
 	} else {
 		vd->vd_driver = vtdbest;
 		cp->cn_pri = vd->vd_driver->vd_init(vd);
@@ -1899,7 +1899,7 @@ vtterm_cnprobe(struct terminal *tm, struct consdev *cp)
 
 	/* Check if driver's vt_init return CN_DEAD. */
 	if (cp->cn_pri == CN_DEAD) {
-		vd->vd_flags |= VDF_DEAD;
+		atomic_set_int(&vd->vd_flags, VDF_DEAD);
 	}
 
 	/* Initialize any early-boot keyboard drivers */
@@ -1912,7 +1912,7 @@ vtterm_cnprobe(struct terminal *tm, struct consdev *cp)
 	vt_init_font_static();
 
 	/* Attach default font if not in TEXTMODE. */
-	if ((vd->vd_flags & VDF_TEXTMODE) == 0) {
+	if ((atomic_load_int(&vd->vd_flags) & VDF_TEXTMODE) == 0) {
 		vw->vw_font = vtfont_ref(vt_font_assigned);
 		vt_compute_drawable_area(vw);
 	}
@@ -1937,7 +1937,7 @@ vtterm_cnprobe(struct terminal *tm, struct consdev *cp)
 		if (!vt_splash_cpu)
 			vtterm_splash(vd);
 #endif
-		vd->vd_flags |= VDF_INITIALIZED;
+		atomic_set_int(&vd->vd_flags, VDF_INITIALIZED);
 	}
 }
 
@@ -1953,11 +1953,11 @@ vtterm_cngetc(struct terminal *tm)
 		return (*vw->vw_kbdsq++);
 
 	/* Make sure the splash screen is not there. */
-	if (vd->vd_flags & VDF_SPLASH) {
+	if (atomic_load_int(&vd->vd_flags) & VDF_SPLASH) {
 		/* Remove splash */
-		vd->vd_flags &= ~VDF_SPLASH;
+		atomic_clear_int(&vd->vd_flags, VDF_SPLASH);
 		/* Mark screen as invalid to force update */
-		vd->vd_flags |= VDF_INVALID;
+		atomic_set_int(&vd->vd_flags, VDF_INVALID);
 		vt_flush(vd);
 	}
 
@@ -2135,7 +2135,7 @@ vtterm_opened(struct terminal *tm, int opened)
 	struct vt_device *vd = vw->vw_device;
 
 	VT_LOCK(vd);
-	vd->vd_flags &= ~VDF_SPLASH;
+	atomic_clear_int(&vd->vd_flags, VDF_SPLASH);
 	if (opened)
 		vw->vw_flags |= VWF_OPENED;
 	else {
@@ -2210,7 +2210,7 @@ vt_change_font(struct vt_window *vw, struct vt_font *vf)
 
 	/* Force a full redraw the next timer tick. */
 	if (vd->vd_curwindow == vw) {
-		vd->vd_flags |= VDF_INVALID;
+		atomic_set_int(&vd->vd_flags, VDF_INVALID);
 		vt_resume_flush_timer(vw, 0);
 	}
 	vw->vw_flags &= ~VWF_BUSY;
@@ -2819,7 +2819,7 @@ skip_thunk:
 		 */
 		VT_LOCK(vd);
 		if (vw == vd->vd_curwindow) {
-			vd->vd_flags |= VDF_INVALID;
+			atomic_set_int(&vd->vd_flags, VDF_INVALID);
 			vt_resume_flush_timer(vw, 0);
 		}
 		VT_UNLOCK(vd);
@@ -2830,9 +2830,9 @@ skip_thunk:
 		return (0);
 	case CONS_BELLTYPE:	/* set bell type sound */
 		if ((*(int *)data) & CONS_QUIET_BELL)
-			vd->vd_flags |= VDF_QUIET_BELL;
+			atomic_set_int(&vd->vd_flags, VDF_QUIET_BELL);
 		else
-			vd->vd_flags &= ~VDF_QUIET_BELL;
+			atomic_clear_int(&vd->vd_flags, VDF_QUIET_BELL);
 		return (0);
 	case CONS_GETINFO: {
 		vid_info_t *vi = (vid_info_t *)data;
@@ -2867,16 +2867,16 @@ skip_thunk:
 		 */
 		switch (mouse->operation) {
 		case MOUSE_HIDE:
-			if (vd->vd_flags & VDF_MOUSECURSOR) {
-				vd->vd_flags &= ~VDF_MOUSECURSOR;
+			if (atomic_load_int(&vd->vd_flags) & VDF_MOUSECURSOR) {
+				atomic_clear_int(&vd->vd_flags, VDF_MOUSECURSOR);
 #ifndef SC_NO_CUTPASTE
 				vt_mouse_state(VT_MOUSE_HIDE);
 #endif
 			}
 			return (0);
 		case MOUSE_SHOW:
-			if (!(vd->vd_flags & VDF_MOUSECURSOR)) {
-				vd->vd_flags |= VDF_MOUSECURSOR;
+			if (!(atomic_load_int(&vd->vd_flags) & VDF_MOUSECURSOR)) {
+				atomic_set_int(&vd->vd_flags, VDF_MOUSECURSOR);
 				vd->vd_mx = vd->vd_width / 2;
 				vd->vd_my = vd->vd_height / 2;
 #ifndef SC_NO_CUTPASTE
@@ -2891,7 +2891,7 @@ skip_thunk:
 	case PIO_VFONT: {
 		struct vt_font *vf;
 
-		if (vd->vd_flags & VDF_TEXTMODE)
+		if (atomic_load_int(&vd->vd_flags) & VDF_TEXTMODE)
 			return (ENOTSUP);
 
 		error = vtfont_load((void *)data, &vf);
@@ -2937,7 +2937,7 @@ skip_thunk:
 				 * the next VT switch.
 				 */
 				restore = true;
-				vd->vd_flags |= VDF_INVALID;
+				atomic_set_int(&vd->vd_flags, VDF_INVALID);
 			}
 			vw->vw_flags &= ~VWF_GRAPHICS;
 			VT_UNLOCK(vd);
@@ -3185,7 +3185,7 @@ vt_allocate_window(struct vt_device *vd, unsigned int window)
 	vw->vw_number = window;
 	vw->vw_kbdmode = K_XLATE;
 
-	if ((vd->vd_flags & VDF_TEXTMODE) == 0) {
+	if ((atomic_load_int(&vd->vd_flags) & VDF_TEXTMODE) == 0) {
 		vw->vw_font = vtfont_ref(vt_font_assigned);
 		vt_compute_drawable_area(vw);
 	}
@@ -3241,7 +3241,7 @@ vt_upgrade(struct vt_device *vd)
 		vd->vd_curwindow = vd->vd_windows[VT_CONSWINDOW];
 
 	register_handlers = 0;
-	if (!(vd->vd_flags & VDF_ASYNC)) {
+	if (!(atomic_load_int(&vd->vd_flags) & VDF_ASYNC)) {
 		/* Attach keyboard. */
 		vt_allocate_keyboard(vd);
 
@@ -3257,7 +3257,7 @@ vt_upgrade(struct vt_device *vd)
 		 * callout structure.
 		 */
 		atomic_add_acq_int(&vd->vd_timer_armed, 1);
-		vd->vd_flags |= VDF_ASYNC;
+		atomic_set_int(&vd->vd_flags, VDF_ASYNC);
 		callout_reset(&vd->vd_timer, hz / VT_TIMERFREQ, vt_timer, vd);
 		register_handlers = 1;
 	}
@@ -3286,7 +3286,7 @@ vt_resize(struct vt_device *vd)
 		vw = vd->vd_windows[i];
 		VT_LOCK(vd);
 		/* Assign default font to window, if not textmode. */
-		if (!(vd->vd_flags & VDF_TEXTMODE) && vw->vw_font == NULL)
+		if (!(atomic_load_int(&vd->vd_flags) & VDF_TEXTMODE) && vw->vw_font == NULL)
 			vw->vw_font = vtfont_ref(vt_font_assigned);
 		VT_UNLOCK(vd);
 
@@ -3305,7 +3305,7 @@ vt_replace_backend(const struct vt_driver *drv, void *softc)
 
 	vd = main_vd;
 
-	if (vd->vd_flags & VDF_ASYNC) {
+	if (atomic_load_int(&vd->vd_flags) & VDF_ASYNC) {
 		/* Stop vt_flush periodic task. */
 		VT_LOCK(vd);
 		vt_suspend_flush_timer(vd);
@@ -3322,7 +3322,7 @@ vt_replace_backend(const struct vt_driver *drv, void *softc)
 	 * set it.
 	 */
 	VT_LOCK(vd);
-	vd->vd_flags &= ~VDF_TEXTMODE;
+	atomic_clear_int(&vd->vd_flags, VDF_TEXTMODE);
 
 	if (drv != NULL) {
 		/*
@@ -3352,14 +3352,14 @@ vt_replace_backend(const struct vt_driver *drv, void *softc)
 		vd->vd_prev_driver = NULL;
 		vd->vd_prev_softc = NULL;
 
-		vd->vd_flags |= VDF_DOWNGRADE;
+		atomic_set_int(&vd->vd_flags, VDF_DOWNGRADE);
 
 		vd->vd_driver->vd_init(vd);
 
 		if (old_drv->vd_fini)
 			old_drv->vd_fini(vd, old_softc);
 
-		vd->vd_flags &= ~VDF_DOWNGRADE;
+		atomic_clear_int(&vd->vd_flags, VDF_DOWNGRADE);
 	}
 
 	VT_UNLOCK(vd);
@@ -3375,11 +3375,11 @@ vt_replace_backend(const struct vt_driver *drv, void *softc)
 		vd->vd_driver->vd_postswitch(vd);
 
 #ifdef DEV_SPLASH
-	if (vd->vd_flags & VDF_SPLASH)
+	if (atomic_load_int(&vd->vd_flags) & VDF_SPLASH)
 		vtterm_splash(vd);
 #endif
 
-	if (vd->vd_flags & VDF_ASYNC) {
+	if (atomic_load_int(&vd->vd_flags) & VDF_ASYNC) {
 		/* Allow to put chars now. */
 		terminal_mute(vd->vd_curwindow->vw_terminal, 0);
 		/* Rerun timer for screen updates. */
@@ -3399,7 +3399,7 @@ vt_suspend_handler(void *priv, enum power_stype stype)
 	struct vt_device *vd;
 
 	vd = priv;
-	vd->vd_flags |= VDF_SUSPENDED;
+	atomic_set_int(&vd->vd_flags, VDF_SUSPENDED);
 	if (vd->vd_driver != NULL && vd->vd_driver->vd_suspend != NULL)
 		vd->vd_driver->vd_suspend(vd);
 }
@@ -3412,7 +3412,7 @@ vt_resume_handler(void *priv, enum power_stype stype)
 	vd = priv;
 	if (vd->vd_driver != NULL && vd->vd_driver->vd_resume != NULL)
 		vd->vd_driver->vd_resume(vd);
-	vd->vd_flags &= ~VDF_SUSPENDED;
+	atomic_clear_int(&vd->vd_flags, VDF_SUSPENDED);
 }
 
 int
