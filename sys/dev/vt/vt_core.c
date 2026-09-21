@@ -1304,6 +1304,9 @@ vt_mark_mouse_position_as_dirty(struct vt_device *vd, int locked)
 	vw = vd->vd_curwindow;
 	vf = vw->vw_font;
 
+	if (!locked)
+		vtbuf_lock(&vw->vw_buf);
+
 	x = vd->vd_mx_drawn;
 	y = vd->vd_my_drawn;
 
@@ -1327,8 +1330,6 @@ vt_mark_mouse_position_as_dirty(struct vt_device *vd, int locked)
 		area.tr_end.tp_row = y + 2;
 	}
 
-	if (!locked)
-		vtbuf_lock(&vw->vw_buf);
 	if (vd->vd_driver->vd_invalidate_text)
 		vd->vd_driver->vd_invalidate_text(vd, &area);
 	vtbuf_dirty(&vw->vw_buf, &area);
@@ -2201,12 +2202,14 @@ vt_change_font(struct vt_window *vw, struct vt_font *vf)
 	 * it, in case the new area is smaller than the previous one.
 	 */
 	vt_compute_drawable_area(vw);
+	vtbuf_lock(&vd->vd_curwindow->vw_buf);
 	vd->vd_mx = min(vd->vd_mx,
 	    vw->vw_draw_area.tr_end.tp_col -
 	    vw->vw_draw_area.tr_begin.tp_col - 1);
 	vd->vd_my = min(vd->vd_my,
 	    vw->vw_draw_area.tr_end.tp_row -
 	    vw->vw_draw_area.tr_begin.tp_row - 1);
+	vtbuf_unlock(&vd->vd_curwindow->vw_buf);
 
 	/* Force a full redraw the next timer tick. */
 	if (vd->vd_curwindow == vw) {
@@ -2430,12 +2433,14 @@ vt_mouse_event(int type, int x, int y, int event, int cnt, int mlevel)
 		x = MIN(x, (size.tp_col * vf->vf_width) - 1);
 		y = MIN(y, (size.tp_row * vf->vf_height) - 1);
 
+		vtbuf_lock(&vw->vw_buf);
 		vd->vd_mx = x;
 		vd->vd_my = y;
 		if (vd->vd_mstate & (MOUSE_BUTTON1DOWN | VT_MOUSE_EXTENDBUTTON))
 			vtbuf_set_mark(&vw->vw_buf, VTB_MARK_MOVE,
 			    vd->vd_mx / vf->vf_width,
 			    vd->vd_my / vf->vf_height);
+		vtbuf_unlock(&vw->vw_buf);
 
 		vt_resume_flush_timer(vw, 0);
 		return; /* Done */
@@ -2877,8 +2882,10 @@ skip_thunk:
 		case MOUSE_SHOW:
 			if (!(atomic_load_int(&vd->vd_flags) & VDF_MOUSECURSOR)) {
 				atomic_set_int(&vd->vd_flags, VDF_MOUSECURSOR);
+				vtbuf_lock(&vd->vd_curwindow->vw_buf);
 				vd->vd_mx = vd->vd_width / 2;
 				vd->vd_my = vd->vd_height / 2;
+				vtbuf_unlock(&vd->vd_curwindow->vw_buf);
 #ifndef SC_NO_CUTPASTE
 				vt_mouse_state(VT_MOUSE_SHOW);
 #endif
