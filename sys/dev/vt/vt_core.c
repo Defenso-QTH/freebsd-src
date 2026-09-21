@@ -508,11 +508,11 @@ vt_proc_window_switch(struct vt_window *vw)
 	curvw = vd->vd_curwindow;
 
 	/* Check if virtual terminal is locked */
-	if (curvw->vw_flags & VWF_VTYLOCK)
+	if (atomic_load_int(&curvw->vw_flags) & VWF_VTYLOCK)
 		return (EBUSY);
 
 	/* Check if switch already in progress */
-	if (curvw->vw_flags & VWF_SWWAIT_REL) {
+	if (atomic_load_int(&curvw->vw_flags) & VWF_SWWAIT_REL) {
 		/* Check if switching to same window */
 		if (curvw->vw_switch_to == vw) {
 			DPRINTF(30, "%s: Switch in progress to same vw.", __func__);
@@ -535,7 +535,7 @@ vt_proc_window_switch(struct vt_window *vw)
 	 * actions.
 	 */
 	VT_LOCK(vd);
-	if ((vw->vw_flags & (VWF_OPENED|VWF_CONSOLE)) == 0) {
+	if ((atomic_load_int(&vw->vw_flags) & (VWF_OPENED|VWF_CONSOLE)) == 0) {
 		VT_UNLOCK(vd);
 		return (EINVAL);
 	}
@@ -583,7 +583,7 @@ vt_window_switch(struct vt_window *vw)
 		 * debugger entry/exit to be equivalent to
 		 * successfully try-locking here.
 		 */
-		if (!(vw->vw_flags & (VWF_OPENED|VWF_CONSOLE))) {
+		if (!(atomic_load_int(&vw->vw_flags) & (VWF_OPENED|VWF_CONSOLE))) {
 			inside_vt_window_switch = false;
 			return (EINVAL);
 		}
@@ -610,7 +610,7 @@ vt_window_switch(struct vt_window *vw)
 		VT_UNLOCK(vd);
 		return (0);
 	}
-	if (!(vw->vw_flags & (VWF_OPENED|VWF_CONSOLE))) {
+	if (!(atomic_load_int(&vw->vw_flags) & (VWF_OPENED|VWF_CONSOLE))) {
 		inside_vt_window_switch = false;
 		VT_UNLOCK(vd);
 		return (EINVAL);
@@ -744,7 +744,7 @@ vt_scroll(struct vt_window *vw, int offset, int whence)
 	int diff;
 	term_pos_t size;
 
-	if ((vw->vw_flags & VWF_SCROLL) == 0)
+	if ((atomic_load_int(&vw->vw_flags) & VWF_SCROLL) == 0)
 		return;
 
 	vt_termsize(vw->vw_device, vw->vw_font, &size);
@@ -843,7 +843,7 @@ vt_scrollmode_kbdevent(struct vt_window *vw, int c, int console)
 		/* Turn scrolling off. */
 		vt_scroll(vw, 0, VHS_END);
 		VTBUF_SLCK_DISABLE(&vw->vw_buf);
-		vw->vw_flags &= ~VWF_SCROLL;
+		atomic_clear_int(&vw->vw_flags, VWF_SCROLL);
 		break;
 	}
 	case FKEY | F(49): /* Home key. */
@@ -909,7 +909,7 @@ vt_processkey(keyboard_t *kbd, struct vt_device *vd, int c)
 	if (vt_machine_kbdevent(vd, c))
 		return (0);
 
-	if (vw->vw_flags & VWF_SCROLL) {
+	if (atomic_load_int(&vw->vw_flags) & VWF_SCROLL) {
 		vt_scrollmode_kbdevent(vw, c, 0/* Not a console */);
 		/* Scroll mode keys handled, nothing to do more. */
 		return (0);
@@ -942,11 +942,11 @@ vt_processkey(keyboard_t *kbd, struct vt_device *vd, int c)
 			VT_LOCK(vd);
 			if (vw->vw_kbdstate & SLKED) {
 				/* Turn scrolling on. */
-				vw->vw_flags |= VWF_SCROLL;
+				atomic_set_int(&vw->vw_flags, VWF_SCROLL);
 				VTBUF_SLCK_ENABLE(&vw->vw_buf);
 			} else {
 				/* Turn scrolling off. */
-				vw->vw_flags &= ~VWF_SCROLL;
+				atomic_clear_int(&vw->vw_flags, VWF_SCROLL);
 				VTBUF_SLCK_DISABLE(&vw->vw_buf);
 				vt_scroll(vw, 0, VHS_END);
 			}
@@ -1501,7 +1501,7 @@ vt_flush(struct vt_device *vd)
 	if (vw == NULL)
 		return (0);
 
-	if (atomic_load_int(&vd->vd_flags) & VDF_SPLASH || vw->vw_flags & VWF_BUSY)
+	if (atomic_load_int(&vd->vd_flags) & VDF_SPLASH || atomic_load_int(&vw->vw_flags) & VWF_BUSY)
 		return (0);
 
 	vf = vw->vw_font;
@@ -1520,7 +1520,7 @@ vt_flush(struct vt_device *vd)
 
 	/* Check if the cursor should be displayed or not. */
 	if ((atomic_load_int(&vd->vd_flags) & VDF_MOUSECURSOR) && /* Mouse support enabled. */
-	    !(vw->vw_flags & VWF_MOUSE_HIDE) && /* Cursor displayed.      */
+	    !(atomic_load_int(&vw->vw_flags) & VWF_MOUSE_HIDE) && /* Cursor displayed.      */
 	    !kdb_active && !KERNEL_PANICKED()) {  /* DDB inactive.          */
 		vd->vd_mshown = 1;
 	} else {
@@ -1976,7 +1976,7 @@ vtterm_cngetc(struct terminal *tm)
 	if (c & RELKEY)
 		return (-1);
 
-	if (vw->vw_flags & VWF_SCROLL) {
+	if (atomic_load_int(&vw->vw_flags) & VWF_SCROLL) {
 		vt_scrollmode_kbdevent(vw, c, 1/* Console mode */);
 		vt_flush(vd);
 		return (-1);
@@ -1989,12 +1989,12 @@ vtterm_cngetc(struct terminal *tm)
 			vt_save_kbd_state(vw, kbd);
 			if (vw->vw_kbdstate & SLKED) {
 				/* Turn scrolling on. */
-				vw->vw_flags |= VWF_SCROLL;
+				atomic_set_int(&vw->vw_flags, VWF_SCROLL);
 				VTBUF_SLCK_ENABLE(&vw->vw_buf);
 			} else {
 				/* Turn scrolling off. */
 				vt_scroll(vw, 0, VHS_END);
-				vw->vw_flags &= ~VWF_SCROLL;
+				atomic_clear_int(&vw->vw_flags, VWF_SCROLL);
 				VTBUF_SLCK_DISABLE(&vw->vw_buf);
 			}
 			break;
@@ -2137,9 +2137,9 @@ vtterm_opened(struct terminal *tm, int opened)
 	VT_LOCK(vd);
 	atomic_clear_int(&vd->vd_flags, VDF_SPLASH);
 	if (opened)
-		vw->vw_flags |= VWF_OPENED;
+		atomic_set_int(&vw->vw_flags, VWF_OPENED);
 	else {
-		vw->vw_flags &= ~VWF_OPENED;
+		atomic_clear_int(&vw->vw_flags, VWF_OPENED);
 		/* TODO: finish ACQ/REL */
 	}
 	VT_UNLOCK(vd);
@@ -2167,12 +2167,12 @@ vt_change_font(struct vt_window *vw, struct vt_font *vf)
 	 */
 
 	VT_LOCK(vd);
-	if (vw->vw_flags & VWF_BUSY) {
+	if (atomic_load_int(&vw->vw_flags) & VWF_BUSY) {
 		/* Another process is changing the font. */
 		VT_UNLOCK(vd);
 		return (EBUSY);
 	}
-	vw->vw_flags |= VWF_BUSY;
+	atomic_set_int(&vw->vw_flags, VWF_BUSY);
 	VT_UNLOCK(vd);
 
 	vt_termsize(vd, vf, &size);
@@ -2213,7 +2213,7 @@ vt_change_font(struct vt_window *vw, struct vt_font *vf)
 		atomic_set_int(&vd->vd_flags, VDF_INVALID);
 		vt_resume_flush_timer(vw, 0);
 	}
-	vw->vw_flags &= ~VWF_BUSY;
+	atomic_clear_int(&vw->vw_flags, VWF_BUSY);
 	VT_UNLOCK(vd);
 	return (0);
 }
@@ -2250,7 +2250,7 @@ signal_vt_rel(struct vt_window *vw)
 		vw->vw_pid = 0;
 		return (TRUE);
 	}
-	vw->vw_flags |= VWF_SWWAIT_REL;
+	atomic_set_int(&vw->vw_flags, VWF_SWWAIT_REL);
 	PROC_LOCK(vw->vw_proc);
 	kern_psignal(vw->vw_proc, vw->vw_smode.relsig);
 	PROC_UNLOCK(vw->vw_proc);
@@ -2271,7 +2271,7 @@ signal_vt_acq(struct vt_window *vw)
 		vw->vw_pid = 0;
 		return (TRUE);
 	}
-	vw->vw_flags |= VWF_SWWAIT_ACQ;
+	atomic_set_int(&vw->vw_flags, VWF_SWWAIT_ACQ);
 	PROC_LOCK(vw->vw_proc);
 	kern_psignal(vw->vw_proc, vw->vw_smode.acqsig);
 	PROC_UNLOCK(vw->vw_proc);
@@ -2283,8 +2283,8 @@ static int
 finish_vt_rel(struct vt_window *vw, int release, int *s)
 {
 
-	if (vw->vw_flags & VWF_SWWAIT_REL) {
-		vw->vw_flags &= ~VWF_SWWAIT_REL;
+	if (atomic_load_int(&vw->vw_flags) & VWF_SWWAIT_REL) {
+		atomic_clear_int(&vw->vw_flags, VWF_SWWAIT_REL);
 		if (release) {
 			taskqueue_drain_timeout(taskqueue_thread, &vw->vw_timeout_task_dead);
 			(void)vt_late_window_switch(vw->vw_switch_to);
@@ -2298,8 +2298,8 @@ static int
 finish_vt_acq(struct vt_window *vw)
 {
 
-	if (vw->vw_flags & VWF_SWWAIT_ACQ) {
-		vw->vw_flags &= ~VWF_SWWAIT_ACQ;
+	if (atomic_load_int(&vw->vw_flags) & VWF_SWWAIT_ACQ) {
+		atomic_clear_int(&vw->vw_flags, VWF_SWWAIT_ACQ);
 		return (0);
 	}
 	return (EINVAL);
@@ -2396,7 +2396,7 @@ vt_mouse_event(int type, int x, int y, int event, int cnt, int mlevel)
 	vw = vd->vd_curwindow;
 	vf = vw->vw_font;
 
-	if (vw->vw_flags & (VWF_MOUSE_HIDE | VWF_GRAPHICS))
+	if (atomic_load_int(&vw->vw_flags) & (VWF_MOUSE_HIDE | VWF_GRAPHICS))
 		/*
 		 * Either the mouse is disabled, or the window is in
 		 * "graphics mode". The graphics mode is usually set by
@@ -2548,10 +2548,10 @@ vt_mouse_state(int show)
 
 	switch (show) {
 	case VT_MOUSE_HIDE:
-		vw->vw_flags |= VWF_MOUSE_HIDE;
+		atomic_set_int(&vw->vw_flags, VWF_MOUSE_HIDE);
 		break;
 	case VT_MOUSE_SHOW:
-		vw->vw_flags &= ~VWF_MOUSE_HIDE;
+		atomic_clear_int(&vw->vw_flags, VWF_MOUSE_HIDE);
 		break;
 	}
 
@@ -2747,7 +2747,7 @@ skip_thunk:
 		return (error);
 	}
 	case KDGETMODE:
-		*(int *)data = (vw->vw_flags & VWF_GRAPHICS) ?
+		*(int *)data = (atomic_load_int(&vw->vw_flags) & VWF_GRAPHICS) ?
 		    KD_GRAPHICS : KD_TEXT;
 		return (0);
 	case KDGKBMODE: {
@@ -2926,7 +2926,7 @@ skip_thunk:
 		case KD_PIXEL: {
 			bool restore = false;
 			VT_LOCK(vd);
-			if ((vw->vw_flags & VWF_GRAPHICS) &&
+			if ((atomic_load_int(&vw->vw_flags) & VWF_GRAPHICS) &&
 			    vw == vd->vd_curwindow) {
 				/*
 				 * When leaving graphics mode on the currently
@@ -2939,7 +2939,7 @@ skip_thunk:
 				restore = true;
 				atomic_set_int(&vd->vd_flags, VDF_INVALID);
 			}
-			vw->vw_flags &= ~VWF_GRAPHICS;
+			atomic_clear_int(&vw->vw_flags, VWF_GRAPHICS);
 			VT_UNLOCK(vd);
 			if (restore) {
 				if (vd->vd_driver->vd_postswitch)
@@ -2949,7 +2949,7 @@ skip_thunk:
 			break;
 		}
 		case KD_GRAPHICS:
-			vw->vw_flags |= VWF_GRAPHICS;
+			atomic_set_int(&vw->vw_flags, VWF_GRAPHICS);
 			break;
 		}
 		return (0);
@@ -3036,9 +3036,9 @@ skip_thunk:
 	case VT_LOCKSWITCH:
 		/* TODO: Check current state, switching can be in progress. */
 		if ((*(int *)data) == 0x01)
-			vw->vw_flags |= VWF_VTYLOCK;
+			atomic_set_int(&vw->vw_flags, VWF_VTYLOCK);
 		else if ((*(int *)data) == 0x02)
-			vw->vw_flags &= ~VWF_VTYLOCK;
+			atomic_clear_int(&vw->vw_flags, VWF_VTYLOCK);
 		else
 			return (EINVAL);
 		return (0);
@@ -3048,7 +3048,7 @@ skip_thunk:
 			vw = vd->vd_windows[i];
 			if (vw == NULL)
 				continue;
-			if (!(vw->vw_flags & VWF_OPENED)) {
+			if (!(atomic_load_int(&vw->vw_flags) & VWF_OPENED)) {
 				*(int *)data = vw->vw_number + 1;
 				VT_UNLOCK(vd);
 				return (0);
@@ -3150,7 +3150,7 @@ skip_thunk:
 			break;
 		case VT_TRUE:	/* user has released screen, go on */
 			/* finish_vt_rel(..., TRUE, ...) should not be locked */
-			if (vw->vw_flags & VWF_SWWAIT_REL) {
+			if (atomic_load_int(&vw->vw_flags) & VWF_SWWAIT_REL) {
 				if ((error = finish_vt_rel(vw, TRUE, &s)) == 0)
 					DPRINTF(5, "%s%d: VT_RELDISP: VT_TRUE\n",
 					    SC_DRIVER_NAME, VT_UNIT(vw));
@@ -3221,11 +3221,11 @@ vt_upgrade(struct vt_device *vd)
 			/* New window. */
 			vw = vt_allocate_window(vd, i);
 		}
-		if (!(vw->vw_flags & VWF_READY)) {
+		if (!(atomic_load_int(&vw->vw_flags) & VWF_READY)) {
 			TIMEOUT_TASK_INIT(taskqueue_thread, &vw->vw_timeout_task_dead, 0, &vt_switch_timer, vw);
 			terminal_maketty(vw->vw_terminal, "v%r", VT_UNIT(vw));
-			vw->vw_flags |= VWF_READY;
-			if (vw->vw_flags & VWF_CONSOLE) {
+			atomic_set_int(&vw->vw_flags, VWF_READY);
+			if (atomic_load_int(&vw->vw_flags) & VWF_CONSOLE) {
 				/* For existing console window. */
 				EVENTHANDLER_REGISTER(shutdown_pre_sync,
 				    vt_window_switch, vw, SHUTDOWN_PRI_DEFAULT);
