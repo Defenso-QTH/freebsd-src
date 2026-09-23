@@ -1501,7 +1501,7 @@ vt_flush(struct vt_device *vd)
 	if (vw == NULL)
 		return (0);
 
-	if (vd->vd_flags & VDF_SPLASH || vw->vw_flags & VWF_BUSY)
+	if (vw->vw_flags & VWF_BUSY)
 		return (0);
 
 	vf = vw->vw_font;
@@ -1509,8 +1509,19 @@ vt_flush(struct vt_device *vd)
 		return (0);
 
 	VT_FLUSH_LOCK(vd);
-
 	vtbuf_lock(&vw->vw_buf);
+
+	/*
+	 * Re-check VDF_SPLASH now that both locks are held.  vtterm_splash()
+	 * holds whichever VT_FLUSH_LOCK() selects for this backend across its
+	 * blit, so one of them serialises us against it.
+	 */
+	if (vd->vd_flags & VDF_SPLASH) {
+		vtbuf_unlock(&vw->vw_buf);
+		VT_FLUSH_UNLOCK(vd);
+		return (0);
+	}
+
 	inside_vt_flush = true;
 
 #ifndef SC_NO_CUTPASTE
@@ -1697,17 +1708,24 @@ vtterm_splash(struct vt_device *vd)
 
 	si = MD_FETCH(preload_kmdp, rebooting == 1 ? MODINFOMD_SHTDWNSPLASH :
 	    MODINFOMD_SPLASH, struct splash_info *);
+	/* Bail before taking the lock if the backend lacks a needed op. */
 	if (si == NULL) {
 		if (vd->vd_driver->vd_bitblt_bmp == NULL)
 			return;
-	} else if (vd->vd_driver->vd_bitblt_argb == NULL)
+	} else if (vd->vd_driver->vd_bitblt_argb == NULL || si->si_depth != 4)
+		return;
+	if (rebooting == 1 && vd->vd_driver->vd_blank == NULL)
 		return;
 
-	if (rebooting == 1) {
-		if (vd->vd_driver->vd_blank == NULL)
-			return;
+	/* VT_FLUSH_LOCK() locks vd_flush_lock only for deferred backends. */
+	if (vd->vd_driver->vd_bitblt_after_vtbuf_unlock)
+		mtx_lock(&vd->vd_flush_lock);
+	else
+		vtbuf_lock(&vd->vd_curwindow->vw_buf);
+	vd->vd_flags |= VDF_SPLASH;
+
+	if (rebooting == 1)
 		vd->vd_driver->vd_blank(vd, TC_BLACK);
-	}
 
 	if (si == NULL) {
 		top = (vd->vd_height - vt_logo_height) / 2;
@@ -1716,8 +1734,6 @@ vtterm_splash(struct vt_device *vd)
 		    vd->vd_curwindow, vt_logo_image, NULL, vt_logo_width,
 		    vt_logo_height, left, top, TC_WHITE, TC_BLACK);
 	} else {
-		if (si->si_depth != 4)
-			return;
 		image = (uintptr_t)si + sizeof(struct splash_info);
 		image = roundup2(image, 8);
 		top = (vd->vd_height - si->si_height) / 2;
@@ -1726,7 +1742,10 @@ vtterm_splash(struct vt_device *vd)
 		    (unsigned char *)image, si->si_width, si->si_height,
 		    left, top);
 	}
-	vd->vd_flags |= VDF_SPLASH;
+	if (vd->vd_driver->vd_bitblt_after_vtbuf_unlock)
+		mtx_unlock(&vd->vd_flush_lock);
+	else
+		vtbuf_unlock(&vd->vd_curwindow->vw_buf);
 }
 #endif
 
