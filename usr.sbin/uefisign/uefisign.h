@@ -37,6 +37,14 @@
 #define	DIGEST		"SHA256"
 #define	MAX_SECTIONS	128
 
+/*
+ * Exit status (see uefisign(8)):
+ *   0  success (file signed, or -V: file contains a signature)
+ *   1  program or library failure (the err(3)/errx(3) default)
+ *   2  no signature (-V: file contains no signature)
+ *   3  invalid file format
+ */
+
 struct executable {
 	const char	*x_path;
 	FILE		*x_fp;

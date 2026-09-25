@@ -64,7 +64,7 @@ load(struct executable *x)
 
 	len = sb.st_size;
 	if (len <= 0)
-		errx(1, "%s: file is empty", x->x_path);
+		errx(3, "%s: file is empty", x->x_path);
 
 	buf = malloc(len);
 	if (buf == NULL)
@@ -164,7 +164,7 @@ digest(struct executable *x)
 	 * I believe this can happen with overlapping sections.
 	 */
 	if (sum_of_bytes_hashed > x->x_len)
-		errx(1, "number of bytes hashed is larger than file size");
+		errx(3, "number of bytes hashed is larger than file size");
 
 	/*
 	 * I can't really explain this one; just do what the spec says.
@@ -245,7 +245,7 @@ child(const char *inpath, const char *outpath, int pipefd,
 	parse(x);
 	if (Vflag) {
 		if (signature_size(x) == 0)
-			errx(1, "file not signed");
+			errx(2, "file not signed");
 
 		printf("file contains signature\n");
 		if (vflag) {
