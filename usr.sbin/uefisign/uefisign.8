@@ -65,7 +65,24 @@ Be verbose.
 .Sh EXIT STATUS
 The
 .Nm
-utility exits 0 on success, and >0 if an error occurs.
+utility exits with one of the following values:
+.Bl -tag -width indent
+.It 0
+Valid signature:
+the file was signed, or, with
+.Fl V ,
+the file contains a signature.
+.It 1
+Program or library failure.
+.It 2
+Invalid signature:
+with
+.Fl V ,
+the file does not contain a signature.
+.It 3
+Invalid file format:
+the input is not a conforming PE image.
+.El
 .Sh EXAMPLES
 Generate self-signed certificate and use it to sign a binary:
 .Dl /usr/share/examples/uefisign/uefikeys testcert

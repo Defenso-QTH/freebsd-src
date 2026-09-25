@@ -144,19 +144,19 @@ range_check(const struct executable *x, off_t off, size_t len,
 {
 
 	if (off < 0) {
-		errx(1, "%s starts at negative offset %jd",
+		errx(3, "%s starts at negative offset %jd",
 		    name, (intmax_t)off);
 	}
 	if (off >= (off_t)x->x_len) {
-		errx(1, "%s starts at %jd, past the end of executable at %zd",
+		errx(3, "%s starts at %jd, past the end of executable at %zd",
 		    name, (intmax_t)off, x->x_len);
 	}
 	if (len >= x->x_len) {
-		errx(1, "%s size %zd is larger than the executable size %zd",
+		errx(3, "%s size %zd is larger than the executable size %zd",
 		    name, len, x->x_len);
 	}
 	if (off + len > x->x_len) {
-		errx(1, "%s extends to %jd, past the end of executable at %zd",
+		errx(3, "%s extends to %jd, past the end of executable at %zd",
 		    name, (intmax_t)(off + len), x->x_len);
 	}
 }
@@ -206,11 +206,11 @@ show_certificate(const struct executable *x)
 
 	pc = (struct pe_certificate *)(x->x_buf + pde->pde_rva);
 	if (pc->pc_revision != PE_CERTIFICATE_REVISION) {
-		errx(1, "wrong certificate chunk revision, is %d, should be %d",
+		errx(3, "wrong certificate chunk revision, is %d, should be %d",
 		    pc->pc_revision, PE_CERTIFICATE_REVISION);
 	}
 	if (pc->pc_type != PE_CERTIFICATE_TYPE) {
-		errx(1, "wrong certificate chunk type, is %d, should be %d",
+		errx(3, "wrong certificate chunk type, is %d, should be %d",
 		    pc->pc_type, PE_CERTIFICATE_TYPE);
 	}
 	printf("to dump PKCS7:\n    "
@@ -231,12 +231,12 @@ parse_section_table(struct executable *x, off_t off, int number_of_sections)
 	    "section table");
 
 	if (x->x_headers_len < off + sizeof(*psh) * number_of_sections)
-		errx(1, "section table outside of headers");
+		errx(3, "section table outside of headers");
 
 	psh = (const struct pe_section_header *)(x->x_buf + off);
 
 	if (number_of_sections >= MAX_SECTIONS) {
-		errx(1, "too many sections: got %d, should be %d",
+		errx(3, "too many sections: got %d, should be %d",
 		    number_of_sections, MAX_SECTIONS);
 	}
 	x->x_nsections = number_of_sections;
@@ -244,7 +244,7 @@ parse_section_table(struct executable *x, off_t off, int number_of_sections)
 	for (i = 0; i < number_of_sections; i++) {
 		if (psh->psh_size_of_raw_data > 0 &&
 		    psh->psh_pointer_to_raw_data < x->x_headers_len)
-			errx(1, "section points inside the headers");
+			errx(3, "section points inside the headers");
 
 		range_check(x, psh->psh_pointer_to_raw_data,
 		    psh->psh_size_of_raw_data, "section");
@@ -268,14 +268,14 @@ parse_directory(struct executable *x, off_t off,
 	//printf("Data Directory at offset %zd\n", off);
 
 	if (number_of_rva_and_sizes <= PE_DIRECTORY_ENTRY_CERTIFICATE) {
-		errx(1, "wrong NumberOfRvaAndSizes %d; should be at least %d",
+		errx(3, "wrong NumberOfRvaAndSizes %d; should be at least %d",
 		    number_of_rva_and_sizes, PE_DIRECTORY_ENTRY_CERTIFICATE);
 	}
 
 	range_check(x, off, sizeof(*pde) * number_of_rva_and_sizes,
 	    "PE Data Directory");
 	if (x->x_headers_len <= off + sizeof(*pde) * number_of_rva_and_sizes)
-		errx(1, "PE Data Directory outside of headers");
+		errx(3, "PE Data Directory outside of headers");
 
 	x->x_certificate_entry_off =
 	    off + sizeof(*pde) * PE_DIRECTORY_ENTRY_CERTIFICATE;
@@ -362,7 +362,7 @@ parse_optional_32_plus(struct executable *x, off_t off,
 	case PE_OPTIONAL_SUBSYSTEM_EFI_RUNTIME:
 		break;
 	default:
-		errx(1, "wrong PE Optional Header subsystem 0x%x",
+		errx(3, "wrong PE Optional Header subsystem 0x%x",
 		    po->po_subsystem);
 	}
 
@@ -386,7 +386,7 @@ parse_optional_32_plus(struct executable *x, off_t off,
 #endif
 
 	if (x->x_len < x->x_headers_len)
-		errx(1, "invalid SizeOfHeaders %d", po->po_size_of_headers);
+		errx(3, "invalid SizeOfHeaders %d", po->po_size_of_headers);
 	x->x_headers_len = po->po_size_of_headers;
 	//printf("Size of Headers: %d\n", po->po_size_of_headers);
 
@@ -411,7 +411,7 @@ parse_optional_32(struct executable *x, off_t off, int number_of_sections)
 	case PE_OPTIONAL_SUBSYSTEM_EFI_RUNTIME:
 		break;
 	default:
-		errx(1, "wrong PE Optional Header subsystem 0x%x",
+		errx(3, "wrong PE Optional Header subsystem 0x%x",
 		    po->po_subsystem);
 	}
 
@@ -435,7 +435,7 @@ parse_optional_32(struct executable *x, off_t off, int number_of_sections)
 #endif
 
 	if (x->x_len < x->x_headers_len)
-		errx(1, "invalid SizeOfHeaders %d", po->po_size_of_headers);
+		errx(3, "invalid SizeOfHeaders %d", po->po_size_of_headers);
 	x->x_headers_len = po->po_size_of_headers;
 	//printf("Size of Headers: %d\n", po->po_size_of_headers);
 
@@ -460,7 +460,7 @@ parse_optional(struct executable *x, off_t off, int number_of_sections)
 	case PE_OPTIONAL_MAGIC_32_PLUS:
 		return (parse_optional_32_plus(x, off, number_of_sections));
 	default:
-		errx(1, "wrong PE Optional Header magic 0x%x", po->po_magic);
+		errx(3, "wrong PE Optional Header magic 0x%x", po->po_magic);
 	}
 }
 
@@ -475,7 +475,7 @@ parse_pe(struct executable *x, off_t off)
 
 	pe = (struct pe_header *)(x->x_buf + off);
 	if (pe->pe_signature != PE_SIGNATURE)
-		errx(1, "wrong PE signature 0x%x", pe->pe_signature);
+		errx(3, "wrong PE signature 0x%x", pe->pe_signature);
 
 	//printf("Number of sections: %d\n", pe->pe_coff.coff_number_of_sections);
 
@@ -492,7 +492,7 @@ parse(struct executable *x)
 
 	mz = (struct mz_header *)x->x_buf;
 	if (mz->mz_signature[0] != 'M' || mz->mz_signature[1] != 'Z')
-		errx(1, "MZ header not found");
+		errx(3, "MZ header not found");
 
 	return (parse_pe(x, mz->mz_lfanew));
 }

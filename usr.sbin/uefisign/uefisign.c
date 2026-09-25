@@ -327,6 +327,10 @@ wait_for_child(pid_t pid)
 	if (pid == -1)
 		err(1, "waitpid");
 
+	/* A child killed by a signal is a failure, not a valid signature. */
+	if (!WIFEXITED(status))
+		return (1);
+
 	return (WEXITSTATUS(status));
 }
 
