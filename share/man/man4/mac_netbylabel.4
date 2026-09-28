@@ -1,0 +1,128 @@
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026 Quentin Thebault
+.\"
+.\" Redistribution and use in source and binary forms, with or without
+.\" modification, are permitted provided that the following conditions
+.\" are met:
+.\" 1. Redistributions of source code must retain the above copyright
+.\"    notice, this list of conditions and the following disclaimer.
+.\" 2. Redistributions in binary form must reproduce the above copyright
+.\"    notice, this list of conditions and the following disclaimer in the
+.\"    documentation and/or other materials provided with the distribution.
+.\"
+.\" THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+.\" IMPLIED WARRANTIES ARE DISCLAIMED.
+.\"
+.Dd September 29, 2026
+.Dt MAC_NETBYLABEL 4
+.Os
+.Sh NAME
+.Nm mac_netbylabel
+.Nd "network access control by veriexec label"
+.Sh SYNOPSIS
+To load the policy at boot time, place the following lines in
+.Xr loader.conf 5 :
+.Bd -ragged -offset indent
+.Dl mac_veriexec_load="YES"
+.Dl mac_netbylabel_load="YES"
+.Ed
+.Sh DESCRIPTION
+The
+.Nm
+policy restricts a process's use of the
+.Tn IP
+network based on the
+.Xr mac_veriexec 4
+label of the executable the process is running.
+It is a companion to
+.Xr mac_veriexec 4 ,
+which establishes a verified binary's identity and label;
+.Nm
+acts on that label to allow or deny the binary's network access.
+.Pp
+A verified binary's veriexec label may carry
+.Dq Li net/
+tokens:
+.Bl -tag -width ".Li net/allow" -offset indent
+.It Li net/allow
+The binary is permitted to use the IP network.
+.It Li net/deny
+The binary is denied the IP network.
+.El
+.Pp
+Labels are assigned in the veriexec manifest, for example:
+.Bd -literal -offset indent
+usr/sbin/ntpd    sha256=... label=net/allow
+.Ed
+.Pp
+The policy is evaluated at
+.Xr connect 2
+and
+.Xr bind 2
+for
+.Dv AF_INET
+and
+.Dv AF_INET6
+sockets only.
+The decision is a property of the binary a process is currently
+running (its text vnode) and is re-evaluated at each
+.Xr execve 2 ;
+there is no process-tree inheritance.
+Inbound connections are unaffected, as
+.Xr accept 2
+is not mediated.
+.Pp
+The policy is controlled through the
+.Xr sysctl 8
+interface:
+.Bl -tag -width ".Va security.mac.netbylabel.block_loopback"
+.It Va security.mac.netbylabel.enabled
+Master switch.
+When 0 (the default) the policy performs no checks.
+.It Va security.mac.netbylabel.default_deny
+When 0 (the default) the policy is a deny-list: only binaries labeled
+.Li net/deny
+are blocked.
+When 1 it is an allow-list: every binary is blocked unless it is labeled
+.Li net/allow .
+.It Va security.mac.netbylabel.block_loopback
+When 0 (the default) connections and binds to loopback addresses
+.Pq Li 127.0.0.0/8 , Li ::1
+are exempt, so the policy affects off-host traffic only.
+When 1 the policy applies to loopback as well.
+.El
+.Pp
+All three may be set as tunables in
+.Xr loader.conf 5 .
+Leaving loopback exempt allows name resolution through a local
+resolver and local socket services to keep working for otherwise
+network-denied binaries.
+.Pp
+A process that is denied the network by
+.Nm
+receives
+.Er EACCES
+from
+.Xr connect 2
+or
+.Xr bind 2 .
+A binary that has no veriexec label, or is not known to veriexec, is
+treated as carrying no
+.Li net/
+token.
+.Sh SEE ALSO
+.Xr connect 2 ,
+.Xr execve 2 ,
+.Xr mac 4 ,
+.Xr mac_veriexec 4 ,
+.Xr loader.conf 5 ,
+.Xr sysctl 8 ,
+.Xr veriexec 8
+.Sh HISTORY
+The
+.Nm
+policy first appeared in
+.Fx 15.2 .
+.Sh AUTHORS
+.An Quentin Thebault
