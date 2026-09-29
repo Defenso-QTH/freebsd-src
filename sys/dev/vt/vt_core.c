@@ -1522,18 +1522,19 @@ vt_flush(struct vt_device *vd)
 		return (0);
 
 	VT_FLUSH_LOCK(vd);
+	vtbuf_lock(&vw->vw_buf);
 
 	/*
-	 * Re-check VDF_SPLASH inside VT_FLUSH_LOCK so that vtterm_splash(),
-	 * which holds this lock across its framebuffer writes, fully excludes
+	 * Re-check VDF_SPLASH under the vtbuf lock so that vtterm_splash(),
+	 * which holds the same lock while it sets the flag, fully excludes
 	 * concurrent character rendering.
 	 */
 	if (vd->vd_flags & VDF_SPLASH) {
+		vtbuf_unlock(&vw->vw_buf);
 		VT_FLUSH_UNLOCK(vd);
 		return (0);
 	}
 
-	vtbuf_lock(&vw->vw_buf);
 	inside_vt_flush = true;
 
 #ifndef SC_NO_CUTPASTE
@@ -1733,15 +1734,14 @@ vtterm_splash(struct vt_device *vd)
 		return;
 
 	/*
-	 * All capability checks passed.  Hold VT_FLUSH_LOCK across the flag
-	 * set and the entire blit so that any vt_flush() that is already past
-	 * the early VDF_SPLASH test must wait for us to finish before it can
-	 * acquire the lock; it will then re-check VDF_SPLASH inside the lock
-	 * and return without touching the framebuffer.  VT_FLUSH_LOCK is
-	 * MTX_DEF, so holding it across a slow blit is legal.
+	 * All capability checks passed.  Set VDF_SPLASH under the vtbuf lock
+	 * so that any vt_flush() racing us either observes the flag under the
+	 * same lock and bails, or is serialised behind us.  The blit itself
+	 * runs unlocked.
 	 */
-	VT_FLUSH_LOCK(vd);
+	vtbuf_lock(&vd->vd_curwindow->vw_buf);
 	vd->vd_flags |= VDF_SPLASH;
+	vtbuf_unlock(&vd->vd_curwindow->vw_buf);
 
 	if (rebooting == 1)
 		vd->vd_driver->vd_blank(vd, TC_BLACK);
@@ -1761,7 +1761,6 @@ vtterm_splash(struct vt_device *vd)
 		    (unsigned char *)image, si->si_width, si->si_height,
 		    left, top);
 	}
-	VT_FLUSH_UNLOCK(vd);
 }
 #endif
 
