@@ -71,7 +71,10 @@ jobs:
             build-essential autoconf automake libtool m4 pkg-config \
             libssl-dev libbsd-dev liblzma-dev libarchive-dev \
             libcurl4-openssl-dev zlib1g-dev libbz2-dev
-          git clone --depth 1 https://github.com/freebsd/pkg /tmp/pkg
+          # Pin to a release tag, not master: pkg master added an EM_LOONGARCH
+          # reference in pkg_elf.c that the Ubuntu runner's older <elf.h> does
+          # not define, breaking this host build.  Release tags don't carry it.
+          git clone --depth 1 --branch 2.8.4 https://github.com/freebsd/pkg /tmp/pkg
           cd /tmp/pkg
           ./configure --prefix=/usr/local
           make -j"$NPROC"
