@@ -26,7 +26,7 @@
 .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.Dd August 23, 2026
+.Dd October 5, 2026
 .Dt BHYVE 8
 .Os
 .Sh NAME
@@ -982,6 +982,9 @@ to guest by VirtIO Input Interface.
 .Sm off
 .It
 .Op Cm rfb= Ar address
+.Op Cm ,mode= Ar mode
+.Op Cm ,uid= Ar user
+.Op Cm ,gid= Ar group
 .Op Cm ,w= Ar width
 .Op Cm ,h= Ar height
 .Op Cm ,vga= Ar vgaconf
@@ -1015,6 +1018,25 @@ There are three possible formats:
 The default is to listen on localhost IPv4 address and default VNC port 5900.
 An IPv6 address must be enclosed in square brackets and may contain an
 optional zone identifier.
+.It Cm mode= Ns Ar mode , Cm uid= Ns Ar user No and Cm gid= Ns Ar group
+Access rights configuration for the UNIX socket.
+.Ar mode
+may be either absolute or symbolic, as in
+.Xr chmod 1 .
+.Ar user
+and
+.Ar group
+may be either numeric IDs or names, as in
+.Xr chown 1 .
+The mode defaults to
+.Li 0600 .
+If
+.Ar user
+or
+.Ar group
+is not specified, the socket retains the ownership of the
+.Nm
+process.
 .It Cm w= Ns Ar width No and Cm h= Ns Ar height
 A display resolution, width and height, respectively.
 If not specified, a default resolution of 1024x768 pixels will be used.

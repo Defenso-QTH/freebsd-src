@@ -41,6 +41,8 @@
 #include <string.h>
 
 #include <errno.h>
+#include <grp.h>
+#include <pwd.h>
 #include <unistd.h>
 
 #include "bhyvegc.h"
@@ -101,6 +103,9 @@ struct pci_fbuf_softc {
 	char      *rfb_password;
 	int       rfb_port;
 	int       rfb_wait;
+	mode_t    rfb_mode;
+	uid_t     rfb_uid;
+	gid_t     rfb_gid;
 	int       vga_enabled;
 	int	  vga_full;
 
@@ -246,6 +251,10 @@ pci_fbuf_parse_config(struct pci_fbuf_softc *sc, nvlist_t *nvl)
 {
 	const char *value;
 	char *cp;
+	void *setp;
+	struct passwd *pw;
+	struct group *gr;
+	unsigned long val;
 
 	sc->rfb_wait = get_config_bool_node_default(nvl, "wait", false);
 
@@ -313,6 +322,57 @@ pci_fbuf_parse_config(struct pci_fbuf_softc *sc, nvlist_t *nvl)
 				}
 				sc->rfb_port = atoi(cp);
 			}
+		}
+	}
+
+	if (sc->rfb_family == AF_UNIX) {
+		value = get_config_value_node(nvl, "mode");
+		if (value == NULL)
+			value = "0600";
+		setp = setmode(value);
+		if (setp == NULL) {
+			EPRINTLN("rfb: invalid mode \"%s\"", value);
+			return (-1);
+		}
+		sc->rfb_mode = getmode(setp, 0);
+		free(setp);
+
+		value = get_config_value_node(nvl, "uid");
+		if (value != NULL) {
+			pw = getpwnam(value);
+			if (pw != NULL) {
+				sc->rfb_uid = pw->pw_uid;
+			} else {
+				errno = 0;
+				val = strtoul(value, &cp, 10);
+				if (errno || *cp != '\0' || val > UID_MAX) {
+					EPRINTLN("rfb: invalid uid \"%s\"",
+					    value);
+					return (-1);
+				}
+				sc->rfb_uid = val;
+			}
+		} else {
+			sc->rfb_uid = geteuid();
+		}
+
+		value = get_config_value_node(nvl, "gid");
+		if (value != NULL) {
+			gr = getgrnam(value);
+			if (gr != NULL) {
+				sc->rfb_gid = gr->gr_gid;
+			} else {
+				errno = 0;
+				val = strtoul(value, &cp, 10);
+				if (errno || *cp != '\0' || val > GID_MAX) {
+					EPRINTLN("rfb: invalid gid \"%s\"",
+					    value);
+					return (-1);
+				}
+				sc->rfb_gid = val;
+			}
+		} else {
+			sc->rfb_gid = getegid();
 		}
 	}
 
@@ -450,7 +510,8 @@ pci_fbuf_init(struct pci_devinst *pi, nvlist_t *nvl)
 	memset((void *)sc->fb_base, 0, FB_SIZE);
 
 	error = rfb_init(sc->rfb_family, sc->rfb_host, sc->rfb_port,
-	    sc->rfb_wait, sc->rfb_password);
+	    sc->rfb_wait, sc->rfb_password, sc->rfb_mode, sc->rfb_uid,
+	    sc->rfb_gid);
 done:
 	if (error)
 		free(sc);
