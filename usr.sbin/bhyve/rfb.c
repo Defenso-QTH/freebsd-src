@@ -34,6 +34,7 @@
 #include <sys/endian.h>
 #include <sys/socket.h>
 #include <sys/select.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/un.h>
 #include <arpa/inet.h>
@@ -1339,7 +1340,7 @@ sse42_supported(void)
 
 int
 rfb_init(sa_family_t family, const char *hostname, int port, int wait,
-    const char *password)
+    const char *password, mode_t mode, uid_t uid, gid_t gid)
 {
 	int e;
 	char servname[6];
@@ -1419,6 +1420,16 @@ rfb_init(sa_family_t family, const char *hostname, int port, int wait,
 
 	if (family == AF_UNIX) {
 		unlink(hostname);
+		e = fchown(rc->sfd, uid, gid);
+		if (e != 0) {
+			perror("fchown");
+			goto error;
+		}
+		e = fchmod(rc->sfd, mode);
+		if (e != 0) {
+			perror("fchmod");
+			goto error;
+		}
 		e = bind(rc->sfd, (struct sockaddr *)&sun, SUN_LEN(&sun));
 	} else
 		e = bind(rc->sfd, ai->ai_addr, ai->ai_addrlen);
