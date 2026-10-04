@@ -1028,6 +1028,15 @@ and
 .Ar group
 may be either numeric IDs or names, as in
 .Xr chown 1 .
+The mode defaults to
+.Li 0600 .
+If
+.Ar user
+or
+.Ar group
+is not specified, the socket retains the ownership of the
+.Nm
+process.
 .It Cm w= Ns Ar width No and Cm h= Ns Ar height
 A display resolution, width and height, respectively.
 If not specified, a default resolution of 1024x768 pixels will be used.

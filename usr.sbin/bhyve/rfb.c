@@ -1350,6 +1350,7 @@ rfb_init(sa_family_t family, const char *hostname, int port, int wait,
 	struct sockaddr_un sun;
 	int on = 1;
 	int cnt;
+	mode_t mask;
 #ifndef WITHOUT_CAPSICUM
 	cap_rights_t rights;
 #endif
@@ -1420,22 +1421,37 @@ rfb_init(sa_family_t family, const char *hostname, int port, int wait,
 
 	if (family == AF_UNIX) {
 		unlink(hostname);
-		e = fchown(rc->sfd, uid, gid);
-		if (e != 0) {
-			perror("fchown");
-			goto error;
-		}
 		e = fchmod(rc->sfd, mode);
 		if (e != 0) {
 			perror("fchmod");
 			goto error;
 		}
+		/*
+		 * The process umask is applied to the socket mode at bind
+		 * time; clear it across bind() so the requested mode is used.
+		 */
+		mask = umask(0);
 		e = bind(rc->sfd, (struct sockaddr *)&sun, SUN_LEN(&sun));
+		(void)umask(mask);
 	} else
 		e = bind(rc->sfd, ai->ai_addr, ai->ai_addrlen);
 	if (e < 0) {
 		perror("bind");
 		goto error;
+	}
+
+	/*
+	 * fchown(2) on a socket descriptor is not supported; set the owner on
+	 * the bound path instead.  The uid/gid default to the process's own
+	 * euid/egid, so by default this is a no-op (the socket is already
+	 * owned by the process after bind()).
+	 */
+	if (family == AF_UNIX) {
+		e = chown(hostname, uid, gid);
+		if (e != 0) {
+			perror("chown");
+			goto error;
+		}
 	}
 
 	if (listen(rc->sfd, 1) < 0) {

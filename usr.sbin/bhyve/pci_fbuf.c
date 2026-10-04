@@ -251,7 +251,7 @@ pci_fbuf_parse_config(struct pci_fbuf_softc *sc, nvlist_t *nvl)
 {
 	const char *value;
 	char *cp;
-	mode_t	*modep;
+	void	*setp;
 	struct passwd *pw;
 	struct group *gr;
 	unsigned long val;
@@ -327,60 +327,52 @@ pci_fbuf_parse_config(struct pci_fbuf_softc *sc, nvlist_t *nvl)
 
 	if (sc->rfb_family == AF_UNIX) {
 		value = get_config_value_node(nvl, "mode");
-		if (value != NULL) {
-			modep = setmode(value);
-			if (modep == NULL) {
-				EPRINTLN("rfb: invalid mode \"%s\"", value);
-				return (-1);
-			}
-		} else {
-			modep = setmode("0600");
-			if (modep == NULL) {
-				EPRINTLN("rfb: setmode() failed");
-				return (-1);
-			}
+		if (value == NULL)
+			value = "0600";
+		setp = setmode(value);
+		if (setp == NULL) {
+			EPRINTLN("rfb: invalid mode \"%s\"", value);
+			return (-1);
 		}
-		sc->rfb_mode = *modep;
-		free(modep);
+		sc->rfb_mode = getmode(setp, 0);
+		free(setp);
 
 		value = get_config_value_node(nvl, "uid");
 		if (value != NULL) {
-                        pw = getpwnam(value);
-                        if (pw != NULL) {
-                                sc->rfb_uid = pw->pw_uid;
+			pw = getpwnam(value);
+			if (pw != NULL) {
+				sc->rfb_uid = pw->pw_uid;
 			} else {
-                                errno = 0;
-                                val = strtoul(value, &cp, 10);
-                                if (errno || *cp != '\0' || val > UID_MAX) {
-                                        EPRINTLN("rfb: invalid uid \"%s\"",
+				errno = 0;
+				val = strtoul(value, &cp, 10);
+				if (errno || *cp != '\0' || val > UID_MAX) {
+					EPRINTLN("rfb: invalid uid \"%s\"",
 					    value);
-                                        return (-1);
-                                } else {
-                                        sc->rfb_uid = val;
-                                }
-                        }
+					return (-1);
+				}
+				sc->rfb_uid = val;
+			}
 		} else {
-                        sc->rfb_uid = geteuid();
+			sc->rfb_uid = geteuid();
 		}
 
 		value = get_config_value_node(nvl, "gid");
 		if (value != NULL) {
-                        gr = getgrnam(value);
-                        if (gr != NULL) {
-                                sc->rfb_gid = gr->gr_gid;
+			gr = getgrnam(value);
+			if (gr != NULL) {
+				sc->rfb_gid = gr->gr_gid;
 			} else {
-                                errno = 0;
-                                val = strtoul(value, &cp, 10);
-                                if (errno || *cp != '\0' || val > GID_MAX) {
-                                        EPRINTLN("rfb: invalid gid \"%s\"",
+				errno = 0;
+				val = strtoul(value, &cp, 10);
+				if (errno || *cp != '\0' || val > GID_MAX) {
+					EPRINTLN("rfb: invalid gid \"%s\"",
 					    value);
-                                        return (-1);
-                                } else {
-                                        sc->rfb_gid = val;
-                                }
-                        }
+					return (-1);
+				}
+				sc->rfb_gid = val;
+			}
 		} else {
-                        sc->rfb_gid = getegid();
+			sc->rfb_gid = getegid();
 		}
 	}
 
