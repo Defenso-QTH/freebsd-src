@@ -33,20 +33,84 @@
 #include <machine/specialreg.h>
 
 #include <errno.h>
+#include <pthread.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <vmmapi.h>
 
+#include "config.h"
 #include "debug.h"
 #include "xmsr.h"
 
+/*
+ * Hyper-V guest crash MSRs, advertised by vmm(4) when x86.hyperv is set.  A
+ * crashing guest stores a code and four parameters in P0-P4 (for Windows,
+ * the bugcheck code and its parameters) and then sets CRASH_NOTIFY in
+ * CRASH_CTL.
+ */
+#define	MSR_HV_CRASH_P0		0x40000100
+#define	MSR_HV_CRASH_P4		0x40000104
+#define	MSR_HV_CRASH_CTL	0x40000105
+#define	HV_CRASH_CTL_NOTIFY	(1UL << 63)
+#define	HV_CRASH_NPARAMS	(MSR_HV_CRASH_P4 - MSR_HV_CRASH_P0 + 1)
+
 static int cpu_vendor_intel, cpu_vendor_amd, cpu_vendor_hygon;
 
-int
-emulate_wrmsr(struct vcpu *vcpu __unused, uint32_t num, uint64_t val __unused)
+static bool hyperv;
+static uint64_t hv_crash_param[HV_CRASH_NPARAMS];
+static pthread_mutex_t hv_crash_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+static bool
+hv_crash_msr(uint32_t num)
 {
+	return (hyperv && num >= MSR_HV_CRASH_P0 && num <= MSR_HV_CRASH_CTL);
+}
+
+static void
+hv_crash_wrmsr(struct vcpu *vcpu, uint32_t num, uint64_t val)
+{
+	uint64_t p[HV_CRASH_NPARAMS];
+
+	pthread_mutex_lock(&hv_crash_mtx);
+	if (num != MSR_HV_CRASH_CTL) {
+		hv_crash_param[num - MSR_HV_CRASH_P0] = val;
+		pthread_mutex_unlock(&hv_crash_mtx);
+		return;
+	}
+	memcpy(p, hv_crash_param, sizeof(p));
+	pthread_mutex_unlock(&hv_crash_mtx);
+
+	if ((val & HV_CRASH_CTL_NOTIFY) != 0)
+		EPRINTLN("vcpu %d: guest reported a crash: "
+		    "%#lx (%#lx, %#lx, %#lx, %#lx)",
+		    vcpu_id(vcpu), p[0], p[1], p[2], p[3], p[4]);
+}
+
+static uint64_t
+hv_crash_rdmsr(uint32_t num)
+{
+	uint64_t val;
+
+	if (num == MSR_HV_CRASH_CTL)
+		return (HV_CRASH_CTL_NOTIFY);
+
+	pthread_mutex_lock(&hv_crash_mtx);
+	val = hv_crash_param[num - MSR_HV_CRASH_P0];
+	pthread_mutex_unlock(&hv_crash_mtx);
+	return (val);
+}
+
+int
+emulate_wrmsr(struct vcpu *vcpu, uint32_t num, uint64_t val)
+{
+
+	if (hv_crash_msr(num)) {
+		hv_crash_wrmsr(vcpu, num, val);
+		return (0);
+	}
 
 	if (cpu_vendor_intel) {
 		switch (num) {
@@ -102,6 +166,11 @@ int
 emulate_rdmsr(struct vcpu *vcpu __unused, uint32_t num, uint64_t *val)
 {
 	int error = 0;
+
+	if (hv_crash_msr(num)) {
+		*val = hv_crash_rdmsr(num);
+		return (0);
+	}
 
 	if (cpu_vendor_intel) {
 		switch (num) {
@@ -229,6 +298,8 @@ init_msr(void)
 	int error;
 	u_int regs[4];
 	char cpu_vendor[13];
+
+	hyperv = get_config_bool_default("x86.hyperv", false);
 
 	do_cpuid(0, regs);
 	((u_int *)&cpu_vendor)[0] = regs[1];
