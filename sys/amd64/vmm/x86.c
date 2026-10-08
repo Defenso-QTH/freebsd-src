@@ -53,7 +53,25 @@ static SYSCTL_NODE(_hw_vmm, OID_AUTO, topology, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
 #define CPUID_VM_SIGNATURE	0x40000000
 #define	CPUID_VM_HIGH		CPUID_BHYVE_FEATURES
 
+/*
+ * Leaves of the Microsoft Hypervisor Top Level Functional Specification,
+ * shown instead of bhyve's own at the base of the hypervisor range when
+ * VM_CAP_HYPERV is set.  bhyve's leaves then move up one block, as Xen and
+ * KVM do with theirs, so guests that scan the range can still find them.
+ */
+#define	CPUID_HV_SIGNATURE	0x40000000
+#define	CPUID_HV_INTERFACE	0x40000001
+#define	CPUID_HV_IDENTITY	0x40000002
+#define	CPUID_HV_FEATURES	0x40000003
+#define	CPUID_HV_RECOMMENDS	0x40000004
+#define	CPUID_HV_LIMITS		0x40000005
+#define	CPUID_HV_HIGH		CPUID_HV_LIMITS
+#define	CPUID_HV_BHYVE_OFFSET	0x100
+
+#define	CPUID_HV_IFACE_HV1	0x31237648	/* "Hv#1" */
+
 static const char bhyve_id[12] = "bhyve bhyve ";
+static const char hyperv_id[12] = "Microsoft Hv";
 
 static uint64_t bhyve_xcpuids;
 SYSCTL_ULONG(_hw_vmm, OID_AUTO, bhyve_xcpuids, CTLFLAG_RW, &bhyve_xcpuids, 0,
@@ -73,6 +91,45 @@ log2(u_int x)
 	return (x == 0 ? -1 : order_base_2(x));
 }
 
+static void
+hyperv_cpuid(struct vcpu *vcpu, unsigned int func, unsigned int regs[4])
+{
+	uint16_t cores, maxcpus, sockets, threads;
+
+	if (func > CPUID_HV_HIGH)
+		func = CPUID_HV_HIGH;
+
+	regs[0] = regs[1] = regs[2] = regs[3] = 0;
+	switch (func) {
+	case CPUID_HV_SIGNATURE:
+		regs[0] = CPUID_HV_HIGH;
+		bcopy(hyperv_id, &regs[1], 4);
+		bcopy(hyperv_id + 4, &regs[2], 4);
+		bcopy(hyperv_id + 8, &regs[3], 4);
+		break;
+	case CPUID_HV_INTERFACE:
+		regs[0] = CPUID_HV_IFACE_HV1;
+		break;
+	case CPUID_HV_IDENTITY:
+		/* Hypervisor version 10.0, build 14393. */
+		regs[0] = 14393;
+		regs[1] = 10 << 16;
+		break;
+	case CPUID_HV_FEATURES:
+		/* No privileges and no features yet. */
+		break;
+	case CPUID_HV_RECOMMENDS:
+		/* Never notify the hypervisor about long spinlock waits. */
+		regs[1] = 0xffffffff;
+		break;
+	case CPUID_HV_LIMITS:
+		vm_get_topology(vcpu_vm(vcpu), &sockets, &cores, &threads,
+		    &maxcpus);
+		regs[0] = maxcpus;
+		break;
+	}
+}
+
 int
 x86_emulate_cpuid(struct vcpu *vcpu, uint64_t *rax, uint64_t *rbx,
     uint64_t *rcx, uint64_t *rdx)
@@ -81,8 +138,8 @@ x86_emulate_cpuid(struct vcpu *vcpu, uint64_t *rax, uint64_t *rbx,
 	int vcpu_id = vcpu_vcpuid(vcpu);
 	const struct xsave_limits *limits;
 	uint64_t cr4;
-	int error, enable_invpcid, enable_rdpid, enable_rdtscp, level,
-	    width, x2apic_id;
+	int error, enable_hyperv, enable_invpcid, enable_rdpid, enable_rdtscp,
+	    level, width, x2apic_id;
 	unsigned int func, regs[4], logical_cpus, param;
 	enum x2apic_state x2apic_state;
 	uint16_t cores, maxcpus, sockets, threads;
@@ -96,6 +153,9 @@ x86_emulate_cpuid(struct vcpu *vcpu, uint64_t *rax, uint64_t *rbx,
 
 	VCPU_CTR2(vm, vcpu_id, "cpuid %#x,%#x", func, param);
 
+	if (vm_get_capability(vcpu, VM_CAP_HYPERV, &enable_hyperv) != 0)
+		enable_hyperv = 0;
+
 	/*
 	 * Requests for invalid CPUID levels should map to the highest
 	 * available level instead.
@@ -104,6 +164,13 @@ x86_emulate_cpuid(struct vcpu *vcpu, uint64_t *rax, uint64_t *rbx,
 		if (func > cpu_exthigh)
 			func = cpu_exthigh;
 	} else if (func >= CPUID_VM_SIGNATURE) {
+		if (enable_hyperv) {
+			if (func < CPUID_VM_SIGNATURE + CPUID_HV_BHYVE_OFFSET) {
+				hyperv_cpuid(vcpu, func, regs);
+				goto done;
+			}
+			func -= CPUID_HV_BHYVE_OFFSET;
+		}
 		if (func > CPUID_VM_HIGH)
 			func = CPUID_VM_HIGH;
 	} else if (func > cpu_high) {
@@ -606,6 +673,8 @@ x86_emulate_cpuid(struct vcpu *vcpu, uint64_t *rax, uint64_t *rbx,
 
 		case CPUID_VM_SIGNATURE:
 			regs[0] = CPUID_VM_HIGH;
+			if (enable_hyperv)
+				regs[0] += CPUID_HV_BHYVE_OFFSET;
 			bcopy(bhyve_id, &regs[1], 4);
 			bcopy(bhyve_id + 4, &regs[2], 4);
 			bcopy(bhyve_id + 8, &regs[3], 4);
@@ -630,6 +699,7 @@ default_leaf:
 			break;
 	}
 
+done:
 	/*
 	 * CPUID clears the upper 32-bits of the long-mode registers.
 	 */

@@ -138,7 +138,8 @@ enum x2apic_state {
 	struct vm_exit	exitinfo;	/* (x) exit reason and collateral */ \
 	cpuset_t	exitinfo_cpuset; /* (x) storage for vmexit handlers */ \
 	uint64_t	nextrip;	/* (x) next instruction to execute */ \
-	uint64_t	tsc_offset	/* (o) TSC offsetting */
+	uint64_t	tsc_offset;	/* (o) TSC offsetting */	\
+	bool		hyperv		/* (i) Hyper-V CPUID leaves */
 
 #define	VMM_VM_MD_FIELDS						\
 	cpuset_t	startup_cpus;	/* (i) [r] waiting for startup */ \
@@ -384,6 +385,7 @@ enum vm_cap_type {
 	VM_CAP_IPI_EXIT,
 	VM_CAP_MASK_HWINTR,
 	VM_CAP_RFLAGS_TF,
+	VM_CAP_HYPERV,
 	VM_CAP_MAX
 };
 
