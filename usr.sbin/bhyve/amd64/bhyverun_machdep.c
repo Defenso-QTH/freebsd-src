@@ -307,6 +307,14 @@ bhyve_init_vcpu(struct vcpu *vcpu)
 
 	err = vm_set_capability(vcpu, VM_CAP_IPI_EXIT, 1);
 	assert(err == 0);
+
+	if (get_config_bool_default("x86.hyperv", false)) {
+		err = vm_set_capability(vcpu, VM_CAP_HYPERV, 1);
+		if (err != 0) {
+			EPRINTLN("Hyper-V identity not supported by vmm");
+			exit(4);
+		}
+	}
 }
 
 void

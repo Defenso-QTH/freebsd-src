@@ -250,6 +250,7 @@ vcpu_init(struct vcpu *vcpu)
 	vcpu->extint_pending = 0;
 	vcpu->exception_pending = 0;
 	vcpu->guest_xcr0 = XFEATURE_ENABLED_X87;
+	vcpu->hyperv = false;
 	fpu_save_area_reset(vcpu->guestfpu);
 	vmm_stat_init(vcpu->stats);
 }
@@ -1590,6 +1591,12 @@ vm_get_capability(struct vcpu *vcpu, int type, int *retval)
 	if (type < 0 || type >= VM_CAP_MAX)
 		return (EINVAL);
 
+	/* The Hyper-V leaves do not depend on the hardware backend. */
+	if (type == VM_CAP_HYPERV) {
+		*retval = vcpu->hyperv;
+		return (0);
+	}
+
 	return (vmmops_getcap(vcpu->cookie, type, retval));
 }
 
@@ -1598,6 +1605,11 @@ vm_set_capability(struct vcpu *vcpu, int type, int val)
 {
 	if (type < 0 || type >= VM_CAP_MAX)
 		return (EINVAL);
+
+	if (type == VM_CAP_HYPERV) {
+		vcpu->hyperv = val != 0;
+		return (0);
+	}
 
 	return (vmmops_setcap(vcpu->cookie, type, val));
 }
