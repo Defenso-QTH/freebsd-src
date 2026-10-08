@@ -69,6 +69,7 @@ static SYSCTL_NODE(_hw_vmm, OID_AUTO, topology, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
 #define	CPUID_HV_BHYVE_OFFSET	0x100
 
 #define	CPUID_HV_IFACE_HV1	0x31237648	/* "Hv#1" */
+#define	CPUID_HV_EDX_CRASH_MSRS	0x00000400	/* guest crash MSRs */
 
 static const char bhyve_id[12] = "bhyve bhyve ";
 static const char hyperv_id[12] = "Microsoft Hv";
@@ -116,7 +117,8 @@ hyperv_cpuid(struct vcpu *vcpu, unsigned int func, unsigned int regs[4])
 		regs[1] = 10 << 16;
 		break;
 	case CPUID_HV_FEATURES:
-		/* No privileges and no features yet. */
+		/* No privileges.  bhyve(8) emulates the crash MSRs. */
+		regs[3] = CPUID_HV_EDX_CRASH_MSRS;
 		break;
 	case CPUID_HV_RECOMMENDS:
 		/* Never notify the hypervisor about long spinlock waits. */

@@ -233,6 +233,9 @@ This value is used for the guest's System Management BIOS System Information str
 Identify the hypervisor to the guest as Microsoft Hyper-V.
 This is intended for Windows guests.
 The CPUID leaves that identify bhyve itself move up by 0x100.
+The guest crash MSRs are emulated: when the guest reports a crash
+through them, such as a Windows stop error, the crash code and its four
+parameters are printed.
 .It Va x86.mptable Ta bool Ta true Ta
 Generate an MPTable.
 .It Va x86.x2apic Ta bool Ta false Ta
