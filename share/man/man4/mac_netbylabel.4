@@ -95,6 +95,10 @@ When 1 the policy applies to loopback as well.
 .Pp
 All three may be set as tunables in
 .Xr loader.conf 5 .
+They become read-only once the system security level has been raised
+above 0, see
+.Xr security 7 ;
+the policy can then only be changed by rebooting.
 Leaving loopback exempt allows name resolution through a local
 resolver and local socket services to keep working for otherwise
 network-denied binaries.
@@ -117,6 +121,7 @@ token.
 .Xr mac 4 ,
 .Xr mac_veriexec 4 ,
 .Xr loader.conf 5 ,
+.Xr security 7 ,
 .Xr sysctl 8 ,
 .Xr veriexec 8
 .Sh HISTORY
