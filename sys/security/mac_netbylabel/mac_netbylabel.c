@@ -76,37 +76,19 @@ SYSCTL_NODE(_security_mac, OID_AUTO, netbylabel,
  * that root cannot switch the policy off on a running system.  Tunables are
  * applied at load time, before rc(8) raises the securelevel.
  */
-static int
-sysctl_netbylabel_setting(SYSCTL_HANDLER_ARGS)
-{
-	int error, val;
-
-	val = *(int *)arg1;
-	error = sysctl_handle_int(oidp, &val, 0, req);
-	if (error != 0 || req->newptr == NULL)
-		return (error);
-	error = securelevel_gt(req->td->td_ucred, 0);
-	if (error != 0)
-		return (error);
-	*(int *)arg1 = val;
-	return (0);
-}
-
 static int mac_netbylabel_enabled = 0;
-SYSCTL_PROC(_security_mac_netbylabel, OID_AUTO, enabled,
-    CTLTYPE_INT | CTLFLAG_RWTUN | CTLFLAG_MPSAFE, &mac_netbylabel_enabled, 0,
-    sysctl_netbylabel_setting, "I", "Enforce the netbylabel policy");
+SYSCTL_INT(_security_mac_netbylabel, OID_AUTO, enabled,
+    CTLFLAG_RWTUN | CTLFLAG_SECURE, &mac_netbylabel_enabled, 0,
+    "Enforce the netbylabel policy");
 
 static int mac_netbylabel_default_deny = 0;
-SYSCTL_PROC(_security_mac_netbylabel, OID_AUTO, default_deny,
-    CTLTYPE_INT | CTLFLAG_RWTUN | CTLFLAG_MPSAFE,
-    &mac_netbylabel_default_deny, 0, sysctl_netbylabel_setting, "I",
+SYSCTL_INT(_security_mac_netbylabel, OID_AUTO, default_deny,
+    CTLFLAG_RWTUN | CTLFLAG_SECURE, &mac_netbylabel_default_deny, 0,
     "Deny IP network unless the binary is labeled net/allow");
 
 static int mac_netbylabel_block_loopback = 0;
-SYSCTL_PROC(_security_mac_netbylabel, OID_AUTO, block_loopback,
-    CTLTYPE_INT | CTLFLAG_RWTUN | CTLFLAG_MPSAFE,
-    &mac_netbylabel_block_loopback, 0, sysctl_netbylabel_setting, "I",
+SYSCTL_INT(_security_mac_netbylabel, OID_AUTO, block_loopback,
+    CTLFLAG_RWTUN | CTLFLAG_SECURE, &mac_netbylabel_block_loopback, 0,
     "Apply the policy to loopback addresses too");
 
 /*
