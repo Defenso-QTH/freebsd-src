@@ -55,6 +55,8 @@ SUBDIR=	\
 	ath_hal_ar9300 \
 	ath_main \
 	ath_rate \
+	${_ath11k} \
+	${_athk_common} \
 	${_autofs} \
 	axgbe \
 	backlight \
@@ -224,6 +226,7 @@ SUBDIR=	\
 	linuxkpi_hdmi \
 	linuxkpi_video \
 	linuxkpi_wlan \
+	${_linuxkpi_mhi} \
 	${_lio} \
 	lpt \
 	${_mac_biba} \
@@ -553,6 +556,11 @@ SUBDIR+=	linux_common
     ${MACHINE_CPUARCH} == "i386" || ${MACHINE_CPUARCH} == "riscv"
 _iwlwifi=	iwlwifi
 _rtw88=		rtw88
+.if ${MACHINE_CPUARCH} == "amd64"
+_ath11k=	ath11k
+_athk_common=	athk_common
+_linuxkpi_mhi=	linuxkpi_mhi
+.endif
 # rtw89 currently cannot be compiled without ACPI (seems also broken in Linux).
 .if ${KERN_OPTS:MDEV_ACPI}
 _rtw89=		rtw89
