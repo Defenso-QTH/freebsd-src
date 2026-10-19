@@ -548,6 +548,24 @@ static int ath11k_pci_config_msi_data(struct ath11k_pci *ab_pci)
 	}
 
 	ab_pci->ab->pci.msi.ep_base_data = msi_desc->msg.data;
+#if defined(__FreeBSD__)
+	/*
+	 * FreeBSD only programs the MSI address when the first interrupt
+	 * handler is set up, so the address read in ath11k_pci_alloc_msi()
+	 * is not valid yet.  Read it again now that it has been written.
+	 */
+	pci_read_config_dword(ab_pci->pdev,
+			      ab_pci->pdev->msi_cap + PCI_MSI_ADDRESS_LO,
+			      &ab_pci->ab->pci.msi.addr_lo);
+	if (msi_desc->pci.msi_attrib.is_64)
+		pci_read_config_dword(ab_pci->pdev,
+				      ab_pci->pdev->msi_cap + PCI_MSI_ADDRESS_HI,
+				      &ab_pci->ab->pci.msi.addr_hi);
+	else
+		ab_pci->ab->pci.msi.addr_hi = 0;
+	ath11k_dbg(ab_pci->ab, ATH11K_DBG_PCI, "after request_irq msi_addr 0x%08x%08x\n",
+		   ab_pci->ab->pci.msi.addr_hi, ab_pci->ab->pci.msi.addr_lo);
+#endif
 
 	ath11k_dbg(ab_pci->ab, ATH11K_DBG_PCI, "after request_irq msi_ep_base_data %d\n",
 		   ab_pci->ab->pci.msi.ep_base_data);
@@ -1367,6 +1385,7 @@ MODULE_LICENSE("Dual BSD/GPL");
 MODULE_VERSION(ath11k_pci, 1);
 MODULE_DEPEND(ath11k_pci, linuxkpi, 1, 1, 1);
 MODULE_DEPEND(ath11k_pci, linuxkpi_wlan, 1, 1, 1);
+MODULE_DEPEND(ath11k_pci, linuxkpi_mhi, 1, 1, 1);
 MODULE_DEPEND(ath11k_pci, athk_common, 1, 1, 1);
 #ifdef CONFIG_ATH11K_DEBUGFS
 MODULE_DEPEND(ath11k_pci, debugfs, 1, 1, 1);
