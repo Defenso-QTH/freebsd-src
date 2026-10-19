@@ -616,6 +616,14 @@ device_wakeup_enable(struct device *dev)
 	return (0);
 }
 
+static inline int
+device_init_wakeup(struct device *dev, bool enable)
+{
+
+	device_set_wakeup_enable(dev, enable);
+	return (0);
+}
+
 static inline bool
 device_iommu_mapped(struct device *dev __unused)
 {

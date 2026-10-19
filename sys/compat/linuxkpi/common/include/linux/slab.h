@@ -271,6 +271,15 @@ kvmalloc_array(size_t n, size_t size, gfp_t flags)
 	return (kvmalloc(size * n, flags));
 }
 
+static inline void *
+vcalloc(size_t n, size_t size)
+{
+	if (WOULD_OVERFLOW(n, size))
+		return (NULL);
+
+	return (vzalloc(size * n));
+}
+
 void * lkpi_kvrealloc(const void *ptr, size_t oldsize, size_t newsize, gfp_t flags);
 
 #if defined(LINUXKPI_VERSION) && LINUXKPI_VERSION < 61200
