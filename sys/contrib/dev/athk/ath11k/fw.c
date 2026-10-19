@@ -14,9 +14,15 @@ static int ath11k_fw_request_firmware_api_n(struct ath11k_base *ab,
 {
 	size_t magic_len, len, ie_len;
 	int ie_id, i, index, bit, ret;
+#if defined(__linux__)
 	struct ath11k_fw_ie *hdr;
 	const u8 *data;
 	__le32 *timestamp;
+#elif defined(__FreeBSD__)
+	const struct ath11k_fw_ie *hdr;
+	const u8 *data;
+	const __le32 *timestamp;
+#endif
 
 	ab->fw.fw = ath11k_core_firmware_request(ab, name);
 	if (IS_ERR(ab->fw.fw)) {
@@ -60,7 +66,11 @@ static int ath11k_fw_request_firmware_api_n(struct ath11k_base *ab,
 
 	/* loop elements */
 	while (len > sizeof(struct ath11k_fw_ie)) {
+#if defined(__linux__)
 		hdr = (struct ath11k_fw_ie *)data;
+#elif defined(__FreeBSD__)
+		hdr = (const struct ath11k_fw_ie *)data;
+#endif
 
 		ie_id = le32_to_cpu(hdr->id);
 		ie_len = le32_to_cpu(hdr->len);
@@ -80,7 +90,11 @@ static int ath11k_fw_request_firmware_api_n(struct ath11k_base *ab,
 			if (ie_len != sizeof(u32))
 				break;
 
+#if defined(__linux__)
 			timestamp = (__le32 *)data;
+#elif defined(__FreeBSD__)
+			timestamp = (const __le32 *)data;
+#endif
 
 			ath11k_dbg(ab, ATH11K_DBG_BOOT, "found fw timestamp %d\n",
 				   le32_to_cpup(timestamp));

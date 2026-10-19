@@ -2476,7 +2476,11 @@ int ath11k_wmi_send_scan_start_cmd(struct ath11k *ar,
 	tlv->header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_ARRAY_UINT32) |
 		      FIELD_PREP(WMI_TLV_LEN, len);
 	ptr += TLV_HDR_SIZE;
+#if defined(__linux__)
 	tmp_ptr = ptr;
+#elif defined(__FreeBSD__)
+	tmp_ptr = (void *)ptr;
+#endif
 
 	for (i = 0; i < params->num_chan; ++i)
 		tmp_ptr[i] = params->chan_list[i];
@@ -4548,7 +4552,11 @@ static int ath11k_init_cmd_send(struct ath11k_pdev_wmi *wmi,
 	ptr += TLV_HDR_SIZE + len;
 
 	if (param->hw_mode_id != WMI_HOST_HW_MODE_MAX) {
+#if defined(__linux__)
 		hw_mode = ptr;
+#elif defined(__FreeBSD__)
+		hw_mode = (void *)ptr;
+#endif
 		hw_mode->tlv_header = FIELD_PREP(WMI_TLV_TAG,
 						 WMI_TAG_PDEV_SET_HW_MODE_CMD) |
 				      FIELD_PREP(WMI_TLV_LEN,
@@ -4572,7 +4580,11 @@ static int ath11k_init_cmd_send(struct ath11k_pdev_wmi *wmi,
 		len = sizeof(*band_to_mac);
 
 		for (idx = 0; idx < param->num_band_to_mac; idx++) {
+#if defined(__linux__)
 			band_to_mac = ptr;
+#elif defined(__FreeBSD__)
+			band_to_mac = (void *)ptr;
+#endif
 
 			band_to_mac->tlv_header = FIELD_PREP(WMI_TLV_TAG,
 							     WMI_TAG_PDEV_BAND_TO_MAC) |

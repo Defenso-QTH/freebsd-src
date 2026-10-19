@@ -215,9 +215,15 @@ static void ath11k_pci_restore_window(struct ath11k_base *ab)
 
 	spin_lock_bh(&ab_pci->window_lock);
 
+#if defined(__linux__)
 	iowrite32(ATH11K_PCI_WINDOW_ENABLE_BIT | ab_pci->register_window,
 		  ab->mem + ATH11K_PCI_WINDOW_REG_ADDRESS);
 	ioread32(ab->mem + ATH11K_PCI_WINDOW_REG_ADDRESS);
+#elif defined(__FreeBSD__)
+	iowrite32(ATH11K_PCI_WINDOW_ENABLE_BIT | ab_pci->register_window,
+		  (char *)ab->mem + ATH11K_PCI_WINDOW_REG_ADDRESS);
+	ioread32((char *)ab->mem + ATH11K_PCI_WINDOW_REG_ADDRESS);
+#endif
 
 	spin_unlock_bh(&ab_pci->window_lock);
 }
@@ -984,7 +990,9 @@ static int ath11k_pci_probe(struct pci_dev *pdev,
 	struct ath11k_base *ab;
 	struct ath11k_pci *ab_pci;
 	u32 soc_hw_version_major, soc_hw_version_minor;
+#if defined(__linux__)
 	const struct ath11k_pci_ops *pci_ops;
+#endif
 	int ret;
 	u32 sub_version;
 
