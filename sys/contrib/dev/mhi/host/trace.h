@@ -3,6 +3,20 @@
  * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
+#if defined(__FreeBSD__)
+#ifndef _TRACE_EVENT_MHI_HOST_H
+#define _TRACE_EVENT_MHI_HOST_H
+/* No tracepoints on FreeBSD. */
+#define	trace_mhi_gen_tre(...)			do { } while (0)
+#define	trace_mhi_intvec_states(...)		do { } while (0)
+#define	trace_mhi_tryset_pm_state(...)		do { } while (0)
+#define	trace_mhi_ctrl_event(...)		do { } while (0)
+#define	trace_mhi_data_event(...)		do { } while (0)
+#define	trace_mhi_channel_command_start(...)	do { } while (0)
+#define	trace_mhi_channel_command_end(...)	do { } while (0)
+#define	trace_mhi_pm_st_transition(...)		do { } while (0)
+#endif
+#else
 #undef TRACE_SYSTEM
 #define TRACE_SYSTEM mhi_host
 
@@ -281,3 +295,4 @@ TRACE_EVENT(mhi_pm_st_transition,
 #define TRACE_INCLUDE_FILE trace
 
 #include <trace/define_trace.h>
+#endif	/* __FreeBSD__ */

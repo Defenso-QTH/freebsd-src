@@ -1349,6 +1349,7 @@ EXPORT_SYMBOL_GPL(mhi_device_put);
 
 void mhi_uevent_notify(struct mhi_controller *mhi_cntrl, enum mhi_ee_type ee)
 {
+#if defined(__linux__)
 	struct device *dev = &mhi_cntrl->mhi_dev->dev;
 	char *buf[2];
 	int ret;
@@ -1364,4 +1365,7 @@ void mhi_uevent_notify(struct mhi_controller *mhi_cntrl, enum mhi_ee_type ee)
 		dev_err(dev, "Failed to send %s uevent\n", TO_MHI_EXEC_STR(ee));
 
 	kfree(buf[0]);
+#elif defined(__FreeBSD__)
+	dev_dbg(&mhi_cntrl->mhi_dev->dev, "EXEC_ENV=%s\n", TO_MHI_EXEC_STR(ee));
+#endif
 }
