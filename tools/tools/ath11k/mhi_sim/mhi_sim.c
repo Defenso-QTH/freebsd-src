@@ -188,6 +188,8 @@ static struct mhisim *sim;
 static struct sx sim_sx;
 SX_SYSINIT(mhisim, &sim_sx, "mhisim run");
 static char sim_result[1024] = "not run";
+/* Fault to inject: 1 BHI error, 2 no event ring interrupts. */
+static int sim_inject;
 
 #define	SIMLOG(fmt, ...) do {						\
 	printf("mhisim: " fmt "\n", ##__VA_ARGS__);			\
@@ -316,6 +318,8 @@ sim_post_event(int er, uint64_t ptr, uint32_t dw0, uint32_t dw1)
 		SIMERR("event ring %d has msivec %u", er, msivec);
 		return;
 	}
+	if (sim_inject == 2)
+		return;
 	mhi_fbsd_test_irq_raise(MHI_FBSD_TEST_IRQ_BASE + msivec);
 }
 
@@ -367,6 +371,11 @@ sim_bhi_task(void *arg __unused, int pending __unused)
 		}
 		if (bad)
 			SIMERR("BHI: image differs at byte %zu", i);
+	}
+	if (sim_inject == 1) {
+		SIMLOG("BHI: injecting an error");
+		sim_set_reg(SIM_BHIOFF + BHI_ERRCODE, 0xbad);
+		bad = 1;
 	}
 	sim->bhi_ok = (bad == 0);
 
@@ -1431,6 +1440,8 @@ static SYSCTL_NODE(_debug, OID_AUTO, mhisim, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
 SYSCTL_PROC(_debug_mhisim, OID_AUTO, run,
     CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, 0, sim_sysctl_run, "I",
     "Run the power up, QMI exchange and power down test");
+SYSCTL_INT(_debug_mhisim, OID_AUTO, inject, CTLFLAG_RW, &sim_inject, 0,
+    "Fault to inject: 1 BHI error, 2 no event ring interrupts");
 SYSCTL_STRING(_debug_mhisim, OID_AUTO, result, CTLFLAG_RD, sim_result, 0,
     "Result of the last run");
 

@@ -1,0 +1,66 @@
+ath11k(4) bring-up tools
+========================
+
+ath11k-debug.sh
+---------------
+
+Loads if_ath11k with the debug knobs below set as tunables, waits for the
+wlan device, scans (and with -a associates using /etc/wpa_supplicant.conf
+and runs dhclient), and packs logs, PCI and MSI state, interrupt counts and
+firmware files into /var/tmp/ath11k-debug-<date>.tar.gz.
+
+Before running it:
+  - pkg install wifi-firmware-ath11k-kmod-wcn6855_hw20 (or fwget(8)); the
+    WCN6855 hw2.1 chips load the same files;
+  - kern.msgbufsize="4194304" in loader.conf, so nothing scrolls away;
+  - dumpdev="AUTO" in rc.conf, so a panic leaves a crash dump;
+  - do not load if_ath11k at boot for the first runs; run the script from a
+    console or a wired link.
+
+Knobs it sets (all can be set by hand too):
+  compat.linuxkpi.ath11k_core_debug_mask=0x1276  ath11k WMI HTC MAC BOOT
+                                                 QMI REG PCI messages
+  compat.linuxkpi.mhi_debug=1       MHI core debug messages
+  compat.linuxkpi.qrtr_debug=1      every QRTR packet and QMI message
+  compat.linuxkpi.80211.debug=0x13005b  LinuxKPI 802.11 traces
+  sysctl compat.linuxkpi.mhi_dump=1 prints the MHI state of every controller
+
+Reading the output
+------------------
+
+The boot goes, in order (summary.txt keeps the matching lines):
+
+ 1. "MSI vectors: 32" from ath11k.  A warning about falling back to one
+    vector means MSI allocation failed; nothing after that can work.
+ 2. "after request_irq msi_addr ... msi_ep_base_data ..." (PCI debug): the
+    address must not be 0; it is what the firmware writes interrupts to.
+ 3. MHI: "Requested to power ON", firmware image loaded ("successfully
+    loaded firmware image" from LinuxKPI, or "Error loading firmware"),
+    BHI, READY, M0 in SBL, BHIe, then mission mode.  On failure "mhi: state
+    dump" shows the device registers (MHISTATUS state in bits 15:8, READY
+    bit 0, SYSERR bit 2; BHI_EXECENV 0 PBL 1 SBL 2 AMSS; BHI_STATUS bits
+    31:30 2 success 3 error; BHI_ERRCODE) and, per event ring, the device
+    and host read pointers.  A device read pointer ahead of the host's
+    means the device posted events the host never processed: its
+    interrupt did not arrive (compare vmstat-i-before/-after).
+ 4. QRTR: "endpoint ... up on mhi0_IPCR", "hello from node N", "new server
+    service 0x45 instance ...", and the lookup "looks up service 0x45
+    instance ...".  "no lookup matches" means ath11k asked for another QMI
+    instance than the firmware announces.
+ 5. QMI (QMI debug and qrtr_debug): host capability, memory request and
+    ready, board data and M3 download, FW ready.  "response ... for no
+    transaction" means a reply came after its waiter timed out.
+ 6. WMI/HTC up, then the wlan device and scan results.
+
+mhi_sim
+-------
+
+A model of the device side of an ath11k-class MHI device, a test-only
+kernel module that runs the MHI host core, the MHI bus glue, QRTR and QMI
+without hardware:
+
+	make -C mhi_sim && kldload linuxkpi_mhi ./mhi_sim/mhi_sim.ko
+	sysctl debug.mhisim.run=1; sysctl debug.mhisim.result
+
+debug.mhisim.inject=1 makes the device fail the BHI download, =2 drops the
+event ring interrupts, to see the failure reports.
