@@ -288,6 +288,7 @@ struct ieee80211_bss_conf {
 	uint8_t					link_id;
 	uint8_t					_pad0;
 	uint8_t					transmitter_bssid[ETH_ALEN];
+	struct ieee80211_bss_conf		*tx_bss_conf;	/* __rcu */
 	struct ieee80211_ftm_responder_params	*ftmr_params;
 	struct ieee80211_p2p_noa_attr		p2p_noa_attr;
 	struct ieee80211_chanreq		chanreq;
@@ -324,6 +325,7 @@ struct ieee80211_bss_conf {
 	uint16_t				eht_puncturing;
 
 	uint8_t					dtim_period;
+	uint8_t					pwr_reduction;
 	uint8_t					sync_dtim_count;
 	uint8_t					bss_param_ch_cnt_link_id;
 	bool					qos;
