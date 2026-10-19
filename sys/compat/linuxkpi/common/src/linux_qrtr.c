@@ -300,11 +300,12 @@ qrtr_send_resume_tx(const struct qrtr_cb *cb)
 {
 	struct qrtr_ctrl_pkt pkt;
 
+	/* From us, also when the packet was broadcast. */
 	memset(&pkt, 0, sizeof(pkt));
 	pkt.cmd = cpu_to_le32(QRTR_TYPE_RESUME_TX);
-	pkt.client.node = cpu_to_le32(cb->dst_node);
+	pkt.client.node = cpu_to_le32(qrtr_local_nid);
 	pkt.client.port = cpu_to_le32(cb->dst_port);
-	(void)qrtr_send(QRTR_TYPE_RESUME_TX, cb->dst_node, cb->dst_port,
+	(void)qrtr_send(QRTR_TYPE_RESUME_TX, qrtr_local_nid, cb->dst_port,
 	    cb->src_node, cb->src_port, &pkt, sizeof(pkt));
 }
 
