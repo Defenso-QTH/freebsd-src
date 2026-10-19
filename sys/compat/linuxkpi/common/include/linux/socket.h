@@ -33,14 +33,19 @@
 
 #define	AF_QIPCRTR			42
 
-static inline int
-kernel_connect(int sd, struct sockaddr *sa, size_t salen, int flags)
-{
+/*
+ * The only users are QMI clients, whose "socket" is the QRTR port of their
+ * QMI handle (linux_qrtr.c); connecting it sets the default destination of
+ * qmi_send_request().
+ */
+struct lkpi_qrtr_port;
+struct sockaddr_unsized;
 
-	/* kern_connectat()? It is used for sockaddr_qrtr by ath1xk/qmi. */
-	pr_debug("%s: TODO\n", __func__);
-	return (-EINVAL);
-}
+int	lkpi_qrtr_connect(struct lkpi_qrtr_port *,
+	    const struct sockaddr_unsized *, int, int);
+
+#define	kernel_connect(_sock, _sa, _salen, _flags)			\
+	lkpi_qrtr_connect((_sock), (_sa), (_salen), (_flags))
 
 #ifdef notyet
 static inline int

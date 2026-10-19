@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  *
  * Copyright (c) 2022-2023 Bjoern A. Zeeb
+ * Copyright (c) 2026 Quentin Thebault
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -25,149 +26,175 @@
  * SUCH DAMAGE.
  */
 
+
 #ifndef	_LINUXKPI_LINUX_SOC_QCOM_QMI_H
 #define	_LINUXKPI_LINUX_SOC_QCOM_QMI_H
 
-/* QMI (Qualcomm MSM Interface) */
+/*
+ * QMI (Qualcomm MSM Interface) client helpers, on top of the QRTR router
+ * over MHI in linux_qrtr.c.  The interface follows Linux; there are no
+ * sockets underneath, a handle is bound to a QRTR port directly.
+ */
 
+#include <linux/completion.h>
+#include <linux/idr.h>
+#include <linux/list.h>
+#include <linux/mutex.h>
 #include <linux/qrtr.h>
+#include <linux/types.h>
+#include <linux/workqueue.h>
 
-enum soc_qcom_qmi_data_type {
+struct qmi_header {
+	uint8_t					type;
+	__le16					txn_id;
+	__le16					msg_id;
+	__le16					msg_len;
+} __packed;
+
+#define	QMI_REQUEST				0
+#define	QMI_RESPONSE				2
+#define	QMI_INDICATION				4
+
+#define	QMI_COMMON_TLV_TYPE			0
+
+enum qmi_elem_type {
 	QMI_EOTI,
-	QMI_DATA_LEN,
 	QMI_OPT_FLAG,
+	QMI_DATA_LEN,
 	QMI_UNSIGNED_1_BYTE,
 	QMI_UNSIGNED_2_BYTE,
 	QMI_UNSIGNED_4_BYTE,
 	QMI_UNSIGNED_8_BYTE,
+	QMI_SIGNED_2_BYTE_ENUM,
 	QMI_SIGNED_4_BYTE_ENUM,
 	QMI_STRUCT,
 	QMI_STRING,
 };
 
-#define	QMI_RESULT_SUCCESS_V01	__LINE__
-#define	QMI_INDICATION		__LINE__
-
-struct qmi_handle;
-
-enum soc_qcom_qmi_array_type {
+enum qmi_array_type {
 	NO_ARRAY,
 	STATIC_ARRAY,
 	VAR_LEN_ARRAY,
 };
 
-/* Should this become an enum? */
-#define	QMI_COMMON_TLV_TYPE			0
-
 struct qmi_elem_info {
-	enum soc_qcom_qmi_data_type		data_type;
+	enum qmi_elem_type			data_type;
 	uint32_t				elem_len;
 	uint32_t				elem_size;
-	enum soc_qcom_qmi_array_type		array_type;
+	enum qmi_array_type			array_type;
 	uint8_t					tlv_type;
 	uint32_t				offset;
 	const struct qmi_elem_info		*ei_array;
 };
+
+#define	QMI_RESULT_SUCCESS_V01			0
+#define	QMI_RESULT_FAILURE_V01			1
+
+#define	QMI_ERR_NONE_V01			0
+#define	QMI_ERR_MALFORMED_MSG_V01		1
+#define	QMI_ERR_NO_MEMORY_V01			2
+#define	QMI_ERR_INTERNAL_V01			3
+#define	QMI_ERR_CLIENT_IDS_EXHAUSTED_V01	5
+#define	QMI_ERR_INVALID_ID_V01			41
+#define	QMI_ERR_ENCODING_V01			58
+#define	QMI_ERR_DISABLED_V01			69
+#define	QMI_ERR_INCOMPATIBLE_STATE_V01		90
+#define	QMI_ERR_NOT_SUPPORTED_V01		94
 
 struct qmi_response_type_v01 {
 	uint16_t				result;
 	uint16_t				error;
 };
 
-struct qmi_txn {
-};
+extern const struct qmi_elem_info qmi_response_type_v01_ei[];
 
 struct qmi_service {
-	uint32_t				node;
-	uint32_t				port;
+	unsigned int				service;
+	unsigned int				version;
+	unsigned int				instance;
+
+	unsigned int				node;
+	unsigned int				port;
+
+	void					*priv;
+	struct list_head			list_node;
 };
 
-struct qmi_msg_handler {
-	uint32_t				type;
-	uint32_t				msg_id;
-	const struct qmi_elem_info		*ei;
-	size_t					decoded_size;
-	void	(*fn)(struct qmi_handle *, struct sockaddr_qrtr *, struct qmi_txn *, const void *);
-};
+struct qmi_handle;
+struct lkpi_qrtr_port;
 
 struct qmi_ops {
 	int	(*new_server)(struct qmi_handle *, struct qmi_service *);
 	void	(*del_server)(struct qmi_handle *, struct qmi_service *);
+	void	(*net_reset)(struct qmi_handle *);
+	void	(*msg_handler)(struct qmi_handle *, struct sockaddr_qrtr *,
+		    const void *, size_t);
+	void	(*bye)(struct qmi_handle *, unsigned int);
+	void	(*del_client)(struct qmi_handle *, unsigned int, unsigned int);
+};
+
+struct qmi_txn {
+	struct qmi_handle			*qmi;
+
+	uint16_t				id;
+
+	struct mutex				lock;
+	struct completion			completion;
+	int					result;
+
+	const struct qmi_elem_info		*ei;
+	void					*dest;
+};
+
+struct qmi_msg_handler {
+	unsigned int				type;
+	unsigned int				msg_id;
+
+	const struct qmi_elem_info		*ei;
+
+	size_t					decoded_size;
+	void	(*fn)(struct qmi_handle *, struct sockaddr_qrtr *,
+		    struct qmi_txn *, const void *);
 };
 
 struct qmi_handle {
-	int				sock;
+	/* The QRTR port of the handle; passed to kernel_connect(). */
+	struct lkpi_qrtr_port			*sock;
+	struct mutex				sock_lock;
 
-	const struct qmi_msg_handler	*handler;
-	struct qmi_ops			ops;
+	struct sockaddr_qrtr			sq;
+
+	struct list_head			lookups;
+	struct list_head			lookup_results;
+	struct list_head			services;
+
+	struct qmi_ops				ops;
+
+	struct idr				txns;
+	struct mutex				txn_lock;
+
+	const struct qmi_msg_handler		*handlers;
 };
 
+int	qmi_add_lookup(struct qmi_handle *, unsigned int, unsigned int,
+	    unsigned int);
 
-/* XXX-TODO need implementation somewhere... it is not in ath1xk* */
-extern struct qmi_elem_info qmi_response_type_v01_ei[];
+int	qmi_handle_init(struct qmi_handle *, size_t, const struct qmi_ops *,
+	    const struct qmi_msg_handler *);
+void	qmi_handle_release(struct qmi_handle *);
 
-static inline int
-qmi_handle_init(struct qmi_handle *handle, size_t resp_len_max,
-    const struct qmi_ops *ops, const struct qmi_msg_handler *handler)
-{
+ssize_t	qmi_send_request(struct qmi_handle *, struct sockaddr_qrtr *,
+	    struct qmi_txn *, int, size_t, const struct qmi_elem_info *,
+	    const void *);
 
-	handle->handler = handler;
-	if (ops != NULL)
-		handle->ops = *ops;
+void	*qmi_encode_message(int, unsigned int, size_t *, unsigned int,
+	    const struct qmi_elem_info *, const void *);
+int	qmi_decode_message(const void *, size_t, const struct qmi_elem_info *,
+	    void *);
 
-        /* We will find out what else to do here. */
-	/* XXX TODO */
-
-	return (0);
-}
-
-static __inline int
-qmi_add_lookup(struct qmi_handle *handle, uint32_t service, uint32_t version,
-    uint32_t service_ins_id)
-{
-
-	/* XXX TODO */
-	return (0);
-}
-
-static __inline void
-qmi_handle_release(struct qmi_handle *handle)
-{
-
-	/* XXX TODO */
-}
-
-static __inline int
-qmi_send_request(struct qmi_handle *handle, void *x, struct qmi_txn *txn,
-    uint32_t msd_id, size_t len, const struct qmi_elem_info *ei, void *req)
-{
-
-	/* XXX TODO */
-	return (-ENXIO);
-}
-
-static __inline void
-qmi_txn_cancel(struct qmi_txn *txn)
-{
-
-	/* XXX TODO */
-}
-
-static __inline int
-qmi_txn_init(struct qmi_handle *handle, struct qmi_txn *txn,
-    const struct qmi_elem_info *ei, void *resp)
-{
-
-	/* XXX TODO */
-	return (-ENXIO);
-}
-
-static __inline int
-qmi_txn_wait(struct qmi_txn *txn, uint64_t jiffies)
-{
-
-	/* XXX TODO */
-	return (-ENXIO);
-}
+int	qmi_txn_init(struct qmi_handle *, struct qmi_txn *,
+	    const struct qmi_elem_info *, void *);
+int	qmi_txn_wait(struct qmi_txn *, unsigned long);
+void	qmi_txn_cancel(struct qmi_txn *);
 
 #endif	/* _LINUXKPI_LINUX_SOC_QCOM_QMI_H */
