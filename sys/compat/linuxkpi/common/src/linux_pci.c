@@ -1433,21 +1433,28 @@ lkpi_pci_msi_desc_alloc(unsigned int irq)
 	if (irq < pdev->dev.irq_start || irq >= pdev->dev.irq_end)
 		return (NULL);
 
-	vec = pdev->dev.irq_start - irq;
+	vec = irq - pdev->dev.irq_start;
+	if (!pdev->msi_enabled || vec >= pci_msi_count(dev->bsddev))
+		return (NULL);
 
-	if (pdev->msi_desc[vec] != NULL)
-		return (pdev->msi_desc[vec]);
+	desc = pdev->msi_desc[vec];
+	if (desc == NULL) {
+		desc = malloc(sizeof(*desc), M_DEVBUF, M_WAITOK | M_ZERO);
+		pdev->msi_desc[vec] = desc;
+	}
 
+	/*
+	 * The MSI message is only programmed once the first interrupt
+	 * handler is set up, and is reprogrammed when the interrupt moves,
+	 * so refresh it on every call rather than caching the value seen
+	 * before request_irq().  Vectors of a multi-message MSI share the
+	 * address and use consecutive data values.
+	 */
 	dinfo = device_get_ivars(dev->bsddev);
 	msi = &dinfo->cfg.msi;
-
-	desc = malloc(sizeof(*desc), M_DEVBUF, M_WAITOK | M_ZERO);
-
 	desc->pci.msi_attrib.is_64 =
 	   (msi->msi_ctrl & PCIM_MSICTRL_64BIT) ? true : false;
-	desc->msg.data = msi->msi_data;
-
-	pdev->msi_desc[vec] = desc;
+	desc->msg.data = msi->msi_data + vec;
 
 	return (desc);
 }
@@ -2085,19 +2092,32 @@ linuxkpi_dma_alloc_noncoherent(struct device *dev, size_t size, dma_addr_t *dma_
     enum dma_data_direction direction, gfp_t gfp)
 {
 	struct linux_dma_priv *priv;
+	vm_paddr_t high;
 	size_t align;
 	void *mem;
 
+	if (dev == NULL || dev->dma_priv == NULL) {
+		*dma_handle = 0;
+		return (NULL);
+	}
+	priv = dev->dma_priv;
+	/*
+	 * Like Linux, place the pages within the coherent DMA mask: drivers
+	 * hand these addresses to hardware that may only take that many bits.
+	 */
+	if (priv->dma_coherent_mask)
+		high = priv->dma_coherent_mask;
+	else
+		high = BUS_SPACE_MAXADDR_32BIT;
 	size = PAGE_ALIGN(size);
 	align = PAGE_SIZE << get_order(size);
-	mem = kmem_alloc_contig(size, gfp & GFP_NATIVE_MASK, 0, BUS_SPACE_MAXADDR,
+	mem = kmem_alloc_contig(size, gfp & GFP_NATIVE_MASK, 0, high,
 	    align, 0, VM_MEMATTR_DEFAULT);
 	if (mem == NULL) {
 		*dma_handle = 0;
 		return (NULL);
 	}
 
-	priv = dev->dma_priv;
 	*dma_handle = linux_dma_map_phys_common(dev, vtophys(mem), size, priv->dmat);
 	if (*dma_handle == 0) {
 		kmem_free(mem, size);
