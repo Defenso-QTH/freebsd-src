@@ -35,11 +35,17 @@
 #include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
+#include <sys/mutex.h>
+#include <sys/priority.h>
+#include <sys/proc.h>
 #include <sys/queue.h>
 #include <sys/sx.h>
 #include <sys/sysctl.h>
+#include <sys/taskqueue.h>
 
+#include <linux/compat.h>
 #include <linux/device.h>
+#include <linux/interrupt.h>
 #include <linux/mhi.h>
 #include <linux/slab.h>
 
@@ -238,6 +244,182 @@ mhi_fbsd_driver_unregister(struct device_driver *drv)
 }
 
 /*
+ * Test interrupts, for a controller without hardware behind it.  They keep
+ * the semantics LinuxKPI gives MSI interrupts: disabling only counts, an
+ * interrupt raised while disabled is replayed on enable, and invocations
+ * of a handler do not overlap.  Handlers run on a taskqueue thread.
+ */
+#define	MHI_FBSD_TEST_IRQS	8
+
+struct mhi_fbsd_test_irq {
+	unsigned int	irq;
+	irq_handler_t	handler;
+	irq_handler_t	thread_handler;
+	void		*arg;
+	int		depth;
+	bool		pending;
+	bool		busy;
+	struct task	task;
+};
+
+static struct mhi_fbsd_test_irq mhi_fbsd_test_irqs[MHI_FBSD_TEST_IRQS];
+static struct mtx mhi_fbsd_test_irq_lock;
+MTX_SYSINIT(mhi_fbsd_test_irq_lock, &mhi_fbsd_test_irq_lock, "mhi test irq list",
+    MTX_DEF);
+static struct taskqueue *mhi_fbsd_test_tq;
+
+static struct mhi_fbsd_test_irq *
+mhi_fbsd_test_irq_find(unsigned int irq)
+{
+	int i;
+
+	for (i = 0; i < MHI_FBSD_TEST_IRQS; i++) {
+		if (mhi_fbsd_test_irqs[i].handler != NULL &&
+		    mhi_fbsd_test_irqs[i].irq == irq)
+			return (&mhi_fbsd_test_irqs[i]);
+	}
+	return (NULL);
+}
+
+static void
+mhi_fbsd_test_irq_task(void *arg, int pending __unused)
+{
+	struct mhi_fbsd_test_irq *ti = arg;
+	irq_handler_t handler, thread_handler;
+	void *harg;
+
+	if (linux_set_current_flags(curthread, M_NOWAIT))
+		return;
+	mtx_lock(&mhi_fbsd_test_irq_lock);
+	while (ti->handler != NULL && ti->pending && ti->depth == 0 &&
+	    !ti->busy) {
+		ti->pending = false;
+		ti->busy = true;
+		handler = ti->handler;
+		thread_handler = ti->thread_handler;
+		harg = ti->arg;
+		mtx_unlock(&mhi_fbsd_test_irq_lock);
+		if (handler(ti->irq, harg) == IRQ_WAKE_THREAD &&
+		    thread_handler != NULL)
+			thread_handler(ti->irq, harg);
+		mtx_lock(&mhi_fbsd_test_irq_lock);
+		ti->busy = false;
+		wakeup(ti);
+	}
+	mtx_unlock(&mhi_fbsd_test_irq_lock);
+}
+
+void
+mhi_fbsd_test_irq_raise(unsigned int irq)
+{
+	struct mhi_fbsd_test_irq *ti;
+
+	mtx_lock(&mhi_fbsd_test_irq_lock);
+	ti = mhi_fbsd_test_irq_find(irq);
+	if (ti != NULL) {
+		ti->pending = true;
+		if (ti->depth == 0)
+			taskqueue_enqueue(mhi_fbsd_test_tq, &ti->task);
+	}
+	mtx_unlock(&mhi_fbsd_test_irq_lock);
+}
+
+int
+mhi_fbsd_request_irq(unsigned int irq, irq_handler_t handler,
+    irq_handler_t thread_handler, unsigned long flags, const char *name,
+    void *arg)
+{
+	struct mhi_fbsd_test_irq *ti;
+	int i;
+
+	if (irq < MHI_FBSD_TEST_IRQ_BASE)
+		return (lkpi_request_irq(NULL, irq, handler, thread_handler,
+		    flags, name, arg));
+
+	mtx_lock(&mhi_fbsd_test_irq_lock);
+	if (mhi_fbsd_test_tq == NULL) {
+		mtx_unlock(&mhi_fbsd_test_irq_lock);
+		return (-ENXIO);
+	}
+	for (i = 0; i < MHI_FBSD_TEST_IRQS; i++) {
+		if (mhi_fbsd_test_irqs[i].handler == NULL)
+			break;
+	}
+	if (i == MHI_FBSD_TEST_IRQS || mhi_fbsd_test_irq_find(irq) != NULL) {
+		mtx_unlock(&mhi_fbsd_test_irq_lock);
+		return (-EBUSY);
+	}
+	ti = &mhi_fbsd_test_irqs[i];
+	ti->irq = irq;
+	ti->handler = handler;
+	ti->thread_handler = thread_handler;
+	ti->arg = arg;
+	ti->depth = 0;
+	ti->pending = false;
+	ti->busy = false;
+	TASK_INIT(&ti->task, 0, mhi_fbsd_test_irq_task, ti);
+	mtx_unlock(&mhi_fbsd_test_irq_lock);
+	return (0);
+}
+
+void
+mhi_fbsd_free_irq(unsigned int irq, void *arg)
+{
+	struct mhi_fbsd_test_irq *ti;
+
+	if (irq < MHI_FBSD_TEST_IRQ_BASE) {
+		lkpi_free_irq(irq, arg);
+		return;
+	}
+	mtx_lock(&mhi_fbsd_test_irq_lock);
+	ti = mhi_fbsd_test_irq_find(irq);
+	if (ti != NULL)
+		ti->depth++;
+	mtx_unlock(&mhi_fbsd_test_irq_lock);
+	if (ti == NULL)
+		return;
+	taskqueue_drain(mhi_fbsd_test_tq, &ti->task);
+	mtx_lock(&mhi_fbsd_test_irq_lock);
+	ti->handler = NULL;
+	mtx_unlock(&mhi_fbsd_test_irq_lock);
+}
+
+int
+mhi_fbsd_enable_irq(unsigned int irq)
+{
+	struct mhi_fbsd_test_irq *ti;
+
+	if (irq < MHI_FBSD_TEST_IRQ_BASE)
+		return (lkpi_enable_irq(irq));
+	mtx_lock(&mhi_fbsd_test_irq_lock);
+	ti = mhi_fbsd_test_irq_find(irq);
+	if (ti != NULL && ti->depth > 0 && --ti->depth == 0 && ti->pending)
+		taskqueue_enqueue(mhi_fbsd_test_tq, &ti->task);
+	mtx_unlock(&mhi_fbsd_test_irq_lock);
+	return (0);
+}
+
+void
+mhi_fbsd_disable_irq(unsigned int irq)
+{
+	struct mhi_fbsd_test_irq *ti;
+
+	if (irq < MHI_FBSD_TEST_IRQ_BASE) {
+		lkpi_disable_irq(irq);
+		return;
+	}
+	mtx_lock(&mhi_fbsd_test_irq_lock);
+	ti = mhi_fbsd_test_irq_find(irq);
+	if (ti != NULL) {
+		ti->depth++;
+		while (ti->busy && taskqueue_member(mhi_fbsd_test_tq,
+		    curthread) == 0)
+			mtx_sleep(ti, &mhi_fbsd_test_irq_lock, 0, "mhitirq", 0);
+	}
+	mtx_unlock(&mhi_fbsd_test_irq_lock);
+}
+
+/*
  * QRTR, the MHI client the IPCR channels bind to, and the QMI interface
  * live in this module too (linux_qrtr.c).
  */
@@ -248,7 +430,15 @@ mhi_fbsd_modevent(module_t mod __unused, int type, void *data __unused)
 
 	switch (type) {
 	case MOD_LOAD:
+		mhi_fbsd_test_tq = taskqueue_create("mhi test irq", M_WAITOK,
+		    taskqueue_thread_enqueue, &mhi_fbsd_test_tq);
+		taskqueue_start_threads(&mhi_fbsd_test_tq, 1, PI_NET,
+		    "mhi test irq");
 		error = lkpi_qrtr_init();
+		if (error != 0) {
+			taskqueue_free(mhi_fbsd_test_tq);
+			mhi_fbsd_test_tq = NULL;
+		}
 		return (-error);
 	case MOD_UNLOAD:
 		if (lkpi_qrtr_busy())
@@ -260,6 +450,8 @@ mhi_fbsd_modevent(module_t mod __unused, int type, void *data __unused)
 		}
 		sx_xunlock(&mhi_fbsd_lock);
 		lkpi_qrtr_uninit();
+		taskqueue_free(mhi_fbsd_test_tq);
+		mhi_fbsd_test_tq = NULL;
 		return (0);
 	default:
 		return (EOPNOTSUPP);
