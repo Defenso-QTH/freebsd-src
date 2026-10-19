@@ -67,7 +67,28 @@ int	mhi_fbsd_device_for_each_child(struct device *, void *,
 	    int (*)(struct device *, void *));
 int	mhi_fbsd_driver_register(struct device_driver *);
 void	mhi_fbsd_driver_unregister(struct device_driver *);
-void	mhi_fbsd_uevent_notify(struct mhi_controller *, enum mhi_ee_type);
+
+/*
+ * Interrupts.  Numbers from MHI_FBSD_TEST_IRQ_BASE up belong to a test
+ * controller that raises them with mhi_fbsd_test_irq_raise() (see
+ * tools/tools/ath11k/mhi_sim); all others are LinuxKPI interrupts.
+ */
+#define	MHI_FBSD_TEST_IRQ_BASE		0x40000000u
+
+int	mhi_fbsd_request_irq(unsigned int, irq_handler_t, irq_handler_t,
+	    unsigned long, const char *, void *);
+void	mhi_fbsd_free_irq(unsigned int, void *);
+int	mhi_fbsd_enable_irq(unsigned int);
+void	mhi_fbsd_disable_irq(unsigned int);
+void	mhi_fbsd_test_irq_raise(unsigned int);
+
+#define	request_threaded_irq(_irq, _h, _th, _f, _n, _a)			\
+	mhi_fbsd_request_irq((_irq), (_h), (_th), (_f), (_n), (_a))
+#define	request_irq(_irq, _h, _f, _n, _a)				\
+	mhi_fbsd_request_irq((_irq), (_h), NULL, (_f), (_n), (_a))
+#define	free_irq(_irq, _a)		mhi_fbsd_free_irq((_irq), (_a))
+#define	enable_irq(_irq)		mhi_fbsd_enable_irq(_irq)
+#define	disable_irq(_irq)		mhi_fbsd_disable_irq(_irq)
 
 #define	device_initialize(_dev)		mhi_fbsd_device_initialize(_dev)
 #define	device_add(_dev)		mhi_fbsd_device_add(_dev)
