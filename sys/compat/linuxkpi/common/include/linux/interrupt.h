@@ -51,6 +51,7 @@ int  lkpi_request_irq(struct device *, unsigned int, irq_handler_t,
 	irq_handler_t, unsigned long, const char *, void *);
 int  lkpi_enable_irq(unsigned int);
 void lkpi_disable_irq(unsigned int);
+void lkpi_disable_irq_nosync(unsigned int);
 int  lkpi_bind_irq_to_cpu(unsigned int, int);
 void lkpi_free_irq(unsigned int, void *);
 void lkpi_devm_free_irq(struct device *, unsigned int, void *);
@@ -106,7 +107,7 @@ disable_irq(unsigned int irq)
 static inline void
 disable_irq_nosync(unsigned int irq)
 {
-	lkpi_disable_irq(irq);
+	lkpi_disable_irq_nosync(irq);
 }
 
 static inline int
