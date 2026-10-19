@@ -498,7 +498,15 @@ static const struct ath11k_hw_params ath11k_hw_params[] = {
 		.name = "wcn6855 hw2.1",
 		.hw_rev = ATH11K_HW_WCN6855_HW21,
 		.fw = {
+#if defined(__linux__)
 			.dir = "WCN6855/hw2.1",
+#elif defined(__FreeBSD__)
+			/*
+			 * linux-firmware has hw2.1 as a link to hw2.0, which
+			 * the firmware packages do not carry over.
+			 */
+			.dir = "WCN6855/hw2.0",
+#endif
 			.board_size = 256 * 1024,
 			.cal_offset = 128 * 1024,
 		},
