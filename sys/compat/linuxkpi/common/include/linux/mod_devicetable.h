@@ -82,6 +82,17 @@ struct dmi_system_id {
 #define	ACPI_ID_LEN		16
 
 /* -----------------------------------------------------------------------------
+ * MHI
+ */
+#define	MHI_DEVICE_MODALIAS_FMT	"mhi:%s"
+#define	MHI_NAME_SIZE		32
+
+struct mhi_device_id {
+	const char	chan[MHI_NAME_SIZE];
+	kernel_ulong_t	driver_data;
+};
+
+/* -----------------------------------------------------------------------------
  * USB
  */
 /* struct usb_device_id is defined in sys/dev/usb/usbdi.h. */

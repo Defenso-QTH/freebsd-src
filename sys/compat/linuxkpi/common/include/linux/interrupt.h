@@ -42,6 +42,7 @@ typedef	irqreturn_t	(*irq_handler_t)(int, void *);
 
 #define	IRQF_SHARED		0x0004	/* Historically */
 #define	IRQF_NOBALANCING	0
+#define	IRQF_NO_SUSPEND		0
 
 #define	IRQ_DISABLE_UNLAZY	0
 
@@ -139,6 +140,12 @@ irq_set_affinity_hint(int vector, const cpumask_t *mask)
 		error = intr_setaffinity(vector, CPU_WHICH_IRQ, cpuset_root);
 
 	return (-error);
+}
+
+static inline int
+irq_set_affinity_and_hint(int vector, const cpumask_t *mask)
+{
+	return (irq_set_affinity_hint(vector, mask));
 }
 
 static inline struct msi_desc *

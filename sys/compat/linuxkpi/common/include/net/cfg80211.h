@@ -151,6 +151,7 @@ struct linuxkpi_ieee80211_channel {
 	int					max_reg_power;
 	uint32_t				orig_flags;
 	int					orig_mpwr;
+	int8_t					psd;
 };
 
 #define	NL80211_EHT_NSS_MAX			16
@@ -726,6 +727,7 @@ struct ieee80211_reg_rule {
 		int	max_antenna_gain;
 		int	max_eirp;
 	} power_rule;
+	int8_t	psd;
 };
 
 struct linuxkpi_ieee80211_regdomain {
@@ -1151,6 +1153,7 @@ enum wiphy_flags {
 	WIPHY_FLAG_4ADDR_STATION		= BIT(15),
 	WIPHY_FLAG_SUPPORTS_MLO			= BIT(16),
 	WIPHY_FLAG_DISABLE_WEXT			= BIT(17),
+	WIPHY_FLAG_NOTIFY_REGDOM_BY_DRIVER	= BIT(18),
 };
 
 struct wiphy_work;
