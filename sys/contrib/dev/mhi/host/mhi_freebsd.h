@@ -82,6 +82,12 @@ int	mhi_fbsd_enable_irq(unsigned int);
 void	mhi_fbsd_disable_irq(unsigned int);
 void	mhi_fbsd_test_irq_raise(unsigned int);
 
+/*
+ * Print the device and host MHI state, for boot and runtime failures.
+ * Also on demand for every controller with compat.linuxkpi.mhi_dump=1.
+ */
+void	mhi_fbsd_dump(struct mhi_controller *, const char *);
+
 #define	request_threaded_irq(_irq, _h, _th, _f, _n, _a)			\
 	mhi_fbsd_request_irq((_irq), (_h), (_th), (_f), (_n), (_a))
 #define	request_irq(_irq, _h, _f, _n, _a)				\
