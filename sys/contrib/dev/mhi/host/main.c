@@ -281,8 +281,10 @@ int mhi_destroy_device(struct device *dev, void *data)
 	struct mhi_controller *mhi_cntrl;
 	enum mhi_ee_type ee = MHI_EE_MAX;
 
+#if defined(__linux__)
 	if (dev->bus != &mhi_bus_type)
 		return 0;
+#endif
 
 	mhi_dev = to_mhi_device(dev);
 	mhi_cntrl = mhi_dev->mhi_cntrl;

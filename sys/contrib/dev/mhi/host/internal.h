@@ -8,6 +8,9 @@
 #define _MHI_INT_H
 
 #include "../common.h"
+#if defined(__FreeBSD__)
+#include <linux/interrupt.h>
+#endif
 
 extern const struct bus_type mhi_bus_type;
 
@@ -419,5 +422,9 @@ void mhi_unmap_single_no_bb(struct mhi_controller *mhi_cntrl,
 			    struct mhi_buf_info *buf_info);
 void mhi_unmap_single_use_bb(struct mhi_controller *mhi_cntrl,
 			     struct mhi_buf_info *buf_info);
+
+#if defined(__FreeBSD__)
+#include "mhi_freebsd.h"
+#endif
 
 #endif /* _MHI_INT_H */

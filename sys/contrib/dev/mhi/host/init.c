@@ -1236,7 +1236,9 @@ struct mhi_device *mhi_alloc_device(struct mhi_controller *mhi_cntrl)
 
 	dev = &mhi_dev->dev;
 	device_initialize(dev);
+#if defined(__linux__)
 	dev->bus = &mhi_bus_type;
+#endif
 	dev->release = mhi_release_device;
 
 	if (mhi_cntrl->mhi_dev) {
@@ -1404,8 +1406,10 @@ int __mhi_driver_register(struct mhi_driver *mhi_drv, struct module *owner)
 	if (!mhi_drv->probe || !mhi_drv->remove)
 		return -EINVAL;
 
+#if defined(__linux__)
 	driver->bus = &mhi_bus_type;
 	driver->owner = owner;
+#endif
 
 	return driver_register(driver);
 }
@@ -1417,6 +1421,7 @@ void mhi_driver_unregister(struct mhi_driver *mhi_drv)
 }
 EXPORT_SYMBOL_GPL(mhi_driver_unregister);
 
+#if defined(__linux__)
 static int mhi_uevent(const struct device *dev, struct kobj_uevent_env *env)
 {
 	const struct mhi_device *mhi_dev = to_mhi_device(dev);
@@ -1424,6 +1429,7 @@ static int mhi_uevent(const struct device *dev, struct kobj_uevent_env *env)
 	return add_uevent_var(env, "MODALIAS=" MHI_DEVICE_MODALIAS_FMT,
 					mhi_dev->name);
 }
+#endif
 
 static int mhi_match(struct device *dev, const struct device_driver *drv)
 {
@@ -1451,7 +1457,9 @@ const struct bus_type mhi_bus_type = {
 	.name = "mhi",
 	.dev_name = "mhi",
 	.match = mhi_match,
+#if defined(__linux__)
 	.uevent = mhi_uevent,
+#endif
 	.probe = mhi_probe,
 	.remove = mhi_remove,
 	.dev_groups = mhi_dev_groups,
