@@ -34,6 +34,8 @@
 #include <sys/rwlock.h>
 #include <sys/libkern.h>
 
+#include <linux/bottom_half.h>
+
 typedef struct rwlock rwlock_t;
 
 #define	read_lock(_l)		rw_rlock(_l)
@@ -52,6 +54,14 @@ typedef struct rwlock rwlock_t;
     do { read_unlock(lock); } while (0)
 #define	write_unlock_irqrestore(lock, flags)				\
     do { write_unlock(lock); } while (0)
+#define	read_lock_bh(_l)						\
+    do { read_lock(_l); local_bh_disable(); } while (0)
+#define	read_unlock_bh(_l)						\
+    do { local_bh_enable(); read_unlock(_l); } while (0)
+#define	write_lock_bh(_l)						\
+    do { write_lock(_l); local_bh_disable(); } while (0)
+#define	write_unlock_bh(_l)						\
+    do { local_bh_enable(); write_unlock(_l); } while (0)
 #define	rwlock_init(_l)	rw_init_flags(_l, "lnxrw", RW_NOWITNESS | RW_NEW)
 
 #endif	/* _LINUXKPI_LINUX_RWLOCK_H_ */

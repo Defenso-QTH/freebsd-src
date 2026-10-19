@@ -55,6 +55,16 @@
 #define	smp_store_mb(x, v)	do { WRITE_ONCE(x, v); smp_mb(); } while (0)
 #endif
 
+#ifndef	dma_mb
+#define	dma_mb()	mb()
+#endif
+#ifndef	dma_rmb
+#define	dma_rmb()	rmb()
+#endif
+#ifndef	dma_wmb
+#define	dma_wmb()	wmb()
+#endif
+
 #define	smp_mb__before_atomic()	barrier()
 #define	smp_mb__after_atomic()	barrier()
 
