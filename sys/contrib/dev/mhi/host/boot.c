@@ -623,6 +623,9 @@ error_ready_state:
 	}
 
 error_fw_load:
+#if defined(__FreeBSD__)
+	mhi_fbsd_dump(mhi_cntrl, "firmware load failed");
+#endif
 	write_lock_irq(&mhi_cntrl->pm_lock);
 	new_state = mhi_tryset_pm_state(mhi_cntrl, MHI_PM_FW_DL_ERR);
 	write_unlock_irq(&mhi_cntrl->pm_lock);

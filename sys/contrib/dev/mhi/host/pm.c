@@ -606,6 +606,9 @@ static void mhi_pm_sys_error_transition(struct mhi_controller *mhi_cntrl)
 	bool reset_device = false;
 	int ret, i;
 
+#if defined(__FreeBSD__)
+	mhi_fbsd_dump(mhi_cntrl, "device system error");
+#endif
 	dev_dbg(dev, "Transitioning from PM state: %s to: %s\n",
 		to_mhi_pm_state_str(mhi_cntrl->pm_state),
 		to_mhi_pm_state_str(MHI_PM_SYS_ERR_PROCESS));
@@ -1291,6 +1294,10 @@ int mhi_sync_power_up(struct mhi_controller *mhi_cntrl)
 			   msecs_to_jiffies(timeout_ms));
 
 	ret = (MHI_IN_MISSION_MODE(mhi_cntrl->ee)) ? 0 : -ETIMEDOUT;
+#if defined(__FreeBSD__)
+	if (ret)
+		mhi_fbsd_dump(mhi_cntrl, "power up did not reach mission mode");
+#endif
 	if (ret)
 		mhi_power_down(mhi_cntrl, false);
 

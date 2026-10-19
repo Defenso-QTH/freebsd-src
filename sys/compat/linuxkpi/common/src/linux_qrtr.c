@@ -173,6 +173,8 @@ SYSCTL_INT(_compat_linuxkpi, OID_AUTO, qrtr_debug, CTLFLAG_RWTUN,
 	if (lkpi_qrtr_debug)						\
 		printf("qrtr: " fmt, ##__VA_ARGS__);			\
 } while (0)
+/* Rare events worth having in any bug report. */
+#define	qrtr_info(fmt, ...)	printf("qrtr: " fmt, ##__VA_ARGS__)
 
 /*
  * qrtr_ep_lock protects the endpoints and the nodes they reach; it is
@@ -217,7 +219,7 @@ qrtr_ep_assign(struct qrtr_ep *ep, unsigned int nid)
 	if (ep->nnids == QRTR_EP_NIDS)
 		return;
 	ep->nids[ep->nnids++] = nid;
-	qrtr_dbg("endpoint %p reaches node %u\n", ep, nid);
+	qrtr_info("endpoint %p reaches node %u\n", ep, nid);
 }
 
 static void
@@ -384,7 +386,7 @@ qmi_invoke_handler(struct qmi_handle *qmi, struct sockaddr_qrtr *sq,
 			break;
 	}
 	if (handler->fn == NULL) {
-		qrtr_dbg("no handler for QMI type %u msg 0x%x\n", hdr->type,
+		qrtr_info("no handler for QMI type %u msg 0x%x\n", hdr->type,
 		    le16_to_cpu(hdr->msg_id));
 		return;
 	}
@@ -427,8 +429,9 @@ qmi_handle_message(struct qmi_handle *qmi, struct sockaddr_qrtr *sq,
 		if (txn == NULL) {
 			/* Unexpected, or its waiter gave up. */
 			mutex_unlock(&qmi->txn_lock);
-			qrtr_dbg("qmi: no transaction %u\n",
-			    le16_to_cpu(hdr->txn_id));
+			qrtr_info("qmi: response 0x%x for no transaction %u "
+			    "(late, after a timeout?)\n",
+			    le16_to_cpu(hdr->msg_id), le16_to_cpu(hdr->txn_id));
 			return;
 		}
 		mutex_lock(&txn->lock);
@@ -455,11 +458,13 @@ qmi_handle_message(struct qmi_handle *qmi, struct sockaddr_qrtr *sq,
 /* -------------------------------------------------------------------- */
 /* Name service (ns.c), for remote servers only. */
 
-static void
+/* Tell the handles whose lookups match; returns how many matched. */
+static int
 qrtr_ns_notify(const struct qrtr_server *srv, bool new)
 {
 	struct lkpi_qrtr_port *p;
 	struct qrtr_lookup *lookup;
+	int matched = 0;
 
 	sx_assert(&qrtr_ns_lock, SA_XLOCKED);
 	list_for_each_entry(p, &qrtr_ports, link) {
@@ -471,19 +476,21 @@ qrtr_ns_notify(const struct qrtr_server *srv, bool new)
 			else
 				qmi_recv_del_server(p->qmi, srv->node,
 				    srv->port);
+			matched++;
 			break;
 		}
 	}
+	return (matched);
 }
 
 static void
 qrtr_ns_server_del(struct qrtr_server *srv)
 {
 	sx_assert(&qrtr_ns_lock, SA_XLOCKED);
-	qrtr_dbg("del server service 0x%x instance 0x%x at %u:%x\n",
+	qrtr_info("del server service 0x%x instance 0x%x at %u:%x\n",
 	    srv->service, srv->instance, srv->node, srv->port);
 	list_del(&srv->link);
-	qrtr_ns_notify(srv, false);
+	(void)qrtr_ns_notify(srv, false);
 	kfree(srv);
 }
 
@@ -509,9 +516,11 @@ qrtr_ns_new_server(unsigned int service, unsigned int instance,
 		srv->node = node;
 		srv->port = port;
 		list_add_tail(&srv->link, &qrtr_servers);
-		qrtr_dbg("new server service 0x%x instance 0x%x at %u:%x\n",
+		qrtr_info("new server service 0x%x instance 0x%x at %u:%x\n",
 		    service, instance, node, port);
-		qrtr_ns_notify(srv, true);
+		if (qrtr_ns_notify(srv, true) == 0)
+			qrtr_info("no lookup matches service 0x%x instance "
+			    "0x%x\n", service, instance);
 	}
 	sx_xunlock(&qrtr_ns_lock);
 }
@@ -567,6 +576,7 @@ qrtr_rx_ctrl(struct qrtr_ep *ep, const struct qrtr_cb *cb, const void *data,
 
 	switch (cb->type) {
 	case QRTR_TYPE_HELLO:
+		qrtr_info("hello from node %u\n", cb->src_node);
 		/* Answer, as ns.c say_hello() does; we serve nothing. */
 		memset(&hello, 0, sizeof(hello));
 		hello.cmd = cpu_to_le32(QRTR_TYPE_HELLO);
@@ -575,6 +585,7 @@ qrtr_rx_ctrl(struct qrtr_ep *ep, const struct qrtr_cb *cb, const void *data,
 			    cb->src_node);
 		break;
 	case QRTR_TYPE_BYE:
+		qrtr_info("bye from node %u\n", cb->src_node);
 		qrtr_ns_bye(cb->src_node);
 		break;
 	case QRTR_TYPE_NEW_SERVER:
@@ -616,7 +627,7 @@ qrtr_rx_data(const struct qrtr_cb *cb, const void *data, size_t size)
 	}
 	if (&p->link == &qrtr_ports) {
 		sx_xunlock(&qrtr_ns_lock);
-		qrtr_dbg("no port %x for data from %u:%x\n", cb->dst_port,
+		qrtr_info("no port %x for data from %u:%x\n", cb->dst_port,
 		    cb->src_node, cb->src_port);
 		return;
 	}
@@ -874,7 +885,7 @@ qrtr_mhi_probe(struct mhi_device *mhi_dev, const struct mhi_device_id *id)
 		kfree(ep);
 		return (error);
 	}
-	qrtr_dbg("endpoint %p up on %s\n", ep, dev_name(&mhi_dev->dev));
+	qrtr_info("endpoint %p up on %s\n", ep, dev_name(&mhi_dev->dev));
 
 	return (0);
 }
@@ -890,6 +901,7 @@ qrtr_mhi_remove(struct mhi_device *mhi_dev)
 	ep = dev_get_drvdata(&mhi_dev->dev);
 	if (ep == NULL)
 		return;
+	qrtr_info("endpoint %p going down\n", ep);
 
 	sx_xlock(&qrtr_ep_lock);
 	ep->dead = true;
@@ -1076,7 +1088,7 @@ qmi_add_lookup(struct qmi_handle *qmi, unsigned int service,
 	sx_xlock(&qrtr_ns_lock);
 	list_add_tail(&lookup->link, &qmi->lookups);
 	sx_xunlock(&qrtr_ns_lock);
-	qrtr_dbg("qmi handle %p looks up service 0x%x instance 0x%x\n", qmi,
+	qrtr_info("qmi handle %p looks up service 0x%x instance 0x%x\n", qmi,
 	    service, lookup->instance);
 
 	/* Servers already known are reported from the worker, as on Linux. */

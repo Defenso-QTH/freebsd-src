@@ -496,6 +496,17 @@ static int ath11k_pci_alloc_msi(struct ath11k_pci *ab_pci)
 		clear_bit(ATH11K_FLAG_MULTI_MSI_VECTORS, &ab->dev_flags);
 		ab->pci.msi.config = &msi_config_one_msi;
 		ath11k_dbg(ab, ATH11K_DBG_PCI, "request one msi vector\n");
+#if defined(__FreeBSD__)
+		/*
+		 * With one vector every interrupt user requests the same
+		 * IRQ, and LinuxKPI cannot share one between handlers.
+		 */
+		ath11k_warn(ab, "could not get %d MSI vectors (device offers "
+		    "%d): falling back to one, which LinuxKPI cannot share; "
+		    "expect request_irq failures\n",
+		    msi_config->total_vectors,
+		    pci_msi_count(pci_dev->dev.bsddev));
+#endif
 	}
 	ath11k_info(ab, "MSI vectors: %d\n", num_vectors);
 

@@ -76,6 +76,14 @@ static TAILQ_HEAD(, mhi_fbsd_drv) mhi_fbsd_drvs =
 static struct sx mhi_fbsd_lock;
 SX_SYSINIT(mhi_fbsd_lock, &mhi_fbsd_lock, "mhi bus");
 
+/* Controllers, for the on demand dump. */
+struct mhi_fbsd_cntrl {
+	TAILQ_ENTRY(mhi_fbsd_cntrl)	link;
+	struct mhi_controller		*mhi;
+};
+static TAILQ_HEAD(, mhi_fbsd_cntrl) mhi_fbsd_cntrls =
+    TAILQ_HEAD_INITIALIZER(mhi_fbsd_cntrls);
+
 void
 mhi_fbsd_device_initialize(struct device *dev)
 {
@@ -109,6 +117,8 @@ mhi_fbsd_device_add(struct device *dev)
 {
 	struct mhi_fbsd_dev *node;
 	struct mhi_fbsd_drv *dnode;
+	struct mhi_fbsd_cntrl *cntrl;
+	struct mhi_device *mhi_dev;
 	struct device *parent;
 
 	/*
@@ -126,7 +136,16 @@ mhi_fbsd_device_add(struct device *dev)
 
 	node = malloc(sizeof(*node), M_MHIBUS, M_WAITOK | M_ZERO);
 	node->dev = dev;
+	mhi_dev = to_mhi_device(dev);
+	if (mhi_dev->dev_type == MHI_DEVICE_CONTROLLER) {
+		cntrl = malloc(sizeof(*cntrl), M_MHIBUS, M_WAITOK | M_ZERO);
+		cntrl->mhi = mhi_dev->mhi_cntrl;
+	} else {
+		cntrl = NULL;
+	}
 	sx_xlock(&mhi_fbsd_lock);
+	if (cntrl != NULL)
+		TAILQ_INSERT_TAIL(&mhi_fbsd_cntrls, cntrl, link);
 	TAILQ_INSERT_TAIL(&mhi_fbsd_devs, node, link);
 	TAILQ_FOREACH(dnode, &mhi_fbsd_drvs, link) {
 		mhi_fbsd_try_bind(dev, dnode->drv);
@@ -142,8 +161,16 @@ void
 mhi_fbsd_device_del(struct device *dev)
 {
 	struct mhi_fbsd_dev *node;
+	struct mhi_fbsd_cntrl *cntrl;
 
 	sx_xlock(&mhi_fbsd_lock);
+	TAILQ_FOREACH(cntrl, &mhi_fbsd_cntrls, link) {
+		if (&cntrl->mhi->mhi_dev->dev == dev) {
+			TAILQ_REMOVE(&mhi_fbsd_cntrls, cntrl, link);
+			free(cntrl, M_MHIBUS);
+			break;
+		}
+	}
 	TAILQ_FOREACH(node, &mhi_fbsd_devs, link) {
 		if (node->dev == dev)
 			break;
@@ -423,6 +450,101 @@ mhi_fbsd_disable_irq(unsigned int irq)
  * QRTR, the MHI client the IPCR channels bind to, and the QMI interface
  * live in this module too (linux_qrtr.c).
  */
+/*
+ * State dump.  The device registers say where the device is (state, EE,
+ * download status, error codes); the rings say whether the host saw what
+ * the device posted: an event ring whose device read pointer moved past
+ * the host's while nothing was processed means interrupts do not arrive.
+ */
+static void
+mhi_fbsd_dump_reg(struct mhi_controller *mhi, void __iomem *base,
+    const char *name, u32 off)
+{
+	u32 val;
+
+	if (base == NULL)
+		return;
+	if (mhi_read_reg(mhi, base, off, &val) != 0)
+		printf("  %-18s <read failed>\n", name);
+	else
+		printf("  %-18s 0x%08x\n", name, val);
+}
+
+void
+mhi_fbsd_dump(struct mhi_controller *mhi, const char *why)
+{
+	struct mhi_event *ev;
+	struct mhi_event_ctxt *er;
+	struct mhi_ring *ring;
+	int i;
+
+	printf("mhi: state dump (%s)\n", why);
+	printf("  host: pm_state %s ee %s dev_state %s M0 %u M2 %u M3 %u "
+	    "dev_wake %d pending_pkts %d\n",
+	    to_mhi_pm_state_str(mhi->pm_state), TO_MHI_EXEC_STR(mhi->ee),
+	    mhi_state_str(mhi->dev_state), mhi->M0, mhi->M2, mhi->M3,
+	    atomic_read(&mhi->dev_wake), atomic_read(&mhi->pending_pkts));
+	mhi_fbsd_dump_reg(mhi, mhi->regs, "MHICTRL", MHICTRL);
+	mhi_fbsd_dump_reg(mhi, mhi->regs, "MHISTATUS", MHISTATUS);
+	mhi_fbsd_dump_reg(mhi, mhi->regs, "MHICFG", MHICFG);
+	mhi_fbsd_dump_reg(mhi, mhi->regs, "MHIVER", MHIVER);
+	mhi_fbsd_dump_reg(mhi, mhi->bhi, "BHI_EXECENV", BHI_EXECENV);
+	mhi_fbsd_dump_reg(mhi, mhi->bhi, "BHI_STATUS", BHI_STATUS);
+	mhi_fbsd_dump_reg(mhi, mhi->bhi, "BHI_ERRCODE", BHI_ERRCODE);
+	mhi_fbsd_dump_reg(mhi, mhi->bhi, "BHI_ERRDBG1", BHI_ERRDBG1);
+	mhi_fbsd_dump_reg(mhi, mhi->bhi, "BHI_ERRDBG2", BHI_ERRDBG2);
+	mhi_fbsd_dump_reg(mhi, mhi->bhi, "BHI_ERRDBG3", BHI_ERRDBG3);
+	mhi_fbsd_dump_reg(mhi, mhi->bhi, "BHI_INTVEC", BHI_INTVEC);
+	mhi_fbsd_dump_reg(mhi, mhi->bhie, "BHIE_TXVECSTATUS",
+	    BHIE_TXVECSTATUS_OFFS);
+	mhi_fbsd_dump_reg(mhi, mhi->bhie, "BHIE_RXVECSTATUS",
+	    BHIE_RXVECSTATUS_OFFS);
+	for (i = 0; i < (int)mhi->nr_irqs && mhi->irq != NULL; i++)
+		printf("  irq[%d] %d\n", i, mhi->irq[i]);
+	if (mhi->mhi_ctxt == NULL || mhi->mhi_event == NULL)
+		return;
+	ev = mhi->mhi_event;
+	for (i = 0; i < (int)mhi->total_ev_rings; i++, ev++) {
+		ring = &ev->ring;
+		er = &mhi->mhi_ctxt->er_ctxt[ev->er_index];
+		if (ring->base == NULL)
+			continue;
+		printf("  event ring %d irq %u: device rp %#jx wp %#jx, "
+		    "host rp %#jx wp %#jx\n", ev->er_index, ev->irq,
+		    (uintmax_t)le64_to_cpu(er->rp),
+		    (uintmax_t)le64_to_cpu(er->wp),
+		    (uintmax_t)(ring->iommu_base +
+		    ((uint8_t *)ring->rp - (uint8_t *)ring->base)),
+		    (uintmax_t)(ring->iommu_base +
+		    ((uint8_t *)ring->wp - (uint8_t *)ring->base)));
+		if (le64_to_cpu(er->rp) != ring->iommu_base +
+		    ((uint8_t *)ring->rp - (uint8_t *)ring->base))
+			printf("  -> event ring %d has events the host has not "
+			    "processed: is irq[%u] being delivered? "
+			    "(vmstat -i)\n", ev->er_index, ev->irq);
+	}
+}
+
+static int
+mhi_fbsd_dump_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct mhi_fbsd_cntrl *c;
+	int error, val;
+
+	val = 0;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL || val == 0)
+		return (error);
+	sx_xlock(&mhi_fbsd_lock);
+	TAILQ_FOREACH(c, &mhi_fbsd_cntrls, link)
+		mhi_fbsd_dump(c->mhi, "requested");
+	sx_xunlock(&mhi_fbsd_lock);
+	return (0);
+}
+SYSCTL_PROC(_compat_linuxkpi, OID_AUTO, mhi_dump,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, 0, mhi_fbsd_dump_sysctl,
+    "I", "Write 1 to print the state of every MHI controller");
+
 static int
 mhi_fbsd_modevent(module_t mod __unused, int type, void *data __unused)
 {
