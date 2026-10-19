@@ -1070,8 +1070,13 @@ const char *ath11k_core_get_usecase_firmware(struct ath11k_base *ab)
 
 	entry = ath11k_core_usecase_firmware_table;
 	while (entry->compatible) {
+#if defined(__linux__)
 		if (ab->hw_rev == entry->hw_rev &&
 		    of_machine_is_compatible(entry->compatible))
+#elif defined(__FreeBSD__)
+		/* No device tree machine compatible strings. */
+		if (false)
+#endif
 			return entry->firmware_name;
 		entry++;
 	}
