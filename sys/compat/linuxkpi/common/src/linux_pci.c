@@ -510,6 +510,14 @@ lkpi_pci_dev_init_common(device_t dev, struct pci_dev *pdev)
 
 	/* Check if we have reached the root to satisfy pci_is_root_bus() */
 	dinfo = device_get_ivars(dev);
+	/*
+	 * Drivers read and write the MSI and MSI-X capabilities through
+	 * these offsets, and some hand the MSI address they read there to
+	 * their firmware, e.g. ath11k.  Left at 0, they would access the
+	 * config header instead.
+	 */
+	pdev->msi_cap = dinfo->cfg.msi.msi_location;
+	pdev->msix_cap = dinfo->cfg.msix.msix_location;
 	if (dinfo->cfg.pcie.pcie_location != 0 &&
 	    dinfo->cfg.pcie.pcie_type == PCIEM_TYPE_ROOT_PORT) {
 		pdev->bus->self = NULL;
