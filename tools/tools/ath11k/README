@@ -64,3 +64,12 @@ without hardware:
 
 debug.mhisim.inject=1 makes the device fail the BHI download, =2 drops the
 event ring interrupts, to see the failure reports.
+
+rht_test
+--------
+
+A test-only kernel module for the LinuxKPI rhashtable that ath11k keeps its
+peers in.  Load it and read the result from dmesg:
+
+	make -C rht_test && kldload ./rht_test/rht_test.ko && kldunload rht_test
+	dmesg | grep rht_test
