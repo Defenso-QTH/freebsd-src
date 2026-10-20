@@ -152,7 +152,24 @@ jobs:
       - name: make buildworld
         run: ./tools/build/make.py --debug $EXTRA_BUILD_ARGS TARGET=${{ matrix.target }} TARGET_ARCH=${{ matrix.target_arch }} buildworld -s -j$NPROC $EXTRA_MAKE_ARGS
       - name: make packages
-        run: ./tools/build/make.py --debug $EXTRA_BUILD_ARGS TARGET=${{ matrix.target }} TARGET_ARCH=${{ matrix.target_arch }} KERNCONF=DEFENSO PKG_CMD=/usr/local/sbin/pkg REPODIR=$RUNNER_TEMP/repo packages -s -j$NPROC $EXTRA_MAKE_ARGS
+        run: |
+          # On a RELEASE-pN branch Makefile.inc1 versions every package
+          # ${REVISION}pN (15.1p5) whatever the commit, so pkg upgrade never
+          # sees a new build.  Append the commit time (UTC) so each build of
+          # our branch sorts above the previous one and below the next
+          # upstream patch level (15.1p5.<time> < 15.1p6).  Other branches
+          # already carry a .snap/.a/.b/.rc timestamp; leave them alone.
+          rev=$(sed -n 's/^REVISION="\(.*\)"$/\1/p' sys/conf/newvers.sh)
+          branch=$(sed -n 's/^BRANCH="\(.*\)"$/\1/p' sys/conf/newvers.sh)
+          pkgver_arg=
+          case "$branch" in
+          RELEASE-p[0-9]*)
+            when=$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y%m%d%H%M%S)
+            pkgver_arg="PKG_VERSION=${rev}p${branch#RELEASE-p}.${when}"
+            ;;
+          esac
+          echo "package version: ${pkgver_arg:-from Makefile.inc1}"
+          ./tools/build/make.py --debug $EXTRA_BUILD_ARGS TARGET=${{ matrix.target }} TARGET_ARCH=${{ matrix.target_arch }} KERNCONF=DEFENSO PKG_CMD=/usr/local/sbin/pkg REPODIR=$RUNNER_TEMP/repo $pkgver_arg packages -s -j$NPROC $EXTRA_MAKE_ARGS
       - name: create FreeBSD-kernel-defenso-dbg package
         if: runner.os == 'Linux'
         run: |
