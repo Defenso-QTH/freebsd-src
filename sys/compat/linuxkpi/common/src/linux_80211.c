@@ -4296,6 +4296,16 @@ lkpi_ic_vap_delete(struct ieee80211vap *vap)
 
 	ieee80211_draintask(ic, &lvif->sw_scan_task);
 
+	/*
+	 * Stop a firmware scan on this vif before net80211 detaches the
+	 * vap, as mac80211 does in ieee80211_do_stop().  Otherwise its
+	 * completion arrives after ieee80211_scan_vdetach() cleared
+	 * ss_vap.
+	 */
+	IEEE80211_LOCK(ic);
+	lkpi_stop_hw_scan(lhw, vif);
+	IEEE80211_UNLOCK(ic);
+
 	LKPI_80211_LHW_LVIF_LOCK(lhw);
 	TAILQ_REMOVE(&lhw->lvif_head, lvif, lvif_entry);
 	LKPI_80211_LHW_LVIF_UNLOCK(lhw);
@@ -7428,6 +7438,7 @@ linuxkpi_ieee80211_scan_completed(struct ieee80211_hw *hw,
 	struct lkpi_hw *lhw;
 	struct ieee80211com *ic;
 	struct ieee80211_scan_state *ss;
+	struct ieee80211vap *vap;
 
 	lhw = wiphy_priv(hw->wiphy);
 	ic = lhw->ic;
@@ -7438,7 +7449,16 @@ linuxkpi_ieee80211_scan_completed(struct ieee80211_hw *hw,
 	    (uintmax_t)info->scan_start_tsf, info->tsf_bssid, ":",
 	    info->aborted);
 
-	ieee80211_scan_done(ss->ss_vap);
+	/* The vap may be gone if the scan outlived it. */
+	IEEE80211_LOCK(ic);
+	vap = ss->ss_vap;
+	IEEE80211_UNLOCK(ic);
+	if (vap != NULL)
+		ieee80211_scan_done(vap);
+	else
+		ic_printf(ic, "%s: scan completed with no scanning vap, "
+		    "scan_flags %b\n", __func__, lhw->scan_flags,
+		    LKPI_LHW_SCAN_BITS);
 
 	LKPI_80211_LHW_SCAN_LOCK(lhw);
 	free(lhw->hw_req, M_LKPI80211);
