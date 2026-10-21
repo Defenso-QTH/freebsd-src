@@ -110,11 +110,11 @@ SYSCTL_BOOL(_compat_linuxkpi_80211, OID_AUTO, order_scanlist, CTLFLAG_RW,
     &lkpi_order_scanlist, 0, "Enable LinuxKPI 802.11 scan list shuffeling");
 
 #if defined(LKPI_80211_HW_CRYPTO)
-static bool lkpi_hwcrypto = false;
+static bool lkpi_hwcrypto = true;
 SYSCTL_BOOL(_compat_linuxkpi_80211, OID_AUTO, hw_crypto, CTLFLAG_RDTUN,
     &lkpi_hwcrypto, 0, "Enable LinuxKPI 802.11 hardware crypto offload");
 
-static bool lkpi_hwcrypto_tkip = false;
+static bool lkpi_hwcrypto_tkip = true;
 SYSCTL_BOOL(_compat_linuxkpi_80211, OID_AUTO, tkip, CTLFLAG_RDTUN,
     &lkpi_hwcrypto_tkip, 0, "Enable LinuxKPI 802.11 TKIP crypto offload");
 #endif
