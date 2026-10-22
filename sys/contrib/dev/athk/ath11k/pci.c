@@ -1368,6 +1368,14 @@ static struct pci_driver ath11k_pci_driver = {
 #ifdef CONFIG_PM
 	.driver.pm = &ath11k_pci_pm_ops,
 #endif
+#if defined(__FreeBSD__)
+	/*
+	 * Name the device ath11k0, not ath11k_pci0: rc.d wlans_<parent>
+	 * parsing and the devd wifi-driver-regex do not match names with
+	 * an underscore, so the wlan child would never be created.
+	 */
+	.bsddriver.name	= KBUILD_MODNAME,
+#endif
 };
 
 static int ath11k_pci_init(void)
