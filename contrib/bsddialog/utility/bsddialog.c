@@ -25,6 +25,10 @@
  * SUCH DAMAGE.
  */
 
+#ifdef HAVE_CAPSICUM
+#include <capsicum_helpers.h>
+#endif
+#include <fcntl.h>
 #include <getopt.h>
 #include <limits.h>
 #include <locale.h>
@@ -44,6 +48,14 @@
 #define UNUSED_PAR(x) UNUSED_ ## x __attribute__((__unused__))
 
 static void custom_text(struct options *opt, char *text, char *buf);
+
+/* Files of a dialog, opened before the first dialog starts */
+struct dialogfiles {
+	FILE *hfile;
+	FILE *loadtheme;
+	FILE *savetheme;
+	FILE *textbox;
+};
 
 /* Exit codes */
 struct exitcode {
@@ -145,16 +157,97 @@ static void getenv_exitcodes(void)
 	}
 }
 
+static FILE *open_file(const char *file, bool write)
+{
+	int fd;
+	FILE *fp;
+
+	if (write) {
+		/* Truncated by savetheme(), an unreached dialog keeps it. */
+		if ((fd = open(file, O_WRONLY | O_CREAT, 0666)) < 0)
+			exit_error(false, "cannot open \"%s\"", file);
+		if ((fp = fdopen(fd, "w")) == NULL)
+			exit_error(false, "cannot open \"%s\"", file);
+	} else if ((fp = fopen(file, "r")) == NULL)
+		exit_error(false, "cannot open \"%s\"", file);
+
+	return (fp);
+}
+
+/*
+ * Open the files of every dialog, --and-dialog included, before the first
+ * one starts, so that no dialog has to open a file in capability mode.
+ * Parse a copy of argv, as parseargs() permutes it and main() writes it.
+ */
+static struct dialogfiles *open_files(int argc, char **argv)
+{
+	int i, ndialogs, parsed, nargc, firstoptind;
+	char **pargv, **nargv;
+	struct bsddialog_conf conf;
+	struct options opt;
+	struct exitcode savedexitcodes[sizeof(exitcodes) / sizeof(exitcodes[0])];
+	struct dialogfiles *files;
+
+	ndialogs = 1;
+	for (i = 0; i < argc; i++)
+		if (strcmp(argv[i], "--and-dialog") == 0 ||
+		    strcmp(argv[i], "--and-widget") == 0)
+			ndialogs++;
+	if ((files = calloc(ndialogs, sizeof(*files))) == NULL)
+		exit_error(false, "cannot allocate dialog files");
+	if ((pargv = calloc(argc + 1, sizeof(*pargv))) == NULL)
+		exit_error(false, "cannot allocate argv copy");
+	memcpy(pargv, argv, argc * sizeof(*pargv));
+	/* parseargs() sets exit codes, main() parses again for that */
+	memcpy(savedexitcodes, exitcodes, sizeof(exitcodes));
+	firstoptind = optind;
+
+	for (i = 0; i < ndialogs; i++) {
+		parsed = parseargs(argc, pargv, &conf, &opt, true);
+		nargc = argc - parsed;
+		nargv = pargv + parsed;
+		argc = parsed - optind;
+		pargv += optind;
+
+		if (conf.key.f1_file != NULL)
+			files[i].hfile = open_file(conf.key.f1_file, false);
+		if (opt.loadthemefile != NULL)
+			files[i].loadtheme = open_file(opt.loadthemefile,
+			    false);
+		if (opt.savethemefile != NULL)
+			files[i].savetheme = open_file(opt.savethemefile,
+			    true);
+		if (opt.dialogbuilder == textbox_builder && argc > 0)
+			files[i].textbox = open_file(pargv[0], false);
+
+		argc = nargc;
+		pargv = nargv;
+		if (argc <= 0)
+			break;
+		/* prepare next parseargs() call, as main() */
+		argc++;
+		pargv--;
+		pargv[0] = argv[0];
+		optind = firstoptind;
+	}
+
+	optind = firstoptind;
+	memcpy(exitcodes, savedexitcodes, sizeof(exitcodes));
+
+	return (files);
+}
+
 /*
  * bsddialog utility: TUI widgets and dialogs.
  */
 int main(int argc, char *argv[argc])
 {
 	bool startup;
-	int i, rows, cols, retval, parsed, nargc, firstoptind;
+	int i, rows, cols, retval, parsed, nargc, firstoptind, dialog;
 	char *text, **nargv, *pn;
 	struct bsddialog_conf conf;
 	struct options opt;
+	struct dialogfiles *files;
 
 	setlocale(LC_ALL, "");
 	getenv_exitcodes();
@@ -173,9 +266,13 @@ int main(int argc, char *argv[argc])
 		}
 	}
 
+	files = open_files(argc, argv);
+
 	startup = true;
-	while (true) {
-		parsed = parseargs(argc, argv, &conf, &opt);
+	for (dialog = 0; ; dialog++) {
+		parsed = parseargs(argc, argv, &conf, &opt, false);
+		conf.key.f1_fp = files[dialog].hfile;
+		opt.textboxfp = files[dialog].textbox;
 		nargc = argc - parsed;
 		nargv = argv + parsed;
 		argc = parsed - optind;
@@ -226,17 +323,25 @@ int main(int argc, char *argv[argc])
 		}
 
 		/* theme */
-		if (startup)
+		if (startup) {
 			startuptheme();
+#ifdef HAVE_CAPSICUM
+			/* Every file is open: terminal, themes, dialogs */
+			caph_cache_tzdata();
+			if (caph_enter() < 0)
+				exit_error(false,
+				    "cannot enter capability mode");
+#endif
+		}
 		startup = false;
 		if ((int)opt.theme >= 0)
 			setdeftheme(opt.theme);
 		if (opt.loadthemefile != NULL)
-			loadtheme(opt.loadthemefile, false);
+			loadthemefp(files[dialog].loadtheme, false);
 		if (opt.bikeshed)
 			bikeshed(&conf);
 		if (opt.savethemefile != NULL)
-			savetheme(opt.savethemefile);
+			savetheme(files[dialog].savetheme);
 
 		/* backtitle and dialog */
 		if (opt.dialogbuilder == NULL)

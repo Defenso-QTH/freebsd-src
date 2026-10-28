@@ -154,13 +154,12 @@ static struct property p[NPROPERTY] = {
 	    "use_shadow", COMPAT, NULL}
 };
 
-void savetheme(const char *file)
+void savetheme(FILE *fp)
 {
 	int i, j;
 	unsigned int flags;
 	enum bsddialog_color bg, fg;
 	time_t clock;
-	FILE *fp;
 
 	if (bsddialog_get_theme(&t) != BSDDIALOG_OK)
 		exit_error(false,
@@ -168,8 +167,9 @@ void savetheme(const char *file)
 
 	if (time(&clock) < 0)
 		exit_error(false, "cannot save profile getting current time");
-	if ((fp = fopen(file, "w")) == NULL)
-		exit_error(false, "cannot open %s to save profile", file);
+	/* Opened before the first dialog without truncation. */
+	if (ftruncate(fileno(fp), 0) != 0)
+		exit_error(false, "cannot truncate file to save profile");
 
 	fprintf(fp, "### bsddialog theme - %s\n", ctime(&clock));
 
@@ -220,13 +220,22 @@ void savetheme(const char *file)
 
 void loadtheme(const char *file, bool compatibility)
 {
+	FILE *fp;
+
+	if ((fp = fopen(file, "r")) == NULL)
+		exit_error(false, "Cannot open theme \"%s\" file", file);
+	loadthemefp(fp, compatibility);
+	fclose(fp);
+}
+
+void loadthemefp(FILE *fp, bool compatibility)
+{
 	bool boolvalue;
 	char charvalue, *value;
 	char line[BUFSIZ], name[BUFSIZ], c1[BUFSIZ], c2[BUFSIZ];
 	int i, j, intvalue;
 	unsigned int uintvalue, flags;
 	enum bsddialog_color bg, fg;
-	FILE *fp;
 
 	if (bsddialog_hascolors() == false)
 		return;
@@ -234,9 +243,6 @@ void loadtheme(const char *file, bool compatibility)
 	if (bsddialog_get_theme(&t) != BSDDIALOG_OK)
 		exit_error(false, "Cannot get current theme: %s",
 		    bsddialog_geterror());
-
-	if ((fp = fopen(file, "r")) == NULL)
-		exit_error(false, "Cannot open theme \"%s\" file", file);
 
 	while (fgets(line, BUFSIZ, fp) != NULL) {
 		if (line[0] == '#' || line[0] == '\n')
@@ -319,8 +325,6 @@ void loadtheme(const char *file, bool compatibility)
 			break;
 		}
 	}
-
-	fclose(fp);
 
 	if (bsddialog_set_theme(&t) != BSDDIALOG_OK)
 		exit_error(false, bsddialog_geterror());

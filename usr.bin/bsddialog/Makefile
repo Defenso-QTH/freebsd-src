@@ -8,6 +8,7 @@ SRCS=	bsddialog.c \
 	util_theme.c
 MAN=	bsddialog.1
 CFLAGS+=	-I${BSDDIALOG}/../lib
+CFLAGS+=	-DHAVE_CAPSICUM
 LIBADD=	bsddialog tinfow
 
 .include <bsd.prog.mk>

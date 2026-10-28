@@ -71,7 +71,8 @@ int textbox_builder(BUILDER_ARGS)
 	if (argc > 0)
 		error_args(opt->name, argc, argv);
 
-	return (bsddialog_textbox(conf, text, rows, cols));
+	(void)text; /* the file, opened by open_files() */
+	return (bsddialog_textbox_fp(conf, opt->textboxfp, rows, cols));
 }
 
 /* bar */

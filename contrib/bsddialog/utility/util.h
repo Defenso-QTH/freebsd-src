@@ -67,6 +67,7 @@ struct options {
 	bool cr_wrap;
 	bool tab_escape;
 	bool text_unchanged;
+	FILE *textboxfp;
 	/* Theme and Screen options*/
 	char *backtitle;
 	bool bikeshed;
@@ -85,7 +86,7 @@ struct options {
 void usage(void);
 int
 parseargs(int argc, char **argv, struct bsddialog_conf *conf,
-    struct options *opt);
+    struct options *opt, bool prescan);
 
 /*
  * Dialogs builders, util_builders.c
@@ -117,8 +118,9 @@ int yesno_builder(BUILDER_ARGS);
 /*
  * Theme, util_theme.c
  */
-void savetheme(const char *file);
+void savetheme(FILE *fp);
 void loadtheme(const char *file, bool compatibility);
+void loadthemefp(FILE *fp, bool compatibility);
 void setdeftheme(enum bsddialog_default_theme theme);
 void bikeshed(struct bsddialog_conf *conf);
 void startuptheme(void);

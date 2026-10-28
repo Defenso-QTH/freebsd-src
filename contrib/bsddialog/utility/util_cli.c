@@ -355,7 +355,7 @@ void usage(void)
 
 int
 parseargs(int argc, char **argv, struct bsddialog_conf *conf,
-    struct options *opt)
+    struct options *opt, bool prescan)
 {
 	int arg, parsed, i;
 	struct winsize ws;
@@ -590,6 +590,8 @@ parseargs(int argc, char **argv, struct bsddialog_conf *conf,
 			break;
 		case PRINT_MAXSIZE:
 			opt->mandatory_dialog = false;
+			if (prescan)
+				break;
 			ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws);
 			dprintf(opt->output_fd, "MaxSize: %d, %d\n",
 			    ws.ws_row, ws.ws_col);
@@ -600,6 +602,8 @@ parseargs(int argc, char **argv, struct bsddialog_conf *conf,
 			break;
 		case PRINT_VERSION:
 			opt->mandatory_dialog = false;
+			if (prescan)
+				break;
 			dprintf(opt->output_fd, "Version: %s\n",
 			    LIBBSDDIALOG_VERSION);
 			break;
