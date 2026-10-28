@@ -974,7 +974,10 @@ int f1help_dialog(struct bsddialog_conf *conf)
 	if (conf->key.f1_message != NULL)
 		output = bsddialog_msgbox(&hconf, conf->key.f1_message, 0, 0);
 
-	if (output != BSDDIALOG_ERROR && conf->key.f1_file != NULL)
+	if (output != BSDDIALOG_ERROR && conf->key.f1_fp != NULL) {
+		rewind(conf->key.f1_fp);
+		output = bsddialog_textbox_fp(&hconf, conf->key.f1_fp, 0, 0);
+	} else if (output != BSDDIALOG_ERROR && conf->key.f1_file != NULL)
 		output = bsddialog_textbox(&hconf, conf->key.f1_file, 0, 0);
 
 	return (output == BSDDIALOG_ERROR ? BSDDIALOG_ERROR : 0);

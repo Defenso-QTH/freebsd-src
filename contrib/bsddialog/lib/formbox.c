@@ -842,8 +842,7 @@ bsddialog_form(struct bsddialog_conf *conf, const char *text, int rows,
 				DRAWITEM_TRICK(&form, form.sel, true);
 			break;
 		case KEY_F(1):
-			if (conf->key.f1_file == NULL &&
-			    conf->key.f1_message == NULL)
+			if (!F1HELP(conf))
 				break;
 			curs_set(0);
 			if (f1help_dialog(conf) != 0) {

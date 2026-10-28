@@ -165,8 +165,7 @@ do_message(struct bsddialog_conf *conf, const char *text, int rows, int cols,
 				s.ypad = s.htextpad - s.printrows;
 			break;
 		case KEY_F(1):
-			if (d.conf->key.f1_file == NULL &&
-			    d.conf->key.f1_message == NULL)
+			if (!F1HELP(d.conf))
 				break;
 			if (f1help_dialog(d.conf) != 0)
 				return (BSDDIALOG_ERROR);

@@ -635,8 +635,7 @@ bsddialog_slider(struct bsddialog_conf *conf, const char *text, int rows,
 			}
 			break;
 		case KEY_F(1):
-			if (conf->key.f1_file == NULL &&
-			    conf->key.f1_message == NULL)
+			if (!F1HELP(conf))
 				break;
 			if (f1help_dialog(conf) != 0)
 				return (BSDDIALOG_ERROR);

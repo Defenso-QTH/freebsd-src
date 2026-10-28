@@ -29,6 +29,7 @@
 #define _LIBBSDDIALOG_H_
 
 #include <stdbool.h>
+#include <stdio.h>
 
 #define LIBBSDDIALOG_VERSION     "1.1"
 
@@ -94,6 +95,7 @@ struct bsddialog_conf {
 	struct {
 		bool enable_esc;
 		const char *f1_file;
+		FILE *f1_fp;
 		const char *f1_message;
 	} key;
 	struct {
@@ -252,6 +254,10 @@ bsddialog_slider(struct bsddialog_conf *conf, const char *text, int rows,
 
 int
 bsddialog_textbox(struct bsddialog_conf *conf, const char *file, int rows,
+    int cols);
+
+int
+bsddialog_textbox_fp(struct bsddialog_conf *conf, FILE *fp, int rows,
     int cols);
 
 int

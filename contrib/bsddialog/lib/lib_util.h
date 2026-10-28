@@ -48,6 +48,9 @@ extern bool hastermcolors;
 	refresh();                                                             \
 } while (0)
 /* error and diagnostic */
+#define F1HELP(conf) ((conf)->key.f1_file != NULL ||                        \
+    (conf)->key.f1_fp != NULL || (conf)->key.f1_message != NULL)
+
 #define RETURN_ERROR(str) do {                                                 \
 	set_error_string(str);                                                 \
 	return (BSDDIALOG_ERROR);                                              \

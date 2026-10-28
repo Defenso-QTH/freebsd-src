@@ -129,19 +129,33 @@ int
 bsddialog_textbox(struct bsddialog_conf *conf, const char *file, int rows,
     int cols)
 {
-	bool loop, has_multicol_ch;
-	int i, retval;
-	unsigned int defaulttablen, linecols;
-	wint_t input;
-	char buf[BUFSIZ];
+	int retval;
 	FILE *fp;
-	struct scrolltext st;
-	struct dialog d;
 
 	if (file == NULL)
 		RETURN_ERROR("*file is NULL");
 	if ((fp = fopen(file, "r")) == NULL)
 		RETURN_FMTERROR("Cannot open file \"%s\"", file);
+	retval = bsddialog_textbox_fp(conf, fp, rows, cols);
+	fclose(fp);
+
+	return (retval);
+}
+
+int
+bsddialog_textbox_fp(struct bsddialog_conf *conf, FILE *fp, int rows,
+    int cols)
+{
+	bool loop, has_multicol_ch;
+	int i, retval;
+	unsigned int defaulttablen, linecols;
+	wint_t input;
+	char buf[BUFSIZ];
+	struct scrolltext st;
+	struct dialog d;
+
+	if (fp == NULL)
+		RETURN_ERROR("*fp is NULL");
 
 	if (prepare_dialog(conf, "" /* fake */, rows, cols, &d) != 0)
 		return (BSDDIALOG_ERROR);
@@ -172,7 +186,6 @@ bsddialog_textbox(struct bsddialog_conf *conf, const char *file, int rows,
 		if (has_multicol_ch)
 			st.margin = 2;
 	}
-	fclose(fp);
 	set_tabsize(defaulttablen); /* reset because it is curses global */
 
 	if (textbox_draw(&d, false, &st) != 0)
@@ -249,8 +262,7 @@ bsddialog_textbox(struct bsddialog_conf *conf, const char *file, int rows,
 				st.ypad++;
 			break;
 		case KEY_F(1):
-			if (conf->key.f1_file == NULL &&
-			    conf->key.f1_message == NULL)
+			if (!F1HELP(conf))
 				break;
 			if (f1help_dialog(conf) != 0)
 				return (BSDDIALOG_ERROR);
