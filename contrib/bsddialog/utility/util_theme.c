@@ -265,7 +265,7 @@ void loadtheme(const char *file, bool compatibility)
 				value++;
 			if (sscanf(value, "%c", &charvalue) != 1)
 				PROP_ERROR(p[i].name, "Cannot get a char");
-			*((int*)p[i].value) = charvalue;
+			*((char*)p[i].value) = charvalue;
 			break;
 		case INT:
 			if (sscanf(value, "%d", &intvalue) != 1)
@@ -323,7 +323,7 @@ void loadtheme(const char *file, bool compatibility)
 	fclose(fp);
 
 	if (bsddialog_set_theme(&t) != BSDDIALOG_OK)
-		exit_error(false, bsddialog_geterror());
+		exit_error(false, "%s", bsddialog_geterror());
 }
 
 void setdeftheme(enum bsddialog_default_theme theme)
@@ -331,7 +331,7 @@ void setdeftheme(enum bsddialog_default_theme theme)
 	if (bsddialog_hascolors() == false)
 		return;
 	if (bsddialog_set_default_theme(theme) != BSDDIALOG_OK)
-		exit_error(false, bsddialog_geterror());
+		exit_error(false, "%s", bsddialog_geterror());
 }
 
 void startuptheme(void)
@@ -374,7 +374,7 @@ void bikeshed(struct bsddialog_conf *conf)
 
 	/* theme */
 	if (bsddialog_get_theme(&t) != BSDDIALOG_OK)
-		exit_error(false, bsddialog_geterror());
+		exit_error(false, "%s", bsddialog_geterror());
 
 	gettimeofday(&tv, NULL);
 	srand(tv.tv_usec);
@@ -434,7 +434,7 @@ void bikeshed(struct bsddialog_conf *conf)
 	t.button.shortcutcolor   = bsddialog_color(col[1], col[5], 0);
 
 	if (bsddialog_set_theme(&t))
-		exit_error(false, bsddialog_geterror());
+		exit_error(false, "%s", bsddialog_geterror());
 
 	/* conf */
 	conf->button.always_active = (~rand() & 1) ? true : false;

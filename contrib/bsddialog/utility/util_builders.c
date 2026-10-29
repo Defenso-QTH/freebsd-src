@@ -207,7 +207,9 @@ static int date(BUILDER_ARGS)
 		localtm->tm_year = yy - 1900;
 		localtm->tm_mon = mm - 1;
 		localtm->tm_mday = dd;
-		strftime(stringdate, 1024, opt->date_fmt, localtm);
+		if (strftime(stringdate, sizeof(stringdate), opt->date_fmt,
+		    localtm) == 0)
+			stringdate[0] = '\0';
 		dprintf(opt->output_fd, "%s", stringdate);
 	} else if (opt->bikeshed && ~dd & 1) {
 		dprintf(opt->output_fd, "%u/%u/%u", dd, mm, yy);
@@ -274,7 +276,9 @@ int timebox_builder(BUILDER_ARGS)
 		localtm->tm_hour = hh;
 		localtm->tm_min = mm;
 		localtm->tm_sec = ss;
-		strftime(stringtime, 1024, opt->time_fmt, localtm);
+		if (strftime(stringtime, sizeof(stringtime), opt->time_fmt,
+		    localtm) == 0)
+			stringtime[0] = '\0';
 		dprintf(opt->output_fd, "%s", stringtime);
 	} else if (opt->bikeshed && ~ss & 1) {
 		dprintf(opt->output_fd, "%u:%u:%u", hh, mm, ss);

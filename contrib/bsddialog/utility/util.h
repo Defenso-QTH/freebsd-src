@@ -34,7 +34,8 @@
 #define BSDDIALOG_ITEM_HELP 12
 
 void set_exit_code(int lib_retval, int exitcode);
-void exit_error(bool usage, const char *fmt, ...);
+void exit_error(bool usage, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
 void error_args(const char *dialog, int argc, char **argv);
 
 /*

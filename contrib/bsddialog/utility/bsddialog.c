@@ -122,7 +122,7 @@ static void start_bsddialog_mode(void)
 	if (bsddialog_inmode())
 		return;
 	if (bsddialog_init() != BSDDIALOG_OK)
-		exit_error(false, bsddialog_geterror());
+		exit_error(false, "%s", bsddialog_geterror());
 
 	signal(SIGINT, sigint_handler);
 }
@@ -243,12 +243,12 @@ int main(int argc, char *argv[argc])
 			break;
 		if (opt.backtitle != NULL)
 			if (bsddialog_backtitle(&conf, opt.backtitle))
-				exit_error(false, bsddialog_geterror());
+				exit_error(false, "%s", bsddialog_geterror());
 		retval = opt.dialogbuilder(&conf, text, rows, cols, argc, argv,
 		    &opt);
 		free(text);
 		if (retval == BSDDIALOG_ERROR)
-			exit_error(false, bsddialog_geterror());
+			exit_error(false, "%s", bsddialog_geterror());
 		if (conf.get_height != NULL && conf.get_width != NULL)
 			dprintf(opt.output_fd, "DialogSize: %d, %d\n",
 			    *conf.get_height, *conf.get_width);
