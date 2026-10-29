@@ -122,6 +122,7 @@ bsddialog_gauge(struct bsddialog_conf *conf, const char *text, int rows,
 	int fd2;
 	FILE *input;
 	char inputbuf[2048], ntext[2048], *pntext;
+	size_t len;
 	struct bar b;
 	struct dialog d;
 
@@ -166,8 +167,9 @@ bsddialog_gauge(struct bsddialog_conf *conf, const char *text, int rows,
 			break;
 
 		while (true) {
-			fscanf(input, "%s", inputbuf);
-			if (strcmp(inputbuf, end) == 0) {
+			/* EOF ends the gauge, like the end string */
+			if (fscanf(input, "%2047s", inputbuf) != 1 ||
+			    strcmp(inputbuf, end) == 0) {
 				mainloop = false;
 				break;
 			}
@@ -176,20 +178,25 @@ bsddialog_gauge(struct bsddialog_conf *conf, const char *text, int rows,
 		}
 		if (mainloop == false)
 			break;
-		fscanf(input, "%d", &perc);
+		if (fscanf(input, "%u", &perc) == EOF)
+			break;
 		perc = MIN(perc, 100);
 		pntext = &ntext[0];
 		ntext[0] = '\0';
 		while (true) {
-			fscanf(input, "%s", inputbuf);
-			if (strcmp(inputbuf, end) == 0) {
+			if (fscanf(input, "%2047s", inputbuf) != 1 ||
+			    strcmp(inputbuf, end) == 0) {
 				mainloop = false;
 				break;
 			}
 			if (strcmp(inputbuf, sep) == 0)
 				break;
-			strcpy(pntext, inputbuf);
-			pntext += strlen(inputbuf); /* end string, no strlen */
+			/* words not fitting in ntext are dropped */
+			len = strlen(inputbuf);
+			if ((size_t)(pntext - ntext) + len + 1 >= sizeof(ntext))
+				continue;
+			memcpy(pntext, inputbuf, len);
+			pntext += len;
 			pntext[0] = ' ';
 			pntext++;
 		}
