@@ -107,6 +107,10 @@ build_privateform(struct bsddialog_conf*conf, unsigned int nitems,
 		if (items[i].maxvaluelen == 0)
 			RETURN_FMTERROR("item %u [0-%u] maxvaluelen = 0",
 			    i, nitems);
+		/* buffers have maxvaluelen + 1 wchar_t */
+		if (items[i].maxvaluelen == UINT_MAX)
+			RETURN_FMTERROR("item %u [0-%u] maxvaluelen too big",
+			    i, nitems);
 	}
 	f->nitems = nitems;
 
@@ -156,11 +160,9 @@ build_privateform(struct bsddialog_conf*conf, unsigned int nitems,
 		item->privwbuf = calloc(item->maxletters + 1, sizeof(wchar_t));
 		if (item->privwbuf == NULL)
 			RETURN_ERROR("Cannot allocate item private buffer");
-		memset(item->privwbuf, 0, item->maxletters + 1);
 		item->pubwbuf = calloc(item->maxletters + 1, sizeof(wchar_t));
 		if (item->pubwbuf == NULL)
 			RETURN_ERROR("Cannot allocate item private buffer");
-		memset(item->pubwbuf, 0, item->maxletters + 1);
 
 		if ((winit = alloc_mbstows(CHECK_STR(items[i].init))) == NULL)
 			RETURN_ERROR("Cannot allocate item.init in wchar_t*");
