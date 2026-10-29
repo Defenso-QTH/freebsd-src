@@ -380,6 +380,7 @@ bsddialog_slider(struct bsddialog_conf *conf, const char *text, int rows,
 	struct sliderctl ctl;
 	bool loop, focusbuttons;
 	int retval, sel;
+	unsigned int i;
 	wint_t input;
 	unsigned long size;
 	WINDOW *start_win, *end_win, *size_win, *step_win, *slider_win;
@@ -387,6 +388,17 @@ bsddialog_slider(struct bsddialog_conf *conf, const char *text, int rows,
 
 	CHECK_PTR(start);
 	CHECK_PTR(end);
+	if (length == 0)
+		RETURN_ERROR("length is 0");
+	if (*start > *end || *end >= length)
+		RETURN_FMTERROR("start %lu and end %lu do not fit [0-%lu]",
+		    *start, *end, length - 1);
+	CHECK_ARRAY(nblocks, blocks);
+	for (i = 0; i < nblocks; i++) {
+		if (blocks[i][0] > blocks[i][1] || blocks[i][1] >= length)
+			RETURN_FMTERROR("block %u (%lu %lu) does not fit [0-%lu]",
+			    i, blocks[i][0], blocks[i][1], length - 1);
+	}
 
 	ctl.spaces = blocks;
 	ctl.nspaces = nblocks;
