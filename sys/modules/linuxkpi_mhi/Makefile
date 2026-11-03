@@ -5,7 +5,7 @@ LKPISRCDIR=	${SRCTOP}/sys/compat/linuxkpi/common/src
 KMOD=	linuxkpi_mhi
 
 # QRTR over MHI and the QMI client interface.
-SRCS=	linux_qrtr.c
+SRCS=	linux_qmi_encdec.c linux_qrtr.c
 
 SRCS+=	${LINUXKPI_GENSRCS}
 SRCS+=	opt_wlan.h

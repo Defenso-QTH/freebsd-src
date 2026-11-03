@@ -1,4 +1,8 @@
-/*	$OpenBSD: qwx.c,v 1.146 2026/10/02 11:24:18 stsp Exp $	*/
+/*
+ * The QMI message encoder and decoder below come from OpenBSD's qwx(4)
+ * driver, sys/dev/ic/qwx.c revision 1.146, adapted to the LinuxKPI QMI
+ * interface (linux/soc/qcom/qmi.h).
+ */
 
 /*
  * Copyright 2023 Stefan Sperling <stsp@openbsd.org>
@@ -16,7 +20,20 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-const char *qmi_data_type_name[QMI_NUM_DATA_TYPES] = {
+#include <sys/param.h>
+#include <sys/endian.h>
+
+#include <linux/err.h>
+#include <linux/errno.h>
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/types.h>
+#include <linux/soc/qcom/qmi.h>
+
+#define	QMI_NUM_DATA_TYPES	(QMI_STRING + 1)
+
+static const char *qmi_data_type_name[QMI_NUM_DATA_TYPES] = {
 	"EOTI",
 	"OPT_FLAG",
 	"DATA_LEN",
@@ -30,28 +47,87 @@ const char *qmi_data_type_name[QMI_NUM_DATA_TYPES] = {
 	"STRING"
 };
 
-const struct qmi_elem_info *
-qwx_qmi_decode_get_elem(const struct qmi_elem_info *ei, uint8_t elem_type)
+const struct qmi_elem_info qmi_response_type_v01_ei[] = {
+	{
+		.data_type	= QMI_SIGNED_2_BYTE_ENUM,
+		.elem_len	= 1,
+		.elem_size	= sizeof(uint16_t),
+		.array_type	= NO_ARRAY,
+		.tlv_type	= QMI_COMMON_TLV_TYPE,
+		.offset		= offsetof(struct qmi_response_type_v01, result),
+		.ei_array	= NULL,
+	},
+	{
+		.data_type	= QMI_SIGNED_2_BYTE_ENUM,
+		.elem_len	= 1,
+		.elem_size	= sizeof(uint16_t),
+		.array_type	= NO_ARRAY,
+		.tlv_type	= QMI_COMMON_TLV_TYPE,
+		.offset		= offsetof(struct qmi_response_type_v01, error),
+		.ei_array	= NULL,
+	},
+	{
+		.data_type	= QMI_EOTI,
+		.elem_len	= 0,
+		.elem_size	= 0,
+		.array_type	= NO_ARRAY,
+		.tlv_type	= QMI_COMMON_TLV_TYPE,
+		.offset		= 0,
+		.ei_array	= NULL,
+	},
+};
+
+/*
+ * Size of the C structure described by an element info table, as far as
+ * the table describes it.  The size of the C structure is not passed in
+ * by callers, so this is used to bound accesses to the structure instead.
+ * DATA_LEN members are stored as 32-bit values in the C structure.
+ */
+static size_t
+qmi_struct_size(const struct qmi_elem_info *ei)
+{
+	size_t size = 0, end;
+
+	for (; ei->data_type != QMI_EOTI; ei++) {
+		if (ei->data_type == QMI_DATA_LEN)
+			end = (size_t)ei->offset + sizeof(uint32_t);
+		else
+			end = (size_t)ei->offset +
+			    (size_t)ei->elem_len * ei->elem_size;
+		if (end > size)
+			size = end;
+	}
+
+	return size;
+}
+
+static const struct qmi_elem_info *
+qmi_decode_get_elem(const struct qmi_elem_info *ei, uint8_t elem_type)
 {
 	while (ei->data_type != QMI_EOTI && ei->tlv_type != elem_type)
 		ei++;
 
-	DNPRINTF(QWX_D_QMI, "%s: found elem 0x%x data type 0x%x\n", __func__,
-	    ei->tlv_type, ei->data_type);
 	return ei;
 }
 
-size_t
-qwx_qmi_decode_min_elem_size(const struct qmi_elem_info *ei, int nested)
+static size_t
+qmi_decode_min_elem_size(const struct qmi_elem_info *ei, int nested)
 {
 	size_t min_size = 0;
+	uint32_t nelem = 1;
+
+	/* Variable length arrays may be empty; static arrays may not. */
+	if (ei->array_type == VAR_LEN_ARRAY)
+		return 0;
+	if (ei->array_type == STATIC_ARRAY && ei->data_type != QMI_STRING)
+		nelem = ei->elem_len;
 
 	switch (ei->data_type) {
 	case QMI_EOTI:
 	case QMI_OPT_FLAG:
 		break;
 	case QMI_DATA_LEN:
-		if (ei->elem_len == 1)
+		if (ei->elem_size == 1)
 			min_size += sizeof(uint8_t);
 		else
 			min_size += sizeof(uint16_t);
@@ -62,7 +138,7 @@ qwx_qmi_decode_min_elem_size(const struct qmi_elem_info *ei, int nested)
 	case QMI_UNSIGNED_8_BYTE:
 	case QMI_SIGNED_2_BYTE_ENUM:
 	case QMI_SIGNED_4_BYTE_ENUM:
-		min_size += ei->elem_len * ei->elem_size;
+		min_size += nelem * ei->elem_size;
 		break;
 	case QMI_STRUCT:
 		if (nested > 2) {
@@ -72,16 +148,18 @@ qwx_qmi_decode_min_elem_size(const struct qmi_elem_info *ei, int nested)
 			    ei->tlv_type,
 			    qmi_data_type_name[ei->data_type],
 			    ei->data_type);
+			break;
 		}
+		if (ei->ei_array == NULL)
+			break;
 		ei = ei->ei_array;
 		while (ei->data_type != QMI_EOTI) {
-			min_size += qwx_qmi_decode_min_elem_size(ei,
+			min_size += nelem * qmi_decode_min_elem_size(ei,
 			    nested + 1);
 			ei++;
 		}
 		break;
 	case QMI_STRING:
-		min_size += 1;
 		/* Strings nested in structs use an in-band length field. */
 		if (nested) {
 			if (ei->elem_len <= 0xff)
@@ -99,13 +177,12 @@ qwx_qmi_decode_min_elem_size(const struct qmi_elem_info *ei, int nested)
 	return min_size;
 }
 
-int
-qwx_qmi_decode_tlv_hdr(struct qwx_softc *sc,
-    const struct qmi_elem_info **next_ei, uint16_t *actual_size,
-    size_t output_len, const struct qmi_elem_info *ei0,
-    uint8_t *input, size_t input_len)
+static int
+qmi_decode_tlv_hdr(const struct qmi_elem_info **next_ei,
+    uint16_t *actual_size, size_t output_len, const struct qmi_elem_info *ei0,
+    const uint8_t *input, size_t input_len)
 {
-	uint8_t *p = input;
+	const uint8_t *p = input;
 	size_t remain = input_len;
 	uint8_t elem_type;
 	uint16_t elem_size = 0;
@@ -115,8 +192,7 @@ qwx_qmi_decode_tlv_hdr(struct qwx_softc *sc,
 	*actual_size = 0;
 
 	if (remain < 3) {
-		printf("%s: QMI message TLV header too short\n",
-		   sc->sc_dev.dv_xname);
+		printf("%s: QMI message TLV header too short\n", __func__);
 		return -1;
 	}
 	elem_type = *p;
@@ -131,35 +207,32 @@ qwx_qmi_decode_tlv_hdr(struct qwx_softc *sc,
 	 * XXX We currently allow elements to appear in any order and
 	 * we do not detect duplicates.
 	 */
-	ei = qwx_qmi_decode_get_elem(ei0, elem_type);
+	ei = qmi_decode_get_elem(ei0, elem_type);
 
-	DNPRINTF(QWX_D_QMI,
-	    "%s: decoding element 0x%x with data type %s (0x%x)\n",
-	    __func__, elem_type, qmi_data_type_name[ei->data_type],
-	    ei->data_type);
+	/* The TLV length field is always 16 bits wide. */
+	elem_size = (p[0] | (p[1] << 8));
+	p += 2;
+	remain -= 2;
 
-	if (remain < 2) {
-		printf("%s: QMI message too short\n", sc->sc_dev.dv_xname);
+	if (remain < elem_size) {
+		printf("%s: QMI message too short\n", __func__);
 		return -1;
-	}
-
-	if (ei->data_type == QMI_DATA_LEN && ei->elem_len == 1) {
-		elem_size = p[0];
-		p++;
-		remain--;
-	} else {
-		elem_size = (p[0] | (p[1] << 8));
-		p += 2;
-		remain -= 2;
 	}
 
 	*next_ei = ei;
 	*actual_size = elem_size;
 
 	if (ei->data_type == QMI_EOTI) {
-		DNPRINTF(QWX_D_QMI,
-		    "%s: unrecognized QMI element type 0x%x size %u\n",
-		    sc->sc_dev.dv_xname, elem_type, elem_size);
+		/*
+		 * Types below 0x10 are reserved for mandatory elements;
+		 * a message holding one we do not know cannot be decoded.
+		 */
+		if (elem_type < 0x10) {
+			printf("%s: unrecognized mandatory QMI element "
+			    "type 0x%x\n", __func__, elem_type);
+			return -1;
+		}
+		/* Unrecognized optional QMI element type; will be skipped. */
 		return 0;
 	}
 
@@ -170,9 +243,6 @@ qwx_qmi_decode_tlv_hdr(struct qwx_softc *sc,
 	if (ei->data_type == QMI_OPT_FLAG)
 		ei++;
 
-	DNPRINTF(QWX_D_QMI, "%s: ei->size %u, actual size %u\n", __func__,
-	    ei->elem_size, *actual_size);
-
 	switch (ei->data_type) {
 	case QMI_UNSIGNED_1_BYTE:
 	case QMI_UNSIGNED_2_BYTE:
@@ -180,10 +250,11 @@ qwx_qmi_decode_tlv_hdr(struct qwx_softc *sc,
 	case QMI_UNSIGNED_8_BYTE:
 	case QMI_SIGNED_2_BYTE_ENUM:
 	case QMI_SIGNED_4_BYTE_ENUM:
-		if (elem_size != ei->elem_size) {
+		if (ei->array_type == VAR_LEN_ARRAY ||
+		    elem_size != qmi_decode_min_elem_size(ei, 0)) {
 			printf("%s: QMI message element 0x%x "
 			    "data type %s (0x%x) with bad size: %u\n",
-			    sc->sc_dev.dv_xname, elem_type,
+			    __func__, elem_type,
 			    qmi_data_type_name[ei->data_type],
 			    ei->data_type, elem_size);
 			return -1;
@@ -193,10 +264,10 @@ qwx_qmi_decode_tlv_hdr(struct qwx_softc *sc,
 		break;
 	case QMI_STRING:
 	case QMI_STRUCT:
-		if (elem_size < qwx_qmi_decode_min_elem_size(ei, 0)) {
+		if (elem_size < qmi_decode_min_elem_size(ei, 0)) {
 			printf("%s: QMI message element 0x%x "
 			    "data type %s (0x%x) with bad size: %u\n",
-			    sc->sc_dev.dv_xname, elem_type,
+			    __func__, elem_type,
 			    qmi_data_type_name[ei->data_type],
 			    ei->data_type, elem_size);
 			return -1;
@@ -204,99 +275,96 @@ qwx_qmi_decode_tlv_hdr(struct qwx_softc *sc,
 		break;
 	default:
 		printf("%s: unexpected QMI message element "
-		    "data type 0x%x\n", sc->sc_dev.dv_xname,
-		    ei->data_type);
-		return -1;
-	}
-
-	if (remain < elem_size) {
-		printf("%s: QMI message too short\n", sc->sc_dev.dv_xname);
+		    "data type 0x%x\n", __func__, ei->data_type);
 		return -1;
 	}
 
 	if (ei->offset + ei->elem_size > output_len) {
 		printf("%s: QMI message element type 0x%x too large: %u\n",
-		    sc->sc_dev.dv_xname, elem_type, ei->elem_size);
+		    __func__, elem_type, ei->elem_size);
 		return -1;
 	}
 
 	return 0;
 }
 
-int
-qwx_qmi_decode_byte(void *output, const struct qmi_elem_info *ei, void *input)
+static int
+qmi_decode_byte(void *output, const struct qmi_elem_info *ei,
+    const void *input)
 {
 	if (ei->elem_size != sizeof(uint8_t)) {
 		printf("%s: bad element size\n", __func__);
 		return -1;
 	}
 
-	DNPRINTF(QWX_D_QMI, "%s: element 0x%x data type 0x%x size %u\n",
-	    __func__, ei->tlv_type, ei->data_type, ei->elem_size);
 	memcpy(output, input, ei->elem_size);
 	return 0;
 }
 
-int
-qwx_qmi_decode_word(void *output, const struct qmi_elem_info *ei, void *input)
+static int
+qmi_decode_word(void *output, const struct qmi_elem_info *ei,
+    const void *input)
 {
-	if (ei->elem_size != sizeof(uint16_t)) {
+	uint16_t val;
+
+	if (ei->elem_size != sizeof(val)) {
 		printf("%s: bad element size\n", __func__);
 		return -1;
 	}
 
-	DNPRINTF(QWX_D_QMI, "%s: element 0x%x data type 0x%x size %u\n",
-	    __func__, ei->tlv_type, ei->data_type, ei->elem_size);
-	memcpy(output, input, ei->elem_size);
+	memcpy(&val, input, sizeof(val));
+	val = le16toh(val);
+	memcpy(output, &val, sizeof(val));
 	return 0;
 }
 
-int
-qwx_qmi_decode_dword(void *output, const struct qmi_elem_info *ei, void *input)
+static int
+qmi_decode_dword(void *output, const struct qmi_elem_info *ei,
+    const void *input)
 {
-	if (ei->elem_size != sizeof(uint32_t)) {
+	uint32_t val;
+
+	if (ei->elem_size != sizeof(val)) {
 		printf("%s: bad element size\n", __func__);
 		return -1;
 	}
 
-	DNPRINTF(QWX_D_QMI, "%s: element 0x%x data type 0x%x size %u\n",
-	    __func__, ei->tlv_type, ei->data_type, ei->elem_size);
-	memcpy(output, input, ei->elem_size);
+	memcpy(&val, input, sizeof(val));
+	val = le32toh(val);
+	memcpy(output, &val, sizeof(val));
 	return 0;
 }
 
-int
-qwx_qmi_decode_qword(void *output, const struct qmi_elem_info *ei, void *input)
+static int
+qmi_decode_qword(void *output, const struct qmi_elem_info *ei,
+    const void *input)
 {
-	if (ei->elem_size != sizeof(uint64_t)) {
+	uint64_t val;
+
+	if (ei->elem_size != sizeof(val)) {
 		printf("%s: bad element size\n", __func__);
 		return -1;
 	}
 
-	DNPRINTF(QWX_D_QMI, "%s: element 0x%x data type 0x%x size %u\n",
-	    __func__, ei->tlv_type, ei->data_type, ei->elem_size);
-	memcpy(output, input, ei->elem_size);
+	memcpy(&val, input, sizeof(val));
+	val = le64toh(val);
+	memcpy(output, &val, sizeof(val));
 	return 0;
 }
 
-int
-qwx_qmi_decode_datalen(struct qwx_softc *sc, size_t *used, uint32_t *datalen,
+static int
+qmi_decode_datalen(size_t *used, uint32_t *datalen,
     void *output, size_t output_len, const struct qmi_elem_info *ei,
-    uint8_t *input, uint16_t input_len)
+    const uint8_t *input, size_t input_len)
 {
-	uint8_t *p = input;
+	const uint8_t *p = input;
 	size_t remain = input_len;
 
 	*datalen = 0;
 
-	DNPRINTF(QWX_D_QMI, "%s: input: ", __func__);
-	for (int i = 0; i < input_len; i++) {
-		DNPRINTF(QWX_D_QMI, " %02x", input[i]);
-	}
-	DNPRINTF(QWX_D_QMI, "\n");
-
 	if (remain < ei->elem_size) {
-		printf("%s: QMI message too short: remain=%zu elem_size=%u\n", __func__, remain, ei->elem_size);
+		printf("%s: QMI message too short: remain=%zu elem_size=%u\n",
+		    __func__, remain, ei->elem_size);
 		return -1;
 	}
 
@@ -309,37 +377,31 @@ qwx_qmi_decode_datalen(struct qwx_softc *sc, size_t *used, uint32_t *datalen,
 		break;
 	default:
 		printf("%s: bad datalen element size %u\n",
-		    sc->sc_dev.dv_xname, ei->elem_size);
+		    __func__, ei->elem_size);
 		return -1;
-		
 	}
 	*used = ei->elem_size;
 
 	if (ei->offset + sizeof(*datalen) > output_len) {
 		printf("%s: QMI message element type 0x%x too large\n",
-		    sc->sc_dev.dv_xname, ei->tlv_type);
+		    __func__, ei->tlv_type);
 		return -1;
 	}
-	memcpy(output + ei->offset, datalen, sizeof(*datalen));
+	memcpy((uint8_t *)output + ei->offset, datalen, sizeof(*datalen));
 	return 0;
 }
 
-int
-qwx_qmi_decode_string(struct qwx_softc *sc, size_t *used_total,
+static int
+qmi_decode_string(size_t *used_total,
     void *output, size_t output_len, const struct qmi_elem_info *ei,
-    uint8_t *input, uint16_t input_len, uint16_t elem_size, int nested)
+    const uint8_t *input, size_t input_len, uint16_t elem_size, int nested)
 {
-	uint8_t *p = input;
+	const uint8_t *p = input;
+	uint8_t *s;
 	uint16_t len;
 	size_t remain = input_len;
 
 	*used_total = 0;
-
-	DNPRINTF(QWX_D_QMI, "%s: input: ", __func__);
-	for (int i = 0; i < input_len; i++) {
-		DNPRINTF(QWX_D_QMI, " %02x", input[i]);
-	}
-	DNPRINTF(QWX_D_QMI, "\n");
 
 	if (nested) {
 		/* Strings nested in structs use an in-band length field. */
@@ -367,9 +429,10 @@ qwx_qmi_decode_string(struct qwx_softc *sc, size_t *used_total,
 	} else
 		len = elem_size;
 
-	if (len > ei->elem_len) {
+	/* elem_len includes the terminating NUL. */
+	if (len >= ei->elem_len) {
 		printf("%s: QMI string element of length %u exceeds "
-		    "maximum length %u\n", __func__, len, ei->elem_len);
+		    "maximum length %u\n", __func__, len, ei->elem_len - 1);
 		return -1;
 	}
 	if (len > remain) {
@@ -377,7 +440,7 @@ qwx_qmi_decode_string(struct qwx_softc *sc, size_t *used_total,
 		    "input buffer size %zu\n", __func__, len, remain);
 		return -1;
 	}
-	if (len > output_len) {
+	if (len >= output_len) {
 		printf("%s: QMI string element of length %u exceeds "
 		    "output buffer size %zu\n", __func__, len, output_len);
 		return -1;
@@ -385,190 +448,187 @@ qwx_qmi_decode_string(struct qwx_softc *sc, size_t *used_total,
 
 	memcpy(output, p, len);
 
-	p = output;
-	p[len] = '\0';
-	DNPRINTF(QWX_D_QMI, "%s: string (len %u): %s\n", __func__, len, p);
+	s = output;
+	s[len] = '\0';
 
 	*used_total += len;
 	return 0;
 }
 
-int
-qwx_qmi_decode_struct(struct qwx_softc *sc, size_t *used_total,
+static int
+qmi_decode_struct(size_t *used_total,
     void *output, size_t output_len,
     const struct qmi_elem_info *struct_ei,
-    uint8_t *input, uint16_t input_len,
+    const uint8_t *input, size_t input_len,
     int nested)
 {
 	const struct qmi_elem_info *ei = struct_ei->ei_array;
-	uint32_t min_size;
-	uint8_t *p = input;
+	const uint8_t *p = input;
 	size_t remain = input_len;
 	size_t used = 0;
 
 	*used_total = 0;
 
-	DNPRINTF(QWX_D_QMI, "%s: input: ", __func__);
-	for (int i = 0; i < input_len; i++) {
-		DNPRINTF(QWX_D_QMI, " %02x", input[i]);
+	if (ei == NULL) {
+		printf("%s: QMI struct element 0x%x without element info\n",
+		    __func__, struct_ei->tlv_type);
+		return -1;
 	}
-	DNPRINTF(QWX_D_QMI, "\n");
 
-	min_size = qwx_qmi_decode_min_elem_size(struct_ei, 0);
-	DNPRINTF(QWX_D_QMI, "%s: minimum struct size: %u\n", __func__, min_size);
-	while (*used_total < min_size && ei->data_type != QMI_EOTI) {
-		if (remain == 0) {
-			printf("%s: QMI message too short\n", __func__);
-			return -1;
-		}
+	while (ei->data_type != QMI_EOTI) {
+		uint32_t nelem = 1, i;
 
 		if (ei->data_type == QMI_DATA_LEN) {
 			uint32_t datalen;
 
 			used = 0;
-			if (qwx_qmi_decode_datalen(sc, &used, &datalen,
+			if (qmi_decode_datalen(&used, &datalen,
 			    output, output_len, ei, p, remain))
 				return -1;
-			DNPRINTF(QWX_D_QMI, "%s: datalen %u used %zu bytes\n",
-			    __func__, datalen, used);
 			p += used;
 			remain -= used;
 			*used_total += used;
-			if (remain < datalen) {
-				printf("%s: QMI message too short\n", __func__);
-				return -1;
-			}
 			ei++;
-			DNPRINTF(QWX_D_QMI, "%s: datalen is for data_type=0x%x "
-			    "tlv_type=0x%x elem_size=%u(0x%x) remain=%zu\n",
-			    __func__, ei->data_type, ei->tlv_type,
-			    ei->elem_size, ei->elem_size, remain);
-			if (datalen == 0) {
-				ei++;
-				DNPRINTF(QWX_D_QMI,
-				    "%s: skipped to data_type=0x%x "
-				    "tlv_type=0x%x elem_size=%u(0x%x) "
-				    "remain=%zu\n", __func__,
-				    ei->data_type, ei->tlv_type,
-				    ei->elem_size, ei->elem_size, remain);
-				continue;
-			}
-		} else {
-			if (remain < ei->elem_size) {
-				printf("%s: QMI message too short\n",
+			if (ei->data_type == QMI_EOTI ||
+			    ei->array_type != VAR_LEN_ARRAY) {
+				printf("%s: data len not for a var array\n",
 				    __func__);
 				return -1;
 			}
+			if (datalen > ei->elem_len) {
+				printf("%s: QMI array of %u elements exceeds "
+				    "maximum of %u\n", __func__, datalen,
+				    ei->elem_len);
+				return -1;
+			}
+			nelem = datalen;
+		} else if (ei->array_type == STATIC_ARRAY &&
+		    ei->data_type != QMI_STRING) {
+			nelem = ei->elem_len;
+		} else if (ei->array_type == VAR_LEN_ARRAY) {
+			printf("%s: var array without data len\n", __func__);
+			return -1;
 		}
 
-		if (ei->offset + ei->elem_size > output_len) {
+		if (ei->offset + (size_t)nelem * ei->elem_size > output_len) {
 			printf("%s: QMI message struct member element "
-			    "type 0x%x too large: %u\n", sc->sc_dev.dv_xname,
+			    "type 0x%x too large: %u\n", __func__,
 			    ei->tlv_type, ei->elem_size);
 			return -1;
 		}
 
-		DNPRINTF(QWX_D_QMI,
-		    "%s: decoding struct member element 0x%x with "
-		    "data type %s (0x%x) size=%u(0x%x) remain=%zu\n", __func__,
-		    ei->tlv_type, qmi_data_type_name[ei->data_type],
-		    ei->data_type, ei->elem_size, ei->elem_size, remain);
-		switch (ei->data_type) {
-		case QMI_UNSIGNED_1_BYTE:
-			if (qwx_qmi_decode_byte(output + ei->offset, ei, p))
-				return -1;
-			remain -= ei->elem_size;
-			p += ei->elem_size;
-			*used_total += ei->elem_size;
-			break;
-		case QMI_UNSIGNED_2_BYTE:
-		case QMI_SIGNED_2_BYTE_ENUM:
-			if (qwx_qmi_decode_word(output + ei->offset, ei, p))
-				return -1;
-			remain -= ei->elem_size;
-			p += ei->elem_size;
-			*used_total += ei->elem_size;
-			break;
-		case QMI_UNSIGNED_4_BYTE:
-		case QMI_SIGNED_4_BYTE_ENUM:
-			if (qwx_qmi_decode_dword(output + ei->offset, ei, p))
-				return -1;
-			remain -= ei->elem_size;
-			p += ei->elem_size;
-			*used_total += ei->elem_size;
-			break;
-		case QMI_UNSIGNED_8_BYTE:
-			if (qwx_qmi_decode_qword(output + ei->offset, ei, p))
-				return -1;
-			remain -= ei->elem_size;
-			p += ei->elem_size;
-			*used_total += ei->elem_size;
-			break;
-		case QMI_STRUCT:
-			if (nested > 2) {
-				printf("%s: QMI struct element data type 0x%x "
-				    "is nested too deeply\n",
-				    sc->sc_dev.dv_xname, ei->data_type);
+		for (i = 0; i < nelem; i++) {
+			size_t outoff = ei->offset + (ei->elem_size * i);
+			uint8_t *out = (uint8_t *)output + outoff;
+
+			switch (ei->data_type) {
+			case QMI_UNSIGNED_1_BYTE:
+			case QMI_UNSIGNED_2_BYTE:
+			case QMI_SIGNED_2_BYTE_ENUM:
+			case QMI_UNSIGNED_4_BYTE:
+			case QMI_SIGNED_4_BYTE_ENUM:
+			case QMI_UNSIGNED_8_BYTE:
+				if (remain < ei->elem_size) {
+					printf("%s: QMI message too short\n",
+					    __func__);
+					return -1;
+				}
+				break;
+			default:
+				break;
+			}
+
+			switch (ei->data_type) {
+			case QMI_UNSIGNED_1_BYTE:
+				if (qmi_decode_byte(out, ei, p))
+					return -1;
+				remain -= ei->elem_size;
+				p += ei->elem_size;
+				*used_total += ei->elem_size;
+				break;
+			case QMI_UNSIGNED_2_BYTE:
+			case QMI_SIGNED_2_BYTE_ENUM:
+				if (qmi_decode_word(out, ei, p))
+					return -1;
+				remain -= ei->elem_size;
+				p += ei->elem_size;
+				*used_total += ei->elem_size;
+				break;
+			case QMI_UNSIGNED_4_BYTE:
+			case QMI_SIGNED_4_BYTE_ENUM:
+				if (qmi_decode_dword(out, ei, p))
+					return -1;
+				remain -= ei->elem_size;
+				p += ei->elem_size;
+				*used_total += ei->elem_size;
+				break;
+			case QMI_UNSIGNED_8_BYTE:
+				if (qmi_decode_qword(out, ei, p))
+					return -1;
+				remain -= ei->elem_size;
+				p += ei->elem_size;
+				*used_total += ei->elem_size;
+				break;
+			case QMI_STRUCT:
+				if (nested > 2) {
+					printf("%s: QMI struct element data "
+					    "type 0x%x is nested too deeply\n",
+					    __func__, ei->data_type);
+					return -1;
+				}
+				used = 0;
+				if (qmi_decode_struct(&used,
+				    out, ei->elem_size,
+				    ei, p, remain, nested + 1))
+					return -1;
+				remain -= used;
+				p += used;
+				*used_total += used;
+				break;
+			case QMI_STRING:
+				used = 0;
+				if (qmi_decode_string(&used,
+				    out, output_len - outoff,
+				    ei, p, remain, 0, 1))
+					return -1;
+				remain -= used;
+				p += used;
+				*used_total += used;
+				break;
+			default:
+				printf("%s: unhandled QMI struct element "
+				    "data type 0x%x\n", __func__,
+				    ei->data_type);
 				return -1;
 			}
-			used = 0;
-			if (qwx_qmi_decode_struct(sc, &used,
-			    output + ei->offset, output_len - ei->offset,
-			    ei, p, remain, nested + 1))
-				return -1;
-			remain -= used;
-			p += used;
-			*used_total += used;
-			break;
-		case QMI_STRING:
-			used = 0;
-			if (qwx_qmi_decode_string(sc, &used,
-			    output + ei->offset, output_len - ei->offset,
-			    ei, p, remain, 0, 1))
-				return -1;
-			remain -= used;
-			p += used;
-			*used_total += used;
-			break;
-		default:
-			printf("%s: unhandled QMI struct element "
-			    "data type 0x%x\n", sc->sc_dev.dv_xname,
-			    ei->data_type);
-			return -1;
 		}
 
 		ei++;
-		DNPRINTF(QWX_D_QMI, "%s: next ei 0x%x ei->data_type=0x%x\n",
-		    __func__, ei->tlv_type, ei->data_type);
 	}
-
-	DNPRINTF(QWX_D_QMI, "%s: used_total=%zu ei->data_type=0x%x\n",
-	    __func__, *used_total, ei->data_type);
 
 	return 0;
 }
 
-int
-qwx_qmi_decode_msg(struct qwx_softc *sc, void *output, size_t output_len,
-    const struct qmi_elem_info *ei0, uint8_t *input, uint16_t input_len)
+static int
+qmi_decode_msg(void *output, size_t output_len,
+    const struct qmi_elem_info *ei0, const uint8_t *input, uint16_t input_len)
 {
-	uint8_t *p = input;
+	const uint8_t *p = input;
 	size_t remain = input_len, used;
 	const struct qmi_elem_info *ei = ei0;
 
-	memset(output, 0, output_len);
+	if (output_len > 0)
+		memset(output, 0, output_len);
 
-	DNPRINTF(QWX_D_QMI, "%s: input: ", __func__);
-	for (int i = 0; i < input_len; i++) {
-		DNPRINTF(QWX_D_QMI, " %02x", input[i]);
-	}
-	DNPRINTF(QWX_D_QMI, "\n");
-
-	while (remain > 0 && ei->data_type != QMI_EOTI) {
+	/*
+	 * Elements are looked up by TLV type in the whole table, so keep
+	 * going until all input has been consumed.
+	 */
+	while (remain > 0) {
 		uint32_t nelem = 1, i;
 		uint16_t datalen;
 
-		if (qwx_qmi_decode_tlv_hdr(sc, &ei, &datalen, output_len,
+		if (qmi_decode_tlv_hdr(&ei, &datalen, output_len,
 		    ei0, p, remain))
 			return -1;
 
@@ -586,8 +646,9 @@ qwx_qmi_decode_msg(struct qwx_softc *sc, void *output, size_t output_len,
 
 			if (ei->offset + ei->elem_size > output_len) {
 				printf("%s: QMI message element type 0x%x "
-				    "too large: %u\n", sc->sc_dev.dv_xname,
+				    "too large: %u\n", __func__,
 				    ei->tlv_type, ei->elem_size);
+				return -1;
 			}
 
 			pvalid = (uint8_t *)output + ei->offset;
@@ -599,30 +660,21 @@ qwx_qmi_decode_msg(struct qwx_softc *sc, void *output, size_t output_len,
 		p += 3;
 		remain -= 3;
 
+		/*
+		 * From here on, 'datalen' counts the bytes of this
+		 * element which have not been decoded yet.  The TLV
+		 * header check made sure that all of them are present.
+		 */
 		if (ei->data_type == QMI_DATA_LEN) {
 			const struct qmi_elem_info *datalen_ei = ei;
 			uint8_t elem_type = ei->tlv_type;
 
-			/*
-			 * Size info in TLV header indicates the
-			 * total length of element data that follows.
-			 */
-			if (remain < datalen) {
-				printf("%s:%d QMI message too short\n",
-				    __func__, __LINE__);
-				return -1;
-			}
-
 			ei++;
-			DNPRINTF(QWX_D_QMI,
-			    "%s: next ei data_type=0x%x tlv_type=0x%x "
-			    "dst elem_size=%u(0x%x) src total size=%u "
-			    "remain=%zu\n", __func__, ei->data_type,
-			    ei->tlv_type, ei->elem_size, ei->elem_size,
-			    datalen, remain);
 
 			/* Related EIs must have the same type. */
-			if (ei->tlv_type != elem_type) {
+			if (ei->tlv_type != elem_type ||
+			    ei->data_type == QMI_EOTI ||
+			    ei->array_type != VAR_LEN_ARRAY) {
 				printf("%s: unexpected element type 0x%x; "
 				    "expected 0x%x\n", __func__,
 				    ei->tlv_type, elem_type);
@@ -630,8 +682,7 @@ qwx_qmi_decode_msg(struct qwx_softc *sc, void *output, size_t output_len,
 			}
 
 			if (datalen == 0) {
-				if (ei->data_type != QMI_EOTI)
-					ei++;
+				ei = ei0;
 				continue;
 			}
 
@@ -640,178 +691,160 @@ qwx_qmi_decode_msg(struct qwx_softc *sc, void *output, size_t output_len,
 			 * value follows the header, indicating the number
 			 * of elements in the array.
 			 */
-			if (ei->array_type == VAR_LEN_ARRAY) {
-				DNPRINTF(QWX_D_QMI,
-				    "%s: variable length array\n", __func__);
-				used = 0;
-				if (qwx_qmi_decode_datalen(sc, &used, &nelem,
-				    output, output_len, datalen_ei, p, remain))
-					return -1;
-				p += used;
-				remain -= used;
-				/*
-				 * Previous datalen value included the total
-				 * amount of bytes following the DATALEN TLV
-				 * header.
-				 */
-				datalen -= used;
+			used = 0;
+			if (qmi_decode_datalen(&used, &nelem,
+			    output, output_len, datalen_ei, p, datalen))
+				return -1;
+			p += used;
+			remain -= used;
+			/*
+			 * Previous datalen value included the total
+			 * amount of bytes following the DATALEN TLV
+			 * header.
+			 */
+			datalen -= used;
 
-				if (nelem == 0) {
-					if (ei->data_type != QMI_EOTI)
-						ei++;
-					continue;
-				}
-
-				DNPRINTF(QWX_D_QMI,
-				    "%s: datalen %u used %zu bytes\n",
-				    __func__, nelem, used);
-
-				DNPRINTF(QWX_D_QMI,
-				    "%s: decoding %u array elements with "
-				    "src size %u dest size %u\n", __func__,
-				    nelem, datalen / nelem, ei->elem_size);
+			if (nelem > ei->elem_len) {
+				printf("%s: QMI array of %u elements exceeds "
+				    "maximum of %u\n", __func__, nelem,
+				    ei->elem_len);
+				return -1;
 			}
+		} else if (ei->array_type == STATIC_ARRAY &&
+		    ei->data_type != QMI_STRING) {
+			nelem = ei->elem_len;
 		}
 
-		if (remain < datalen) {
-			printf("%s:%d QMI message too short: remain=%zu, "
-			    "datalen=%u\n", __func__, __LINE__, remain,
-			    datalen);
-			return -1;
-		}
-		if (output_len < nelem * ei->elem_size) {
-			printf("%s: QMI output buffer too short: remain=%zu "
-			    "nelem=%u ei->elem_size=%u\n", __func__, remain,
+		if (output_len < ei->offset + (size_t)nelem * ei->elem_size) {
+			printf("%s: QMI output buffer too short: "
+			    "nelem=%u ei->elem_size=%u\n", __func__,
 			    nelem, ei->elem_size);
 			return -1;
 		}
 
-		for (i = 0; i < nelem && remain > 0; i++) {
+		for (i = 0; i < nelem; i++) {
 			size_t outoff;
+			uint8_t *out;
 
 			outoff = ei->offset + (ei->elem_size * i);
+			out = (uint8_t *)output + outoff;
 			switch (ei->data_type) {
 			case QMI_STRUCT:
 				used = 0;
-				if (qwx_qmi_decode_struct(sc, &used,
-				    output + outoff, output_len - outoff,
-				    ei, p, remain, 0))
+				if (qmi_decode_struct(&used,
+				    out, ei->elem_size,
+				    ei, p, datalen, 0))
 					return -1;
 				remain -= used;
 				p += used;
-				if (used != datalen) {
-					DNPRINTF(QWX_D_QMI,
-					    "%s struct used only %zu bytes "
-					    "of %u input bytes\n", __func__,
-					    used, datalen);
-				} else {
-					DNPRINTF(QWX_D_QMI,
-					    "%s: struct used %zu bytes "
-					    "of input\n", __func__, used);
-				}
+				datalen -= used;
 				break;
 			case QMI_STRING:
 				used = 0;
-				if (qwx_qmi_decode_string(sc, &used,
-				    output + outoff, output_len - outoff,
-				    ei, p, remain, datalen, 0))
+				if (nelem != 1 || qmi_decode_string(&used,
+				    out, output_len - outoff,
+				    ei, p, datalen, datalen, 0))
 					return -1;
 				remain -= used;
 				p += used;
-				if (used != datalen) {
-					DNPRINTF(QWX_D_QMI,
-					    "%s: string used only %zu bytes "
-					    "of %u input bytes\n", __func__,
-					    used, datalen);
-				} else {
-					DNPRINTF(QWX_D_QMI,
-					    "%s: string used %zu bytes "
-					    "of input\n", __func__, used);
-				}
+				datalen -= used;
 				break;
 			case QMI_UNSIGNED_1_BYTE:
-				if (remain < ei->elem_size) {
+				if (datalen < ei->elem_size) {
 					printf("%s: QMI message too "
 					    "short\n", __func__);
 					return -1;
 				}
-				if (qwx_qmi_decode_byte(output + outoff,
-				    ei, p))
+				if (qmi_decode_byte(out, ei, p))
 					return -1;
 				remain -= ei->elem_size;
 				p += ei->elem_size;
+				datalen -= ei->elem_size;
 				break;
 			case QMI_UNSIGNED_2_BYTE:
 			case QMI_SIGNED_2_BYTE_ENUM:
-				if (remain < ei->elem_size) {
+				if (datalen < ei->elem_size) {
 					printf("%s: QMI message too "
 					    "short\n", __func__);
 					return -1;
 				}
-				if (qwx_qmi_decode_word(output + outoff,
-				    ei, p))
+				if (qmi_decode_word(out, ei, p))
 					return -1;
 				remain -= ei->elem_size;
 				p += ei->elem_size;
+				datalen -= ei->elem_size;
 				break;
 			case QMI_UNSIGNED_4_BYTE:
 			case QMI_SIGNED_4_BYTE_ENUM:
-				if (remain < ei->elem_size) {
+				if (datalen < ei->elem_size) {
 					printf("%s: QMI message too "
 					    "short\n", __func__);
 					return -1;
 				}
-				if (qwx_qmi_decode_dword(output + outoff,
-				    ei, p))
+				if (qmi_decode_dword(out, ei, p))
 					return -1;
 				remain -= ei->elem_size;
 				p += ei->elem_size;
+				datalen -= ei->elem_size;
 				break;
 			case QMI_UNSIGNED_8_BYTE:
-				if (remain < ei->elem_size) {
+				if (datalen < ei->elem_size) {
 					printf("%s: QMI message too "
-					    "short 4\n", __func__);
+					    "short\n", __func__);
 					return -1;
 				}
-				if (qwx_qmi_decode_qword(output + outoff,
-				    ei, p))
+				if (qmi_decode_qword(out, ei, p))
 					return -1;
 				remain -= ei->elem_size;
 				p += ei->elem_size;
+				datalen -= ei->elem_size;
 				break;
 			default:
 				printf("%s: unhandled QMI message element "
-				    "data type 0x%x\n",
-				    sc->sc_dev.dv_xname, ei->data_type);
+				    "data type 0x%x\n", __func__,
+				    ei->data_type);
 				return -1;
 			}
 		}
 
-		ei++;
-		DNPRINTF(QWX_D_QMI,
-		    "%s: next ei 0x%x ei->data_type=0x%x remain=%zu\n",
-		    __func__, ei->tlv_type, ei->data_type, remain);
+		/* The element must have used all of its TLV's bytes. */
+		if (datalen != 0) {
+			printf("%s: QMI message element 0x%x has %u "
+			    "trailing bytes\n", __func__, ei->tlv_type,
+			    datalen);
+			return -1;
+		}
 
-		DNPRINTF(QWX_D_QMI, "%s: remaining input: ", __func__);
-		for (int i = 0; i < remain; i++)
-			DNPRINTF(QWX_D_QMI, " %02x", p[i]);
-		DNPRINTF(QWX_D_QMI, "\n");
+		ei = ei0;
 	}
 
 	return 0;
 }
 
-int
-qwx_qmi_encode_datalen(uint8_t *p, uint32_t *datalen,
-    const struct qmi_elem_info *ei, void *input)
+static int
+qmi_encode_datalen(uint8_t *p, uint32_t *datalen,
+    const struct qmi_elem_info *ei, const void *input)
 {
-	memcpy(datalen, input + ei->offset, sizeof(uint32_t));
+	memcpy(datalen, (const uint8_t *)input + ei->offset, sizeof(uint32_t));
 
 	if (ei->elem_size == sizeof(uint8_t)) {
-		p[0] = (*datalen & 0xff);
+		if (*datalen > 0xff) {
+			printf("%s: data len %u too large\n", __func__,
+			    *datalen);
+			return -1;
+		}
+		if (p != NULL)
+			p[0] = (*datalen & 0xff);
 	} else if (ei->elem_size == sizeof(uint16_t)) {
-		p[0] = (*datalen & 0xff);
-		p[1] = (*datalen >> 8) & 0xff;
+		if (*datalen > 0xffff) {
+			printf("%s: data len %u too large\n", __func__,
+			    *datalen);
+			return -1;
+		}
+		if (p != NULL) {
+			p[0] = (*datalen & 0xff);
+			p[1] = (*datalen >> 8) & 0xff;
+		}
 	} else {
 		printf("%s: bad element size\n", __func__);
 		return -1;
@@ -820,8 +853,8 @@ qwx_qmi_encode_datalen(uint8_t *p, uint32_t *datalen,
 	return 0;
 }
 
-int
-qwx_qmi_encode_byte(uint8_t *p, const struct qmi_elem_info *ei, void *input,
+static int
+qmi_encode_byte(uint8_t *p, const struct qmi_elem_info *ei, const void *input,
     int i)
 {
 	if (ei->elem_size != sizeof(uint8_t)) {
@@ -832,12 +865,13 @@ qwx_qmi_encode_byte(uint8_t *p, const struct qmi_elem_info *ei, void *input,
 	if (p == NULL)
 		return 0;
 
-	memcpy(p, input + ei->offset + (i * ei->elem_size), ei->elem_size);
+	memcpy(p, (const uint8_t *)input + ei->offset + (i * ei->elem_size),
+	    ei->elem_size);
 	return 0;
 }
 
-int
-qwx_qmi_encode_word(uint8_t *p, const struct qmi_elem_info *ei, void *input,
+static int
+qmi_encode_word(uint8_t *p, const struct qmi_elem_info *ei, const void *input,
     int i)
 {
 	uint16_t val;
@@ -850,14 +884,15 @@ qwx_qmi_encode_word(uint8_t *p, const struct qmi_elem_info *ei, void *input,
 	if (p == NULL)
 		return 0;
 
-	memcpy(&val, input + ei->offset + (i * ei->elem_size), ei->elem_size);
+	memcpy(&val, (const uint8_t *)input + ei->offset + (i * ei->elem_size),
+	    ei->elem_size);
 	val = htole16(val);
 	memcpy(p, &val, sizeof(val));
 	return 0;
 }
 
-int
-qwx_qmi_encode_dword(uint8_t *p, const struct qmi_elem_info *ei, void *input,
+static int
+qmi_encode_dword(uint8_t *p, const struct qmi_elem_info *ei, const void *input,
     int i)
 {
 	uint32_t val;
@@ -870,14 +905,15 @@ qwx_qmi_encode_dword(uint8_t *p, const struct qmi_elem_info *ei, void *input,
 	if (p == NULL)
 		return 0;
 
-	memcpy(&val, input + ei->offset + (i * ei->elem_size), ei->elem_size);
+	memcpy(&val, (const uint8_t *)input + ei->offset + (i * ei->elem_size),
+	    ei->elem_size);
 	val = htole32(val);
 	memcpy(p, &val, sizeof(val));
 	return 0;
 }
 
-int
-qwx_qmi_encode_qword(uint8_t *p, const struct qmi_elem_info *ei, void *input,
+static int
+qmi_encode_qword(uint8_t *p, const struct qmi_elem_info *ei, const void *input,
     int i)
 {
 	uint64_t val;
@@ -890,26 +926,94 @@ qwx_qmi_encode_qword(uint8_t *p, const struct qmi_elem_info *ei, void *input,
 	if (p == NULL)
 		return 0;
 
-	memcpy(&val, input + ei->offset + (i * ei->elem_size), ei->elem_size);
+	memcpy(&val, (const uint8_t *)input + ei->offset + (i * ei->elem_size),
+	    ei->elem_size);
 	val = htole64(val);
 	memcpy(p, &val, sizeof(val));
 	return 0;
 }
 
-int
-qwx_qmi_encode_struct(uint8_t *p, size_t *encoded_len,
-    const struct qmi_elem_info *struct_ei, void *input, size_t input_len)
+/*
+ * Encode a string.  Strings nested in structs are preceded by an in-band
+ * length field; a string of its own TLV takes the length from the TLV
+ * header.  If p is NULL, only compute the encoded length.  Otherwise,
+ * out_len is the space available at p.
+ */
+static int
+qmi_encode_string(uint8_t *p, size_t out_len, size_t *encoded_len,
+    const struct qmi_elem_info *string_ei, const void *input, int nested)
 {
-	const struct qmi_elem_info *ei = struct_ei->ei_array;
-	size_t remain = input_len;
+	size_t len, hdrlen = 0;
 
 	*encoded_len = 0;
 
+	/* elem_len is the size of the char array, including the NUL. */
+	len = strnlen(input, string_ei->elem_len);
+	if (len >= string_ei->elem_len) {
+		printf("%s: QMI string is not NUL-terminated\n", __func__);
+		return -1;
+	}
+
+	if (nested)
+		hdrlen = (string_ei->elem_len <= 0xff) ? 1 : 2;
+
+	if (p) {
+		if (hdrlen + len > out_len) {
+			printf("%s: QMI message buffer too short\n", __func__);
+			return -1;
+		}
+		if (hdrlen == 1)
+			p[0] = len & 0xff;
+		else if (hdrlen == 2) {
+			p[0] = len & 0xff;
+			p[1] = (len >> 8) & 0xff;
+		}
+		memcpy(p + hdrlen, input, len);
+	}
+
+	*encoded_len = hdrlen + len;
+	return 0;
+}
+
+/*
+ * Encode a struct, which has no TLV headers of its own.  input_len is
+ * the size of the C struct at input.  If p is NULL, only compute the
+ * encoded length.  Otherwise, out_len is the space available at p.
+ */
+static int
+qmi_encode_struct(uint8_t *p, size_t out_len, size_t *encoded_len,
+    const struct qmi_elem_info *struct_ei, const void *input, size_t input_len,
+    int nested)
+{
+	const struct qmi_elem_info *ei = struct_ei->ei_array;
+	size_t remain = out_len;
+
+	*encoded_len = 0;
+
+	if (ei == NULL) {
+		printf("%s: QMI struct element 0x%x without element info\n",
+		    __func__, struct_ei->tlv_type);
+		return -1;
+	}
+	if (nested > 2) {
+		printf("%s: QMI struct element is nested too deeply\n",
+		    __func__);
+		return -1;
+	}
+
 	while (ei->data_type != QMI_EOTI) {
+		uint32_t nelem = 1, i;
+
+		if (ei->offset + sizeof(uint8_t) > input_len) {
+			printf("%s: bad input buffer offset\n", __func__);
+			return -1;
+		}
+
 		if (ei->data_type == QMI_OPT_FLAG) {
 			uint8_t do_encode, tlv_type;
 
-			memcpy(&do_encode, input + ei->offset, sizeof(uint8_t));
+			memcpy(&do_encode, (const uint8_t *)input + ei->offset,
+			    sizeof(uint8_t));
 			ei++; /* Advance to element we might have to encode. */
 			if (ei->data_type == QMI_OPT_FLAG ||
 			    ei->data_type == QMI_EOTI) {
@@ -927,84 +1031,287 @@ qwx_qmi_encode_struct(uint8_t *p, size_t *encoded_len,
 			}
 		}
 
-		if (ei->elem_size > remain) {
-			printf("%s: QMI message buffer too short\n", __func__);
+		if (ei->data_type == QMI_DATA_LEN) {
+			uint32_t datalen = 0;
+
+			if (ei->offset + sizeof(uint32_t) > input_len) {
+				printf("%s: bad input buffer offset\n",
+				    __func__);
+				return -1;
+			}
+			if (p != NULL && ei->elem_size > remain) {
+				printf("%s: QMI message buffer too short\n",
+				    __func__);
+				return -1;
+			}
+			if (qmi_encode_datalen(p, &datalen, ei, input))
+				return -1;
+			remain -= (p != NULL) ? ei->elem_size : 0;
+			if (p != NULL)
+				p += ei->elem_size;
+			*encoded_len += ei->elem_size;
+			ei++;
+			if (ei->data_type == QMI_EOTI ||
+			    ei->array_type != VAR_LEN_ARRAY) {
+				printf("%s: data len not for a var array\n",
+				    __func__);
+				return -1;
+			}
+			if (datalen > ei->elem_len) {
+				printf("%s: QMI array of %u elements exceeds "
+				    "maximum of %u\n", __func__, datalen,
+				    ei->elem_len);
+				return -1;
+			}
+			nelem = datalen;
+		} else if (ei->array_type == STATIC_ARRAY &&
+		    ei->data_type != QMI_STRING) {
+			nelem = ei->elem_len;
+		} else if (ei->array_type == VAR_LEN_ARRAY) {
+			printf("%s: var array without data len\n", __func__);
 			return -1;
 		}
 
-		switch (ei->data_type) {
-		case QMI_UNSIGNED_1_BYTE:
-			if (qwx_qmi_encode_byte(p, ei, input, 0))
+		if (ei->data_type == QMI_STRING) {
+			if (ei->offset + (size_t)ei->elem_len > input_len) {
+				printf("%s: bad input buffer offset\n",
+				    __func__);
 				return -1;
-			break;
-		case QMI_UNSIGNED_2_BYTE:
-			if (qwx_qmi_encode_word(p, ei, input, 0))
-				return -1;
-			break;
-		case QMI_UNSIGNED_4_BYTE:
-		case QMI_SIGNED_4_BYTE_ENUM:
-			if (qwx_qmi_encode_dword(p, ei, input, 0))
-				return -1;
-			break;
-		case QMI_UNSIGNED_8_BYTE:
-			if (qwx_qmi_encode_qword(p, ei, input, 0))
-				return -1;
-			break;
-		default:
-			printf("%s: unhandled QMI struct element type %d\n",
-			    __func__, ei->data_type);
+			}
+		} else if (ei->offset + (size_t)nelem * ei->elem_size >
+		    input_len) {
+			printf("%s: bad input buffer offset\n", __func__);
 			return -1;
 		}
 
-		remain -= ei->elem_size;
-		if (p != NULL)
-			p += ei->elem_size;
-		*encoded_len += ei->elem_size;
+		for (i = 0; i < nelem; i++) {
+			size_t used = 0;
+			size_t inoff = ei->offset + (i * ei->elem_size);
+
+			switch (ei->data_type) {
+			case QMI_UNSIGNED_1_BYTE:
+			case QMI_UNSIGNED_2_BYTE:
+			case QMI_SIGNED_2_BYTE_ENUM:
+			case QMI_UNSIGNED_4_BYTE:
+			case QMI_SIGNED_4_BYTE_ENUM:
+			case QMI_UNSIGNED_8_BYTE:
+				if (p != NULL && ei->elem_size > remain) {
+					printf("%s: QMI message buffer too "
+					    "short\n", __func__);
+					return -1;
+				}
+				used = ei->elem_size;
+				break;
+			default:
+				break;
+			}
+
+			switch (ei->data_type) {
+			case QMI_UNSIGNED_1_BYTE:
+				if (qmi_encode_byte(p, ei, input, i))
+					return -1;
+				break;
+			case QMI_UNSIGNED_2_BYTE:
+			case QMI_SIGNED_2_BYTE_ENUM:
+				if (qmi_encode_word(p, ei, input, i))
+					return -1;
+				break;
+			case QMI_UNSIGNED_4_BYTE:
+			case QMI_SIGNED_4_BYTE_ENUM:
+				if (qmi_encode_dword(p, ei, input, i))
+					return -1;
+				break;
+			case QMI_UNSIGNED_8_BYTE:
+				if (qmi_encode_qword(p, ei, input, i))
+					return -1;
+				break;
+			case QMI_STRUCT:
+				if (qmi_encode_struct(p, remain, &used, ei,
+				    (const uint8_t *)input + inoff,
+				    ei->elem_size, nested + 1))
+					return -1;
+				break;
+			case QMI_STRING:
+				if (qmi_encode_string(p, remain, &used, ei,
+				    (const uint8_t *)input + inoff, 1))
+					return -1;
+				break;
+			default:
+				printf("%s: unhandled QMI struct element "
+				    "type %d\n", __func__, ei->data_type);
+				return -1;
+			}
+
+			if (p != NULL) {
+				remain -= used;
+				p += used;
+			}
+			*encoded_len += used;
+		}
 		ei++;
 	}
 
 	return 0;
 }
 
-int
-qwx_qmi_encode_string(uint8_t *p, size_t *encoded_len,
-    const struct qmi_elem_info *string_ei, void *input, size_t input_len)
+/*
+ * Encode the value of the top-level TLV element described by ei,
+ * which has been advanced past a QMI_OPT_FLAG, if any.  Returns the
+ * element info following the element in *next_ei.  If p is NULL, only
+ * compute the encoded length.  Otherwise, out_len is the space at p.
+ */
+static int
+qmi_encode_tlv_value(uint8_t *p, size_t out_len, size_t *encoded_len,
+    const struct qmi_elem_info **next_ei, const struct qmi_elem_info *ei,
+    const void *input, size_t input_len)
 {
-	*encoded_len = strnlen(input, input_len);
-	if (*encoded_len > string_ei->elem_len) {
-		printf("%s: QMI message buffer too short\n", __func__);
+	size_t remain = out_len;
+	uint32_t datalen = 0;
+	uint32_t nelem = 1, i;
+
+	*encoded_len = 0;
+
+	if (ei->data_type == QMI_DATA_LEN) {
+		if (ei->offset + sizeof(uint32_t) > input_len) {
+			printf("%s: bad input buffer offset\n", __func__);
+			return -1;
+		}
+		if (p != NULL && ei->elem_size > remain) {
+			printf("%s: QMI message buffer too short\n", __func__);
+			return -1;
+		}
+		if (qmi_encode_datalen(p, &datalen, ei, input))
+			return -1;
+		if (p != NULL) {
+			p += ei->elem_size;
+			remain -= ei->elem_size;
+		}
+		*encoded_len += ei->elem_size;
+		ei++;
+		if (ei->data_type == QMI_EOTI ||
+		    ei->array_type != VAR_LEN_ARRAY ||
+		    ei->tlv_type != (ei - 1)->tlv_type) {
+			printf("%s: data len not for a var array\n",
+			    __func__);
+			return -1;
+		}
+		if (datalen > ei->elem_len) {
+			printf("%s: QMI array of %u elements exceeds "
+			    "maximum of %u\n", __func__, datalen, ei->elem_len);
+			return -1;
+		}
+		nelem = datalen;
+	} else if (ei->array_type == STATIC_ARRAY &&
+	    ei->data_type != QMI_STRING) {
+		nelem = ei->elem_len;
+	} else if (ei->array_type == VAR_LEN_ARRAY) {
+		printf("%s: var array without data len\n", __func__);
 		return -1;
 	}
 
-	if (p)
-		memcpy(p, input, *encoded_len);
+	if (ei->data_type == QMI_STRING) {
+		if (ei->offset + (size_t)ei->elem_len > input_len) {
+			printf("%s: bad input buffer offset\n", __func__);
+			return -1;
+		}
+	} else if (ei->offset + (size_t)nelem * ei->elem_size > input_len) {
+		printf("%s: bad input buffer offset at element 0x%x "
+		    "data type 0x%x\n",
+		    __func__, ei->tlv_type, ei->data_type);
+		return -1;
+	}
 
+	for (i = 0; i < nelem; i++) {
+		size_t used = 0;
+		size_t inoff = ei->offset + (i * ei->elem_size);
+
+		switch (ei->data_type) {
+		case QMI_UNSIGNED_1_BYTE:
+		case QMI_UNSIGNED_2_BYTE:
+		case QMI_SIGNED_2_BYTE_ENUM:
+		case QMI_UNSIGNED_4_BYTE:
+		case QMI_SIGNED_4_BYTE_ENUM:
+		case QMI_UNSIGNED_8_BYTE:
+			if (p != NULL && ei->elem_size > remain) {
+				printf("%s: QMI message buffer too short\n",
+				    __func__);
+				return -1;
+			}
+			used = ei->elem_size;
+			break;
+		default:
+			break;
+		}
+
+		switch (ei->data_type) {
+		case QMI_UNSIGNED_1_BYTE:
+			if (qmi_encode_byte(p, ei, input, i))
+				return -1;
+			break;
+		case QMI_UNSIGNED_2_BYTE:
+		case QMI_SIGNED_2_BYTE_ENUM:
+			if (qmi_encode_word(p, ei, input, i))
+				return -1;
+			break;
+		case QMI_UNSIGNED_4_BYTE:
+		case QMI_SIGNED_4_BYTE_ENUM:
+			if (qmi_encode_dword(p, ei, input, i))
+				return -1;
+			break;
+		case QMI_UNSIGNED_8_BYTE:
+			if (qmi_encode_qword(p, ei, input, i))
+				return -1;
+			break;
+		case QMI_STRUCT:
+			if (qmi_encode_struct(p, remain, &used, ei,
+			    (const uint8_t *)input + inoff, ei->elem_size, 0))
+				return -1;
+			break;
+		case QMI_STRING:
+			if (qmi_encode_string(p, remain, &used, ei,
+			    (const uint8_t *)input + inoff, 0))
+				return -1;
+			break;
+		default:
+			printf("%s: unhandled QMI message element type %d\n",
+			    __func__, ei->data_type);
+			return -1;
+		}
+
+		if (p != NULL) {
+			remain -= used;
+			p += used;
+		}
+		*encoded_len += used;
+	}
+
+	if (*encoded_len > 0xffff) {
+		printf("%s: QMI element 0x%x too large: %zu\n", __func__,
+		    ei->tlv_type, *encoded_len);
+		return -1;
+	}
+
+	*next_ei = ei + 1;
 	return 0;
 }
 
-int
-qwx_qmi_encode_msg(uint8_t **encoded_msg, size_t *encoded_len, int type,
-    uint16_t *txn_id, uint16_t msg_id, size_t msg_len,
-    const struct qmi_elem_info *ei, void *input, size_t input_len)
+static int
+qmi_encode_msg(uint8_t **encoded_msg, size_t *encoded_len, int type,
+    uint16_t txn_id, uint16_t msg_id, size_t msg_len,
+    const struct qmi_elem_info *ei, const void *input, size_t input_len)
 {
 	const struct qmi_elem_info *ei0 = ei;
 	struct qmi_header hdr;
 	size_t remain;
 	uint8_t *p, *op;
+	int error = -EINVAL;
 
 	*encoded_msg = NULL;
 	*encoded_len = 0;
 
 	/* First pass: Determine length of encoded message. */
 	while (ei->data_type != QMI_EOTI) {
-		int nelem = 1, i;
-
-		if (ei->offset + ei->elem_size > input_len) {
-			printf("%s: bad input buffer offset at element 0x%x "
-			    "data type 0x%x\n",
-			    __func__, ei->tlv_type, ei->data_type);
-			goto err;
-		}
+		size_t value_len = 0;
 
 		/*
 		 * OPT_FLAG determines whether the next element
@@ -1013,7 +1320,13 @@ qwx_qmi_encode_msg(uint8_t **encoded_msg, size_t *encoded_len, int type,
 		if (ei->data_type == QMI_OPT_FLAG) {
 			uint8_t do_encode, tlv_type;
 
-			memcpy(&do_encode, input + ei->offset, sizeof(uint8_t));
+			if (ei->offset + sizeof(uint8_t) > input_len) {
+				printf("%s: bad input buffer offset\n",
+				    __func__);
+				goto err;
+			}
+			memcpy(&do_encode, (const uint8_t *)input + ei->offset,
+			    sizeof(uint8_t));
 			ei++; /* Advance to element we might have to encode. */
 			if (ei->data_type == QMI_OPT_FLAG ||
 			    ei->data_type == QMI_EOTI) {
@@ -1030,59 +1343,29 @@ qwx_qmi_encode_msg(uint8_t **encoded_msg, size_t *encoded_len, int type,
 			}
 		}
 
-		*encoded_len += 3; /* type, length */
-		if (ei->data_type == QMI_DATA_LEN) {
-			uint32_t datalen = 0;
-			uint8_t dummy[2];
+		if (qmi_encode_tlv_value(NULL, 0, &value_len, &ei, ei,
+		    input, input_len))
+			goto err;
+		*encoded_len += 3 + value_len; /* type, length, value */
+	}
 
-			if (qwx_qmi_encode_datalen(dummy, &datalen, ei, input))
-				goto err;
-			*encoded_len += ei->elem_size;
-			ei++;
-			if (ei->array_type != VAR_LEN_ARRAY) {
-				printf("%s: data len not for a var array\n",
-				    __func__);
-				goto err;
-			}
-			nelem = datalen;
-			if (ei->data_type == QMI_STRUCT) {
-				for (i = 0; i < nelem; i++) {
-					size_t encoded_struct_len = 0;
-					size_t inoff = ei->offset + (i * ei->elem_size);
-
-					if (qwx_qmi_encode_struct(NULL,
-					    &encoded_struct_len, ei,
-					    input + inoff, input_len - inoff))
-						goto err;
-
-					*encoded_len += encoded_struct_len;
-				}
-			} else
-				*encoded_len += nelem * ei->elem_size;
-			ei++;
-		} else if (ei->data_type == QMI_STRING) {
-			size_t encoded_string_len = 0;
-			size_t inoff = ei->offset;
-
-			if (qwx_qmi_encode_string(NULL,
-			    &encoded_string_len, ei,
-			    input + inoff, input_len - inoff))
-				goto err;
-			*encoded_len += encoded_string_len;
-			ei++;
-		} else {
-			*encoded_len += ei->elem_size;
-			ei++;
-		}
+	if (*encoded_len > msg_len) {
+		printf("%s: QMI message 0x%x of %zu bytes exceeds "
+		    "maximum length %zu\n", __func__, msg_id,
+		    *encoded_len, msg_len);
+		error = -EMSGSIZE;
+		goto err;
 	}
 
 	*encoded_len += sizeof(hdr);
-	*encoded_msg = malloc(*encoded_len, M_DEVBUF, M_NOWAIT | M_ZERO);
-	if (*encoded_msg == NULL)
-		return ENOMEM;
+	*encoded_msg = kzalloc(*encoded_len, GFP_KERNEL);
+	if (*encoded_msg == NULL) {
+		*encoded_len = 0;
+		return -ENOMEM;
+	}
 
 	hdr.type = type;
-	hdr.txn_id = htole16(*txn_id);
+	hdr.txn_id = htole16(txn_id);
 	hdr.msg_id = htole16(msg_id);
 	hdr.msg_len = htole16(*encoded_len - sizeof(hdr));
 	memcpy(*encoded_msg, &hdr, sizeof(hdr));
@@ -1092,13 +1375,14 @@ qwx_qmi_encode_msg(uint8_t **encoded_msg, size_t *encoded_len, int type,
 	p = *encoded_msg + sizeof(hdr);
 	remain = *encoded_len - sizeof(hdr);
 	while (ei->data_type != QMI_EOTI) {
-		uint32_t datalen = 0;
-		int nelem = 1, i;
+		const struct qmi_elem_info *tlv_ei;
+		size_t value_len = 0;
 
 		if (ei->data_type == QMI_OPT_FLAG) {
 			uint8_t do_encode, tlv_type;
 
-			memcpy(&do_encode, input + ei->offset, sizeof(uint8_t));
+			memcpy(&do_encode, (const uint8_t *)input + ei->offset,
+			    sizeof(uint8_t));
 			ei++; /* Advance to element we might have to encode. */
 			if (ei->data_type == QMI_OPT_FLAG ||
 			    ei->data_type == QMI_EOTI) {
@@ -1116,7 +1400,7 @@ qwx_qmi_encode_msg(uint8_t **encoded_msg, size_t *encoded_len, int type,
 			}
 		}
 
-		if (ei->elem_size + 3 > remain) {
+		if (3 > remain) {
 			printf("%s: QMI message buffer too short\n", __func__);
 			goto err;
 		}
@@ -1124,97 +1408,85 @@ qwx_qmi_encode_msg(uint8_t **encoded_msg, size_t *encoded_len, int type,
 		/* 3 bytes of type-length-value header, remember for later */
 		op = p;
 		p += 3;
+		remain -= 3;
+		tlv_ei = ei;
 
-		if (ei->data_type == QMI_DATA_LEN) {
-			if (qwx_qmi_encode_datalen(p, &datalen, ei, input))
-				goto err;
-			p += ei->elem_size;
-			ei++;
-			if (ei->array_type == VAR_LEN_ARRAY)
-				nelem = datalen;
-		}
+		if (qmi_encode_tlv_value(p, remain, &value_len, &ei, ei,
+		    input, input_len))
+			goto err;
+		p += value_len;
+		remain -= value_len;
 
-		for (i = 0; i < nelem; i++) {
-			size_t encoded_struct_len = 0;
-			size_t encoded_string_len = 0;
-			size_t inoff = ei->offset + (i * ei->elem_size);
-
-			switch (ei->data_type) {
-			case QMI_UNSIGNED_1_BYTE:
-				if (qwx_qmi_encode_byte(p, ei, input, i))
-					goto err;
-				remain -= ei->elem_size;
-				p += ei->elem_size;
-				break;
-			case QMI_UNSIGNED_2_BYTE:
-			case QMI_SIGNED_2_BYTE_ENUM:
-				if (qwx_qmi_encode_word(p, ei, input, i))
-					goto err;
-				remain -= ei->elem_size;
-				p += ei->elem_size;
-				break;
-			case QMI_UNSIGNED_4_BYTE:
-			case QMI_SIGNED_4_BYTE_ENUM:
-				if (qwx_qmi_encode_dword(p, ei, input, i))
-					goto err;
-				remain -= ei->elem_size;
-				p += ei->elem_size;
-				break;
-			case QMI_UNSIGNED_8_BYTE:
-				if (qwx_qmi_encode_qword(p, ei, input, i))
-					goto err;
-				remain -= ei->elem_size;
-				p += ei->elem_size;
-				break;
-			case QMI_STRUCT:
-				if (qwx_qmi_encode_struct(p,
-				    &encoded_struct_len, ei,
-				    input + inoff, input_len - inoff))
-					goto err;
-				remain -= encoded_struct_len;
-				p += encoded_struct_len;
-				break;
-			case QMI_STRING:
-				if (qwx_qmi_encode_string(p,
-				    &encoded_string_len, ei,
-				    input + inoff, input_len - inoff))
-					goto err;
-				remain -= encoded_string_len;
-				p += encoded_string_len;
-				break;
-			default:
-				printf("%s: unhandled QMI message element type %d\n",
-				    __func__, ei->data_type);
-				goto err;
-			}
-		}
-
-		op[0] = ei->tlv_type;
-		op[1] = (p - (op + 3)) & 0xff;
-		op[2] = ((p - (op + 3)) >> 8) & 0xff;
-
-		ei++;
+		op[0] = tlv_ei->tlv_type;
+		op[1] = value_len & 0xff;
+		op[2] = (value_len >> 8) & 0xff;
 	}
 
-	if (0) {
-		int i;
-		DNPRINTF(QWX_D_QMI,
-		   "%s: message type 0x%x txnid 0x%x msgid 0x%x "
-		    "msglen %zu encoded:", __func__,
-		    type, *txn_id, msg_id, *encoded_len - sizeof(hdr));
-		for (i = 0; i < *encoded_len; i++) {
-			DNPRINTF(QWX_D_QMI, "%s %.2x", i % 16 == 0 ? "\n" : "",
-			    (*encoded_msg)[i]);
-		}
-		if (i % 16)
-			DNPRINTF(QWX_D_QMI, "\n");
+	if (remain != 0) {
+		printf("%s: QMI message length changed while encoding\n",
+		    __func__);
+		goto err;
 	}
 
-	(*txn_id)++; /* wrap-around is fine */
 	return 0;
 err:
-	free(*encoded_msg, M_DEVBUF, *encoded_len);
+	kfree(*encoded_msg);
 	*encoded_msg = NULL;
 	*encoded_len = 0;
-	return -1;
+	return error;
+}
+
+void *
+qmi_encode_message(int type, unsigned int msg_id, size_t *len,
+    unsigned int txn_id, const struct qmi_elem_info *ei, const void *c_struct)
+{
+	uint8_t *msg;
+	size_t encoded_len, input_len;
+	int error;
+
+	if (len == NULL || ei == NULL)
+		return ERR_PTR(-EINVAL);
+	input_len = qmi_struct_size(ei);
+	if (c_struct == NULL && input_len != 0)
+		return ERR_PTR(-EINVAL);
+
+	error = qmi_encode_msg(&msg, &encoded_len, type, txn_id, msg_id,
+	    *len, ei, c_struct, input_len);
+	if (error != 0)
+		return ERR_PTR(error);
+
+	*len = encoded_len;
+	return msg;
+}
+
+int
+qmi_decode_message(const void *buf, size_t len,
+    const struct qmi_elem_info *ei, void *c_struct)
+{
+	struct qmi_header hdr;
+	size_t output_len;
+	uint16_t msg_len;
+
+	if (buf == NULL || ei == NULL)
+		return -EINVAL;
+	output_len = qmi_struct_size(ei);
+	if (c_struct == NULL && output_len != 0)
+		return -EINVAL;
+
+	if (len < sizeof(hdr)) {
+		printf("%s: QMI message too short\n", __func__);
+		return -EINVAL;
+	}
+	memcpy(&hdr, buf, sizeof(hdr));
+	msg_len = le16toh(hdr.msg_len);
+	if (sizeof(hdr) + msg_len != len) {
+		printf("%s: bad QMI message length %u\n", __func__, msg_len);
+		return -EINVAL;
+	}
+
+	if (qmi_decode_msg(c_struct, output_len, ei,
+	    (const uint8_t *)buf + sizeof(hdr), msg_len))
+		return -EINVAL;
+
+	return 0;
 }
