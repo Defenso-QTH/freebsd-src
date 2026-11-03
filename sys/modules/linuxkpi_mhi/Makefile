@@ -4,8 +4,12 @@ LKPISRCDIR=	${SRCTOP}/sys/compat/linuxkpi/common/src
 
 KMOD=	linuxkpi_mhi
 
+# MHI host core, from OpenBSD's qwx(4).
+SRCS=	linux_mhi.c
+# Interrupts, sysctls and the module handler.
+SRCS+=	linux_mhi_bus.c
 # QRTR over MHI and the QMI client interface.
-SRCS=	linux_qmi_encdec.c linux_qrtr.c
+SRCS+=	linux_qmi_encdec.c linux_qrtr.c
 
 SRCS+=	${LINUXKPI_GENSRCS}
 SRCS+=	opt_wlan.h
