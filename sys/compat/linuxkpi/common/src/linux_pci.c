@@ -1445,19 +1445,19 @@ lkpi_pci_msi_desc_alloc(unsigned int irq)
 
 	vec = pdev->dev.irq_start - irq;
 
-	if (pdev->msi_desc[vec] != NULL)
-		return (pdev->msi_desc[vec]);
+	desc = pdev->msi_desc[vec];
 
 	dinfo = device_get_ivars(dev->bsddev);
 	msi = &dinfo->cfg.msi;
 
-	desc = malloc(sizeof(*desc), M_DEVBUF, M_WAITOK | M_ZERO);
+	if (desc == NULL) {
+		desc = malloc(sizeof(*desc), M_DEVBUF, M_WAITOK | M_ZERO);
+		pdev->msi_desc[vec] = desc;
+	}
 
 	desc->pci.msi_attrib.is_64 =
 	   (msi->msi_ctrl & PCIM_MSICTRL_64BIT) ? true : false;
 	desc->msg.data = msi->msi_data;
-
-	pdev->msi_desc[vec] = desc;
 
 	return (desc);
 }
