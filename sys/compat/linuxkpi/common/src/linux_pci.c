@@ -1436,24 +1436,20 @@ lkpi_pci_msi_desc_alloc(unsigned int irq)
 		return (NULL);
 
 	vec = irq - pdev->dev.irq_start;
+	/* XXX MSI-X descriptors are not implemented. */
 	if (!pdev->msi_enabled || vec >= pci_msi_count(dev->bsddev))
 		return (NULL);
 
 	desc = pdev->msi_desc[vec];
+
+	dinfo = device_get_ivars(dev->bsddev);
+	msi = &dinfo->cfg.msi;
+
 	if (desc == NULL) {
 		desc = malloc(sizeof(*desc), M_DEVBUF, M_WAITOK | M_ZERO);
 		pdev->msi_desc[vec] = desc;
 	}
 
-	/*
-	 * The MSI message is only programmed once the first interrupt
-	 * handler is set up, and is reprogrammed when the interrupt moves,
-	 * so refresh it on every call rather than caching the value seen
-	 * before request_irq().  Vectors of a multi-message MSI share the
-	 * address and use consecutive data values.
-	 */
-	dinfo = device_get_ivars(dev->bsddev);
-	msi = &dinfo->cfg.msi;
 	desc->pci.msi_attrib.is_64 =
 	   (msi->msi_ctrl & PCIM_MSICTRL_64BIT) ? true : false;
 	desc->msg.data = msi->msi_data + vec;
