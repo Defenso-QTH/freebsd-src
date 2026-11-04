@@ -1443,7 +1443,10 @@ lkpi_pci_msi_desc_alloc(unsigned int irq)
 	if (irq < pdev->dev.irq_start || irq >= pdev->dev.irq_end)
 		return (NULL);
 
-	vec = pdev->dev.irq_start - irq;
+	vec = irq - pdev->dev.irq_start;
+	/* XXX MSI-X descriptors are not implemented. */
+	if (!pdev->msi_enabled || vec >= pci_msi_count(dev->bsddev))
+		return (NULL);
 
 	desc = pdev->msi_desc[vec];
 
@@ -1457,7 +1460,7 @@ lkpi_pci_msi_desc_alloc(unsigned int irq)
 
 	desc->pci.msi_attrib.is_64 =
 	   (msi->msi_ctrl & PCIM_MSICTRL_64BIT) ? true : false;
-	desc->msg.data = msi->msi_data;
+	desc->msg.data = msi->msi_data + vec;
 
 	return (desc);
 }
