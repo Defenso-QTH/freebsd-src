@@ -805,8 +805,9 @@ qrtr_mhi_dl_cb(struct mhi_device *mhi_dev, struct mhi_result *res)
 		kfree(res->buf_addr);
 		return;
 	}
+	/* A failed transfer carries no packet, but the buffer is reused. */
 	if (ep == NULL || res->transaction_status != 0)
-		return;
+		goto recycle;
 
 	/* Completion context: copy and hand over to the worker. */
 	rx = malloc(sizeof(*rx) + res->bytes_xferd, M_QRTR, M_NOWAIT);
@@ -822,7 +823,7 @@ qrtr_mhi_dl_cb(struct mhi_device *mhi_dev, struct mhi_result *res)
 		    res->bytes_xferd);
 	}
 
-	/* Recycle the buffer. */
+recycle:
 	error = mhi_queue_buf(mhi_dev, DMA_FROM_DEVICE, res->buf_addr,
 	    mhi_dev->mhi_cntrl->buffer_len, MHI_EOT);
 	if (error != 0) {
