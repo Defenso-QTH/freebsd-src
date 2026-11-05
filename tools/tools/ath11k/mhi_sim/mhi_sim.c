@@ -175,6 +175,7 @@ struct mhisim {
 	uint64_t		ch_rp[SIM_NCH];
 	bool			ch_running[SIM_NCH];
 	bool			hello_sent;
+	bool			overflow_sent;
 	bool			m3;		/* suspended: no doorbells */
 	STAILQ_HEAD(, sim_msg)	dlq;		/* to the host, on channel 21 */
 
@@ -184,6 +185,7 @@ struct mhisim {
 	bool			bhi_ok, bhie_ok, greeted, resumed;
 	bool			req_ok;
 	int			nreq;
+	int			dl_avail;	/* receive buffers, request in */
 	int			host_port;
 };
 
@@ -191,7 +193,10 @@ static struct mhisim *sim;
 static struct sx sim_sx;
 SX_SYSINIT(mhisim, &sim_sx, "mhisim run");
 static char sim_result[1024] = "not run";
-/* Fault to inject: 1 BHI error, 2 no event ring interrupts. */
+/*
+ * Fault to inject: 1 BHI error, 2 no event ring interrupts, 3 one receive
+ * buffer completed with an overflow.
+ */
 static int sim_inject;
 
 #define	SIMLOG(fmt, ...) do {						\
@@ -803,6 +808,21 @@ sim_cmd_task(void *arg __unused, int pending __unused)
 	mtx_unlock(&sim->lock);
 }
 
+/* Receive buffers the host has queued on channel 21.  Locked. */
+static int
+sim_dl_avail(void)
+{
+	struct mhi_chan_ctxt *cc;
+	uint64_t len;
+
+	cc = sim_ch_ctxt(21);
+	len = le64_to_cpu(cc->rlen);
+	if (len == 0)
+		return (0);
+	return ((sim->chdb[21] - sim->ch_rp[21] + len) % len /
+	    sizeof(struct mhi_ring_element));
+}
+
 /* Fill the host's receive buffers on channel 21.  Locked. */
 static void
 sim_dl_deliver(void)
@@ -819,6 +839,27 @@ sim_dl_deliver(void)
 	cc = sim_ch_ctxt(ch);
 	base = le64_to_cpu(cc->rbase);
 	len = le64_to_cpu(cc->rlen);
+	/* Once the request is in, the host has queued all its buffers. */
+	if (sim->req_ok && sim->dl_avail < 0)
+		sim->dl_avail = sim_dl_avail();
+	/* A buffer completed with an overflow carries no packet. */
+	if (sim_inject == 3 && sim->req_ok && !sim->overflow_sent &&
+	    sim->ch_rp[ch] != sim->chdb[ch]) {
+		sim->overflow_sent = true;
+		rp = sim->ch_rp[ch];
+		el = sim_dmap(rp);
+		blen = FIELD_GET(MHI_TRE0_DATA_LEN_MASK,
+		    le32_to_cpu(el->dword[0]));
+		SIMLOG("DL: injecting an overflow");
+		sim->ch_rp[ch] = rp + sizeof(*el) == base + len ? base :
+		    rp + sizeof(*el);
+		cc->rp = cpu_to_le64(sim->ch_rp[ch]);
+		sim_post_event(le32_to_cpu(cc->erindex), rp,
+		    FIELD_PREP(GENMASK(31, 24), MHI_EV_CC_OVERFLOW) |
+		    FIELD_PREP(GENMASK(15, 0), blen),
+		    FIELD_PREP(GENMASK(31, 24), ch) |
+		    FIELD_PREP(GENMASK(23, 16), MHI_PKT_TYPE_TX_EVENT));
+	}
 	while ((m = STAILQ_FIRST(&sim->dlq)) != NULL &&
 	    sim->ch_rp[ch] != sim->chdb[ch]) {
 		rp = sim->ch_rp[ch];
@@ -1216,6 +1257,7 @@ sim_setup(void)
 	sim = malloc(sizeof(*sim), M_MHISIM, M_WAITOK | M_ZERO);
 	mtx_init(&sim->lock, "mhisim state", NULL, MTX_DEF);
 	STAILQ_INIT(&sim->dlq);
+	sim->dl_avail = -1;
 	sim->regbase = malloc(SIM_REGLEN, M_MHISIM, M_WAITOK | M_ZERO);
 
 	sim->tq = taskqueue_create("mhisim", M_WAITOK,
@@ -1443,6 +1485,14 @@ sim_run(int mode)
 		pause("mhisim", hz / 50);
 	if (!sim->resumed)
 		SIMERR("QRTR: no resume_tx for confirm_rx");
+	/* Every completed receive buffer is queued again. */
+	pause("mhisim", hz / 10);
+	mtx_lock(&sim->lock);
+	i = sim_dl_avail();
+	mtx_unlock(&sim->lock);
+	if (i < sim->dl_avail)
+		SIMERR("QRTR: %d receive buffer(s) on channel 21, %d at start",
+		    i, sim->dl_avail);
 	if (mode != 2)
 		goto out;
 
@@ -1566,7 +1616,8 @@ SYSCTL_PROC(_debug_mhisim, OID_AUTO, run,
     "Run the power up, QMI exchange and power down test (1), with a "
     "suspend and resume (2)");
 SYSCTL_INT(_debug_mhisim, OID_AUTO, inject, CTLFLAG_RW, &sim_inject, 0,
-    "Fault to inject: 1 BHI error, 2 no event ring interrupts");
+    "Fault to inject: 1 BHI error, 2 no event ring interrupts, "
+    "3 receive overflow");
 SYSCTL_STRING(_debug_mhisim, OID_AUTO, result, CTLFLAG_RD, sim_result, 0,
     "Result of the last run");
 
