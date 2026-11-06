@@ -286,6 +286,12 @@ setup(void)
 		fprintf(stderr, "Cannot find file dump list\n");
 		done(1);
 	}
+	if (spcl.c_count < 0 ||
+	    (ino_t)spcl.c_count * TP_BSIZE * NBBY + 1 > maxino) {
+		fprintf(stderr, "Corrupted dump: list of dumped files is "
+		    "larger than the file system\n");
+		done(1);
+	}
 	map = calloc((unsigned)1, (unsigned)howmany(maxino, NBBY));
 	if (map == (char *)NULL)
 		panic("no memory for file dump list\n");
