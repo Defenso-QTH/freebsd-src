@@ -499,22 +499,32 @@ ieee80211_scan_next(struct ieee80211vap *vap)
  * Manually stop a scan that is currently running.
  * Provided for drivers that are not able to scan single channels
  * (e.g. for firmware-based devices).
+ * The scanning vap is looked up under the lock, as it may have been
+ * detached before the device reported the end of its scan.
+ * Returns false if no vap is scanning.
  */
-void
-ieee80211_scan_done(struct ieee80211vap *vap)
+bool
+ieee80211_scan_done(struct ieee80211com *ic)
 {
-	struct ieee80211com *ic = vap->iv_ic;
 	struct ieee80211_scan_state *ss;
-
-	IEEE80211_DPRINTF(vap, IEEE80211_MSG_SCAN, "%s: called\n", __func__);
+	struct ieee80211vap *vap;
 
 	IEEE80211_LOCK(ic);
 	ss = ic->ic_scan;
+	vap = ss->ss_vap;
+	if (vap == NULL) {
+		IEEE80211_UNLOCK(ic);
+		return (false);
+	}
+
+	IEEE80211_DPRINTF(vap, IEEE80211_MSG_SCAN, "%s: called\n", __func__);
+
 	ss->ss_next = ss->ss_last; /* all channels are complete */
 
 	ic->ic_scan_methods->sc_scan_done(vap);
 
 	IEEE80211_UNLOCK(ic);
+	return (true);
 }
 
 /*

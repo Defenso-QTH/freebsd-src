@@ -178,7 +178,7 @@ int	ieee80211_bg_scan(struct ieee80211vap *, int);
 void	ieee80211_cancel_scan(struct ieee80211vap *);
 void	ieee80211_cancel_anyscan(struct ieee80211vap *);
 void	ieee80211_scan_next(struct ieee80211vap *);
-void	ieee80211_scan_done(struct ieee80211vap *);
+bool	ieee80211_scan_done(struct ieee80211com *);
 void	ieee80211_probe_curchan(struct ieee80211vap *, bool);
 struct ieee80211_channel *ieee80211_scan_pickchannel(struct ieee80211com *, int);
 

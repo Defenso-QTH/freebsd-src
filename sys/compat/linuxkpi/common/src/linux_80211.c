@@ -7955,18 +7955,19 @@ linuxkpi_ieee80211_scan_completed(struct ieee80211_hw *hw,
 {
 	struct lkpi_hw *lhw;
 	struct ieee80211com *ic;
-	struct ieee80211_scan_state *ss;
 
 	lhw = wiphy_priv(hw->wiphy);
 	ic = lhw->ic;
-	ss = ic->ic_scan;
 
 	TRACE_SCAN(ic, "scan_flags %b info { %ju, %6D, aborted %d }",
 	    lhw->scan_flags, LKPI_LHW_SCAN_BITS,
 	    (uintmax_t)info->scan_start_tsf, info->tsf_bssid, ":",
 	    info->aborted);
 
-	ieee80211_scan_done(ss->ss_vap);
+	if (!ieee80211_scan_done(ic))
+		ic_printf(ic, "%s: scan completed with no scanning vap, "
+		    "scan_flags %b\n", __func__, lhw->scan_flags,
+		    LKPI_LHW_SCAN_BITS);
 
 	LKPI_80211_LHW_SCAN_LOCK(lhw);
 	free(lhw->hw_req, M_LKPI80211);
